@@ -798,6 +798,43 @@ class Database:
         with self.transaction() as connection:
             return inserted + _insert_punches(connection, rest)
 
+    def fill_punch_directions(self, punches: Iterable[dict[str, object]]) -> int:
+        """Fill trusted_direction on stored C3 punches that have none, from a
+        history download carrying the same fingerprints. Collector metadata,
+        not a punch edit: rows with a direction and non-C3 rows are never
+        touched, and nothing is inserted. Returns the rows updated."""
+        updates = [
+            (str(p["trusted_direction"]), str(p["fingerprint"]))
+            for p in punches
+            if p.get("trusted_direction") in ("entry", "exit") and p.get("fingerprint")
+        ]
+        if not updates:
+            return 0
+        # Local read first: a history download is the device's whole log, and
+        # each UPDATE on a replica is a Turso round trip.
+        with self.connect() as connection:
+            missing = {
+                row["fingerprint"]
+                for row in connection.execute(
+                    "SELECT fingerprint FROM punches WHERE trusted_direction IS NULL "
+                    "AND device_id IN (SELECT id FROM devices WHERE protocol = 'c3-pullsdk')"
+                ).fetchall()
+            }
+        updates = [u for u in updates if u[1] in missing]
+        if not updates:
+            return 0
+        updated = 0
+        with self.transaction() as connection:
+            for direction, fingerprint in updates:
+                cursor = connection.execute(
+                    "UPDATE punches SET trusted_direction = ? "
+                    "WHERE fingerprint = ? AND trusted_direction IS NULL "
+                    "AND device_id IN (SELECT id FROM devices WHERE protocol = 'c3-pullsdk')",
+                    (direction, fingerprint),
+                )
+                updated += cursor.rowcount
+        return updated
+
     def record_poll(
         self,
         device_id: str,

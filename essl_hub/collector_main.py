@@ -148,6 +148,17 @@ def collect_once(
     ):
         return
 
+    if events and write.get("transport") == "TCP history":
+        # R5: history carries the true exit byte; repair rows the live log
+        # stored with no direction before the unseen filter drops them.
+        try:
+            repaired = database.fill_punch_directions(events)
+        except Exception as exc:
+            _logger.warning("direction repair for %s skipped: %s", device.id, exc)
+        else:
+            if repaired:
+                _logger.info("filled direction on %d stored punch(es) for %s", repaired, device.id)
+
     try:
         database.record_poll(device.id, punches=events, **write)
     except Exception as exc:

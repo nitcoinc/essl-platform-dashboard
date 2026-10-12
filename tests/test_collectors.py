@@ -190,11 +190,19 @@ class C3TrustedDirectionTest(unittest.TestCase):
     def test_byte_three_is_trusted_as_exit(self) -> None:
         self.assertEqual(_c3_trusted_direction(3), "exit")
 
-    def test_byte_fifteen_the_librarys_decode_failure_is_not_trusted(self) -> None:
-        # This is the value captured from the real Gachibowli controller for
-        # every observed exit (protocol byte 1, which this library's enum
-        # cannot decode and falls back to 15 for).
+    def test_byte_fifteen_on_a_card_event_is_an_exit(self) -> None:
+        # The library cannot decode the real exit byte (1) and keeps only its
+        # fallback 15; the raw byte is not exposed on the record.
+        for event_type in (0, 1, 2, 3):
+            self.assertEqual(_c3_trusted_direction(15, event_type), "exit")
+
+    def test_byte_fifteen_without_a_card_event_is_not_trusted(self) -> None:
         self.assertIsNone(_c3_trusted_direction(15))
+        self.assertIsNone(_c3_trusted_direction(15, 8))
+
+    def test_entry_and_exit_bytes_ignore_the_event_type(self) -> None:
+        self.assertEqual(_c3_trusted_direction(0, 0), "entry")
+        self.assertEqual(_c3_trusted_direction(3, 0), "exit")
 
     def test_byte_two_none_is_not_trusted(self) -> None:
         self.assertIsNone(_c3_trusted_direction(2))

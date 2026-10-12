@@ -675,6 +675,33 @@ class DatabaseTest(unittest.TestCase):
         self.assertIsNone(classify(ValueError("no such table: nope")))
 
 
+    def test_fill_punch_directions_updates_null_c3_rows_without_inserting(self) -> None:
+        self.database.insert_punches([self._punch(trusted_direction=None, raw_direction_byte=15)])
+        history = self._punch(trusted_direction="exit", raw_direction_byte=1)
+        self.assertEqual(self.database.fill_punch_directions([history]), 1)
+        self.assertEqual(self.database.insert_punches([history]), 0)
+        with self.database.connect() as connection:
+            rows = connection.execute("SELECT trusted_direction, raw_direction_byte FROM punches").fetchall()
+        self.assertEqual([(r["trusted_direction"], r["raw_direction_byte"]) for r in rows], [("exit", 15)])
+        self.assertEqual(self.database.fill_punch_directions([history]), 0)
+
+    def test_fill_punch_directions_leaves_set_directions_and_x990_rows(self) -> None:
+        self.database.insert_punches([
+            self._punch(fingerprint="c3-set", trusted_direction="entry"),
+            self._punch(fingerprint="x990", device_id="uppal-x990", site="Uppal", trusted_direction=None),
+        ])
+        updated = self.database.fill_punch_directions([
+            self._punch(fingerprint="c3-set", trusted_direction="exit"),
+            self._punch(fingerprint="x990", device_id="uppal-x990", trusted_direction="exit"),
+            self._punch(fingerprint="unknown", trusted_direction="exit"),
+        ])
+        self.assertEqual(updated, 0)
+        with self.database.connect() as connection:
+            rows = {r["fingerprint"]: r["trusted_direction"] for r in connection.execute(
+                "SELECT fingerprint, trusted_direction FROM punches").fetchall()}
+        self.assertEqual(rows, {"c3-set": "entry", "x990": None})
+
+
 class ReplicaModeTest(unittest.TestCase):
     """Replica-mode branches with the network faked out: no Turso needed."""
 

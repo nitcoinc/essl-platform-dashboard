@@ -28,6 +28,7 @@ class FakeDatabase:
         self.last_sync_ok_at = None
         self.last_sync_error: str | None = None
         self.initialized = 0
+        self.direction_fills: list[list[dict]] = []
 
     def sync(self) -> bool:
         return not self.offline
@@ -38,6 +39,11 @@ class FakeDatabase:
     def insert_punches(self, punches) -> int:
         punches = list(punches)
         self.inserted_punches.extend(punches)
+        return len(punches)
+
+    def fill_punch_directions(self, punches) -> int:
+        punches = list(punches)
+        self.direction_fills.append(punches)
         return len(punches)
 
     def device_connection_info(self) -> list[dict]:
@@ -432,6 +438,41 @@ class RefreshDevicesTest(unittest.TestCase):
             result = refresh_devices(BrokenDatabase(), previous)
         self.assertIs(result, previous)
         self.assertTrue(any("postgres is unreachable" in line for line in captured.output))
+
+
+class DirectionRepairTest(unittest.TestCase):
+    def _event(self) -> dict:
+        return {"fingerprint": "fp", "device_id": "gachibowli-c3-400", "trusted_direction": "exit"}
+
+    def test_history_batches_repair_directions_before_the_write(self) -> None:
+        database = FakeDatabase()
+        collect_once(
+            database, DEVICES[1],
+            collector=lambda d: CollectionResult([self._event()], "TCP history", "SN", "FW"),
+        )
+        self.assertEqual(database.direction_fills, [[self._event()]])
+        self.assertEqual(len(database.inserted_punches), 1)
+
+    def test_realtime_batches_do_not_repair(self) -> None:
+        database = FakeDatabase()
+        collect_once(
+            database, DEVICES[1],
+            collector=lambda d: CollectionResult([self._event()], "TCP realtime", "SN", "FW"),
+        )
+        self.assertEqual(database.direction_fills, [])
+
+    def test_a_failed_repair_still_writes_the_poll(self) -> None:
+        database = FakeDatabase()
+
+        def broken(_punches):
+            raise RuntimeError("turso down")
+
+        database.fill_punch_directions = broken
+        collect_once(
+            database, DEVICES[1],
+            collector=lambda d: CollectionResult([self._event()], "TCP history", "SN", "FW"),
+        )
+        self.assertEqual(len(database.successes), 1)
 
 
 if __name__ == "__main__":

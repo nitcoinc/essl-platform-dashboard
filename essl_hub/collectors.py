@@ -350,7 +350,9 @@ def collect_c3(device: DeviceConfig) -> CollectionResult:
                         raw_state=f"{record.event_type} · {record.in_out_state}",
                         door=str(record.port_nr),
                         raw_direction_byte=int(record.in_out_state),
-                        trusted_direction=_c3_trusted_direction(int(record.in_out_state)),
+                        trusted_direction=_c3_trusted_direction(
+                            int(record.in_out_state), int(record.event_type)
+                        ),
                         identity=c3_identity(
                             pin, card, raw["timestamp"], str(record.port_nr), str(int(record.event_type))
                         ),
@@ -407,14 +409,18 @@ def _normalized_event(
     }
 
 
-def _c3_trusted_direction(in_out_state: int) -> str | None:
+def _c3_trusted_direction(in_out_state: int, event_type: int | None = None) -> str | None:
     """KTD4: this library's InOutDirection enum only decodes bytes 0 and 3 to
-    ENTRY/EXIT; a real exit (protocol byte 1) and any other value fall back to
-    its own UNKNOWN_UNSUPPORTED (15). Trust only the two it actually decoded;
-    let hours.py alternate for everything else."""
+    ENTRY/EXIT. A real exit (protocol byte 1) fails its decode and the record
+    keeps only the fallback UNKNOWN_UNSUPPORTED (15); the raw byte is not
+    exposed. On a card (punch) event 15 is therefore an exit: on the
+    Gachibowli panel 21 of 22 such rows sit between two entries. Anything
+    else is left for hours.py to alternate."""
     if in_out_state == 0:
         return "entry"
     if in_out_state == 3:
+        return "exit"
+    if in_out_state == 15 and event_type is not None and _c3_is_punch(str(event_type)):
         return "exit"
     return None
 
