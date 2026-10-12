@@ -447,6 +447,24 @@ def _make_app():
     return app, database
 
 
+def _assert_auth_layout(test: unittest.TestCase, html: str, heading: str) -> None:
+    """U3: every auth page shares the NITCO split layout."""
+    test.assertIn('class="auth-panel"', html)
+    test.assertIn('alt="NITCO"', html)
+    test.assertIn("brand/wordmark-white.png", html)
+    test.assertIn("Attendance Hub</p>", html)
+    test.assertNotIn("auth-brand", html)
+    test.assertNotIn("brand-mark", html)
+    test.assertNotIn("auth-bg", html)
+    test.assertNotIn('"/brand/', html)
+    test.assertEqual(html.count("<main"), 1)
+    test.assertIn(f"<h1>{heading}</h1>", html)
+    # The brand panel sits before main; the heading precedes any form.
+    test.assertLess(html.index('class="auth-panel"'), html.index("<main"))
+    if "<form" in html:
+        test.assertLess(html.index("<h1>"), html.index("<form"))
+
+
 class TurnstileSigninTest(unittest.TestCase):
     ENV = {"TURNSTILE_SITE_KEY": "site-key-1", "TURNSTILE_SECRET_KEY": "secret-1"}
 
@@ -467,6 +485,26 @@ class TurnstileSigninTest(unittest.TestCase):
         self.assertIn('data-sitekey="site-key-1"', page)
         self.assertIn("challenges.cloudflare.com/turnstile/v0/api.js", page)
         self.assertNotIn("secret-1", page)
+
+    def test_widget_renders_inside_the_form_column(self) -> None:
+        page = self.client.get("/signin").text
+        main = page[page.index("<main"):page.index("</main>")]
+        form = main[main.index("<form"):main.index("</form>")]
+        self.assertIn('class="cf-turnstile auth-turnstile"', form)
+        self.assertNotIn("cf-turnstile", page[:page.index("<main")])
+
+    def test_signin_renders_brand_panel_and_email_form(self) -> None:
+        page = self.client.get("/signin").text
+        _assert_auth_layout(self, page, "Sign in")
+        self.assertIn('name="email"', page)
+
+    def test_code_page_uses_the_same_layout(self) -> None:
+        with patch("essl_hub.turnstile.verify", return_value=True):
+            page = self.client.post(
+                "/signin", data={"email": "ravi.kumar@example.com", "cf-turnstile-response": "tok"}
+            ).text
+        _assert_auth_layout(self, page, "Check your email")
+        self.assertIn('name="code"', page)
 
     def test_failed_check_sends_nothing(self) -> None:
         with patch("essl_hub.turnstile.verify", return_value=False) as verify:
@@ -1967,6 +2005,8 @@ class SetupPageTest(unittest.TestCase):
         response = app.test_client().get("/setup")
         self.assertEqual(response.status_code, 200)
         self.assertIn("First-time setup", response.text)
+        _assert_auth_layout(self, response.text, "First-time setup")
+        self.assertIn('name="setup_token"', response.text)
 
     def test_wrong_token_is_refused_and_creates_nobody(self) -> None:
         database = FakeDatabase()
@@ -2252,6 +2292,7 @@ class OfflineTest(unittest.TestCase):
         response = self.app.test_client().post("/signin", data={"email": "admin@example.com"})
         self.assertEqual(response.status_code, 503)
         self.assertIn("Temporarily offline", response.text)
+        _assert_auth_layout(self, response.text, "Temporarily offline")
         self.assertEqual(self.captured, {})
 
 

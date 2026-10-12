@@ -587,17 +587,64 @@ input[type="file"]::file-selector-button {
 .notice + .admin-section { margin-top: var(--s6); }
 .roster-drop { padding: var(--s5); background: var(--surface); border: 1px dashed var(--border-input); border-radius: var(--radius-lg); }
 
-/* ---------- Auth pages ---------- */
-.auth-wrap { min-height: 100vh; min-height: 100dvh; display: grid; place-items: center; padding: var(--s6) var(--s4); }
-.auth-card { width: 100%; max-width: 360px; display: flex; flex-direction: column; gap: var(--s4); }
-.auth-title h1 { font-size: var(--text-20); }
-.auth-title p { margin-top: var(--s1); color: var(--text-secondary); }
-.auth-card form { display: flex; flex-direction: column; gap: var(--s3); }
+/* ---------- Auth pages ----------
+   Split layout: a fixed brand panel (identical in both themes, brand-only
+   colours) beside a theme-token form column. Below 1024px the panel becomes a
+   top band; below 500px of height it collapses to a slim wordmark strip. */
+.auth-layout { min-height: 100vh; min-height: 100dvh; display: grid; grid-template-columns: minmax(0, 11fr) minmax(440px, 9fr); background: var(--bg); }
+.auth-panel {
+  position: sticky; top: 0; height: 100vh; height: 100dvh; overflow: hidden; isolation: isolate;
+  display: flex; flex-direction: column; padding: var(--s12);
+  background-color: #04508f;
+  background-image: url("brand/wave.jpg");
+  background-image: image-set(url("brand/wave.webp") type("image/webp"), url("brand/wave.jpg") type("image/jpeg"));
+  background-size: cover; background-position: 30% 50%; background-repeat: no-repeat;
+}
+/* Fixed scrim behind the wordmark so text stays above 4.5:1 on any crop. */
+.auth-panel::before {
+  content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none;
+  background: linear-gradient(160deg, rgba(1, 28, 72, 0.55) 0%, rgba(1, 28, 72, 0.18) 45%, rgba(1, 28, 72, 0) 70%);
+}
+.auth-panel-brand { display: flex; flex-direction: column; gap: var(--s3); }
+.auth-wordmark { display: block; width: 196px; height: auto; }
+.auth-product { color: #ffffff; font-size: var(--text-16); font-weight: 500; letter-spacing: 0.01em; padding-left: 2px; }
+.auth-wrap { display: grid; place-items: center; padding: var(--s10) var(--s8); }
+.auth-card { width: 100%; max-width: 380px; display: flex; flex-direction: column; gap: var(--s5); }
+.auth-title h1 { font-size: var(--text-28); line-height: 1.2; letter-spacing: -0.015em; }
+.auth-title p { margin-top: var(--s2); color: var(--text-secondary); text-wrap: pretty; hyphens: manual; }
+.auth-card form { display: flex; flex-direction: column; gap: var(--s4); }
 .auth-card .button { width: 100%; }
-.auth-brand { padding: 0; margin-bottom: var(--s2); }
 .auth-card .auth-error { margin-top: 0; }
 .code-input { font-size: var(--text-20) !important; letter-spacing: 0.3em; font-variant-numeric: tabular-nums; }
 .auth-note { font-size: var(--text-13); color: var(--text-secondary); }
+
+@media (max-width: 1023.98px) {
+  .auth-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 1fr; }
+  .auth-panel { position: relative; height: 168px; padding: var(--s8); justify-content: flex-end; background-position: 70% 6%; }
+  .auth-panel::before { background: linear-gradient(90deg, rgba(1, 28, 72, 0.6) 0%, rgba(1, 28, 72, 0.3) 55%, rgba(1, 28, 72, 0.1) 100%); }
+  .auth-panel-brand { flex-direction: row; align-items: baseline; gap: var(--s3); }
+  .auth-wordmark { width: 128px; }
+  .auth-product { font-size: var(--text-14); }
+  .auth-wrap { place-items: start center; padding: var(--s12) var(--s6) var(--s10); }
+}
+@media (max-width: 767.98px) {
+  .auth-panel { height: 128px; padding: var(--s5) var(--s4); }
+  .auth-panel-brand { flex-direction: column; align-items: flex-start; gap: var(--s1); }
+  .auth-wordmark { width: 112px; }
+  .auth-product { font-size: var(--text-13); }
+  .auth-wrap { padding: var(--s8) var(--s4) var(--s6); }
+  .auth-card { gap: var(--s4); }
+  .auth-title h1 { font-size: var(--text-20); }
+  .auth-card form { gap: var(--s3); }
+}
+@media (max-height: 499.98px) {
+  .auth-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 1fr; }
+  .auth-panel { position: relative; height: 48px; padding: 0 var(--s4); justify-content: center; }
+  .auth-panel-brand { flex-direction: row; align-items: center; }
+  .auth-wordmark { width: 80px; }
+  .auth-product { display: none; }
+  .auth-wrap { place-items: start center; padding: var(--s6) var(--s4); }
+}
 
 /* ---------- Mobile (<768px) ---------- */
 @media (max-width: 767.98px) {
@@ -736,7 +783,7 @@ input[type="file"]::file-selector-button {
 .admin-section .empty-state { padding: var(--s5) 0; }
 
 /* Cloudflare Turnstile widget on the sign-in and setup cards */
-.auth-turnstile { margin: 4px 0 12px; min-height: 65px; }
+.auth-turnstile { min-height: 65px; }
 
 /* ---------- People sub-tabs and ID issues ---------- */
 /* The sub-tabs carry the rule under the header, so the topbar drops its own. */
