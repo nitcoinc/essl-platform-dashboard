@@ -28,7 +28,7 @@
         <td data-label="First entry" class="num">{% if r.segments %}{{ r.segments[0].start.strftime('%H:%M') }}{% else %}<span class="muted">-</span>{% endif %}</td>
         <td data-label="Last exit" class="num">{% if r.status == 'open' %}Inside{% elif r.segments and r.segments[-1].end %}{{ r.segments[-1].end.strftime('%H:%M') }}{% else %}<span class="muted">-</span>{% endif %}</td>
         <td data-label="Effective" class="num">{{ ui.hours(r.effective_minutes) }}</td>
-        <td data-label="Today">{{ status_chip(r.status) }}</td>
+        <td data-label="Today">{{ status_chip(r.status, anomalies=r.anomalies) }}</td>
         <td class="row-actions">{{ ui.button('Week', 'tertiary', href=url_for('me.week_view', employee=p.id), size='sm', attrs='aria-label="Week for ' ~ p.name|e ~ '"') }}</td>
       </tr>
       {% endfor %}

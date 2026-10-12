@@ -760,6 +760,21 @@ class HoursRenderingTest(unittest.TestCase):
         next_day = self.client.get("/day?date=2026-09-10")
         self.assertNotIn("5h 30m", next_day.text)
 
+    def test_flagged_day_counts_pairs_and_shows_needs_review(self) -> None:
+        self._sign_in()
+        day = datetime(2026, 9, 9)
+        self.database.insert_punches([
+            _punch_row("fp-r1", day + timedelta(hours=9), "entry"),
+            _punch_row("fp-r2", day + timedelta(hours=14, minutes=33), "entry"),
+            _punch_row("fp-r3", day + timedelta(hours=18), "exit"),
+        ])
+        self._at(datetime(2026, 9, 12, 12))
+        response = self.client.get("/day?date=2026-09-09")
+        self.assertIn("Needs review.", response.text)
+        self.assertIn("No exit after 09:00", response.text)
+        self.assertIn("3h 27m", response.text)
+        self.assertNotIn("Missing exit punch", response.text)
+
     def test_week_at_monday_three_am_still_shows_previous_week(self) -> None:
         self._sign_in()
         self._at(datetime(2026, 9, 14, 3))  # Monday
@@ -1395,6 +1410,23 @@ class ApiHoursTest(unittest.TestCase):
         self.assertEqual(ravi["2026-09-01"]["effective_minutes"], 330)
         self.assertEqual(ravi["2026-09-02"]["status"], "empty")
 
+    def test_hours_response_carries_anomalies(self) -> None:
+        key = self._create_key()
+        self.client.post("/signout")
+        day = datetime(2026, 9, 1)
+        self.database.insert_punches([
+            _punch_row("fp-o1", day + timedelta(hours=8), "exit"),
+            _punch_row("fp-o2", day + timedelta(hours=9), "entry"),
+            _punch_row("fp-o3", day + timedelta(hours=17), "exit"),
+        ])
+        response = self.client.get(
+            "/api/v1/hours?from=2026-09-01&to=2026-09-01",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+        ravi = [r for r in response.get_json()["results"] if r["device_user_id"] == "118"][0]
+        self.assertEqual(ravi["effective_minutes"], 480)
+        self.assertEqual(ravi["anomalies"], ["Exit at 08:00 with no entry"])
+
     def test_range_longer_than_cap_is_refused(self) -> None:
         key = self._create_key()
         self.client.post("/signout")
@@ -1900,6 +1932,20 @@ class RolesAndVisibilityTest(unittest.TestCase):
         html = self.client.get("/team").text
         order = [html.index(f">{n}</a>") for n in ("P41", "P42", "P40")]
         self.assertEqual(order, sorted(order))
+
+    def test_team_marks_flagged_day_needs_review(self) -> None:
+        a, _, _, _ = self._team()
+        start = datetime.combine(_ist_today(), datetime.min.time()) + timedelta(hours=6, minutes=1)
+        self.database.insert_punches([
+            {"fingerprint": f"r{i}", "device_user_id": "40", "event_timestamp": ts, "trusted_direction": d}
+            for i, (ts, d) in enumerate([
+                (start, "exit"), (start + timedelta(minutes=1), "entry"), (start + timedelta(minutes=5), "exit"),
+            ])
+        ])
+        self._sign_in(a)
+        html = self.client.get("/team").text
+        self.assertIn("Needs review", html)
+        self.assertIn("with no entry", html)
 
     def test_employee_on_team_lands_on_own_today(self) -> None:
         me = self._person("47")

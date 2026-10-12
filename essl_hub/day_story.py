@@ -56,10 +56,12 @@ def headline(result: DayResult, target_minutes: int, now: datetime | None, *, is
         if remaining <= 0:
             return Headline(f"Inside · target met at {reached:%H:%M}", "ok")
         return Headline(f"Inside · {_fmt(remaining)} to go", "info")
+    # R3: a flagged day still reads as its score, with a review note after it.
+    review = " · needs review" if result.anomalies else ""
     if result.status == "met":
-        return Headline(f"Target met at {reached:%H:%M}" if reached else "Target met", "ok")
+        return Headline((f"Target met at {reached:%H:%M}" if reached else "Target met") + review, "ok")
     if result.status == "short":
-        return Headline(f"Short by {_fmt(remaining)}", "warn")
+        return Headline(f"Short by {_fmt(remaining)}{review}", "warn")
     if result.status == "incomplete":
         return Headline("Missing exit punch", "bad")
     if weekend:

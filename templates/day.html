@@ -64,7 +64,9 @@
 </section>
 {% endif %}
 
-{% if result.status == 'incomplete' %}
+{% if result.anomalies %}
+<div class="notice review-notice">{{ ui.icon('circle-alert') }}<p><strong>Needs review.</strong> {{ result.anomalies|join('; ') }}. {% if result.status == 'incomplete' %}Nothing paired, so this day counts zero.{% else %}Only the paired time counts.{% endif %} Ask HR to record an explanation.</p></div>
+{% elif result.status == 'incomplete' %}
 <div class="notice">{{ ui.icon('circle-alert') }}<p>A punch on this day has no matching entry or exit, so it counts zero effective hours. Ask HR to record an explanation.</p></div>
 {% endif %}
 

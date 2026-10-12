@@ -34,6 +34,8 @@ class DayResult:
     break_minutes: int
     segments: tuple[Segment, ...]
     direction_source: DirectionSource
+    # Review notes for unmatched swipes, e.g. "No exit after 14:33" (R3).
+    anomalies: tuple[str, ...] = ()
 
 
 def compute_day(
@@ -55,31 +57,11 @@ def compute_day(
         )
 
     resolved, direction_source = _resolve_directions(ordered)
-    segments, orphan, open_start = _pair_segments(resolved)
+    segments, unmatched, open_start = _pair_segments(resolved)
+    anomalies = tuple(_anomaly_text(ts, direction) for ts, direction in unmatched)
 
-    if orphan:
-        if open_start is not None:
-            segments.append(Segment(start=open_start, end=None))
-        return DayResult(
-            status="incomplete",
-            gross_minutes=None,
-            effective_minutes=0,
-            break_minutes=0,
-            segments=tuple(segments),
-            direction_source=direction_source,
-        )
-
-    if open_start is not None:
-        if not is_today or now is None:
-            segments.append(Segment(start=open_start, end=None))
-            return DayResult(
-                status="incomplete",
-                gross_minutes=None,
-                effective_minutes=0,
-                break_minutes=0,
-                segments=tuple(segments),
-                direction_source=direction_source,
-            )
+    # R4: inside now on today's work day is open, whatever orphans came before.
+    if open_start is not None and is_today and now is not None:
         segments.append(Segment(start=open_start, end=None))
         effective = sum(_minutes(s.end - s.start) for s in segments if s.end is not None)
         effective += _minutes(now - open_start)
@@ -91,10 +73,29 @@ def compute_day(
             break_minutes=gross - effective,
             segments=tuple(segments),
             direction_source=direction_source,
+            anomalies=anomalies,
         )
 
-    effective = sum(_minutes(s.end - s.start) for s in segments)
-    gross = _minutes(segments[-1].end - segments[0].start)
+    closed = list(segments)
+    if open_start is not None:
+        # A trailing entry with no exit on a past day: flag it, keep it visible.
+        anomalies += (_anomaly_text(open_start, "entry"),)
+        segments.append(Segment(start=open_start, end=None))
+
+    # R3: an unmatched swipe only zeroes the day when nothing paired at all.
+    if not closed:
+        return DayResult(
+            status="incomplete",
+            gross_minutes=None,
+            effective_minutes=0,
+            break_minutes=0,
+            segments=tuple(segments),
+            direction_source=direction_source,
+            anomalies=anomalies,
+        )
+
+    effective = sum(_minutes(s.end - s.start) for s in closed)
+    gross = _minutes(closed[-1].end - closed[0].start)
     status: DayStatus = "met" if effective >= target_minutes else "short"
     return DayResult(
         status=status,
@@ -103,6 +104,7 @@ def compute_day(
         break_minutes=gross - effective,
         segments=tuple(segments),
         direction_source=direction_source,
+        anomalies=anomalies,
     )
 
 
@@ -148,22 +150,31 @@ def _resolve_directions(
 
 def _pair_segments(
     resolved: list[tuple[datetime, Direction]],
-) -> tuple[list[Segment], bool, datetime | None]:
+) -> tuple[list[Segment], list[tuple[datetime, Direction]], datetime | None]:
+    """Pair each entry with the next exit. Returns the segments, the swipes
+    left unmatched (an entry superseded by another entry, or an exit with no
+    entry before it), and a trailing entry still awaiting its exit."""
     segments: list[Segment] = []
+    unmatched: list[tuple[datetime, Direction]] = []
     open_start: datetime | None = None
-    orphan = False
     for timestamp, direction in resolved:
         if direction == "entry":
             if open_start is not None:
-                orphan = True
+                unmatched.append((open_start, "entry"))
             open_start = timestamp
         else:
             if open_start is None:
-                orphan = True
+                unmatched.append((timestamp, "exit"))
                 continue
             segments.append(Segment(start=open_start, end=timestamp))
             open_start = None
-    return segments, orphan, open_start
+    return segments, unmatched, open_start
+
+
+def _anomaly_text(timestamp: datetime, direction: Direction) -> str:
+    if direction == "entry":
+        return f"No exit after {timestamp:%H:%M}"
+    return f"Exit at {timestamp:%H:%M} with no entry"
 
 
 def _minutes(delta) -> int:

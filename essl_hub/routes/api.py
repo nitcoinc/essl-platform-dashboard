@@ -59,6 +59,7 @@ def api_hours() -> tuple[Response, int] | Response:
                     "gross_minutes": result.gross_minutes,
                     "effective_minutes": result.effective_minutes,
                     "status": result.status,
+                    "anomalies": list(result.anomalies),
                 }
             )
     rows.sort(key=lambda r: (r["date"], r["employee_name"]))

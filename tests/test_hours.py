@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from datetime import date, datetime
 
-from essl_hub.hours import Punch, compute_day, work_day, work_day_window
+from essl_hub.hours import Punch, Segment, compute_day, work_day, work_day_window
 
 
 def _t(hour: int, minute: int, day: int = 10) -> datetime:
@@ -25,19 +25,20 @@ class ComputeDayTest(unittest.TestCase):
         self.assertEqual(result.effective_minutes, 8 * 60 + 15)
         self.assertEqual(result.break_minutes, 60)
 
-    def test_ae2_trailing_entry_on_a_past_day_is_incomplete(self) -> None:
-        # Covers AE2.
+    def test_ae2_trailing_entry_on_a_past_day_counts_pairs_and_flags(self) -> None:
+        # AE2 as revised by R3: the 09:00-13:00 pair counts, the trailing entry is flagged.
         punches = [
             Punch(_t(9, 0), "entry"),
             Punch(_t(13, 0), "exit"),
             Punch(_t(14, 0), "entry"),
         ]
         result = compute_day(punches, target_minutes=480, is_today=False)
-        self.assertEqual(result.status, "incomplete")
-        self.assertEqual(result.effective_minutes, 0)
-        self.assertIsNone(result.gross_minutes)
+        self.assertEqual(result.status, "short")
+        self.assertEqual(result.effective_minutes, 240)
+        self.assertEqual(result.gross_minutes, 240)
         self.assertEqual(result.segments[-1].end, None)
         self.assertEqual(result.segments[-1].start, _t(14, 0))
+        self.assertEqual(result.anomalies, ("No exit after 14:00",))
 
     def test_ae3_today_still_inside_counts_to_now(self) -> None:
         # Covers AE3.
@@ -104,16 +105,17 @@ class ComputeDayTest(unittest.TestCase):
         self.assertEqual(result.status, "short")
         self.assertEqual(result.effective_minutes, 7 * 60)
 
-    def test_exit_as_first_punch_is_incomplete_not_negative(self) -> None:
+    def test_exit_as_first_punch_is_flagged_not_negative(self) -> None:
         punches = [
             Punch(_t(9, 0), "exit"),
             Punch(_t(13, 0), "entry"),
             Punch(_t(17, 0), "exit"),
         ]
         result = compute_day(punches, target_minutes=480, is_today=False)
-        self.assertEqual(result.status, "incomplete")
-        self.assertEqual(result.effective_minutes, 0)
-        self.assertIsNone(result.gross_minutes)
+        self.assertEqual(result.status, "short")
+        self.assertEqual(result.effective_minutes, 240)
+        self.assertEqual(result.gross_minutes, 240)
+        self.assertEqual(result.anomalies, ("Exit at 09:00 with no entry",))
 
     def test_short_day_is_flagged_short(self) -> None:
         punches = [Punch(_t(9, 0), "entry"), Punch(_t(15, 0), "exit")]
@@ -152,3 +154,91 @@ class WorkDayTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CleanDayCharacterisationTest(unittest.TestCase):
+    """Clean days (every entry has its exit) must score exactly as before U2."""
+
+    def test_two_pairs_met(self) -> None:
+        punches = [
+            Punch(_t(9, 0), "entry"),
+            Punch(_t(13, 0), "exit"),
+            Punch(_t(13, 30), "entry"),
+            Punch(_t(18, 0), "exit"),
+        ]
+        result = compute_day(punches, target_minutes=480)
+        self.assertEqual(
+            (result.status, result.gross_minutes, result.effective_minutes, result.break_minutes),
+            ("met", 540, 510, 30),
+        )
+        self.assertEqual(len(result.segments), 2)
+        self.assertEqual(result.direction_source, "raw_byte")
+
+    def test_single_pair_short(self) -> None:
+        result = compute_day([Punch(_t(9, 0), "entry"), Punch(_t(15, 0), "exit")], target_minutes=480)
+        self.assertEqual((result.status, result.gross_minutes, result.effective_minutes), ("short", 360, 360))
+
+    def test_alternation_even_count(self) -> None:
+        punches = [Punch(_t(9, 0)), Punch(_t(12, 0)), Punch(_t(13, 0)), Punch(_t(18, 0))]
+        result = compute_day(punches, target_minutes=480)
+        self.assertEqual((result.status, result.effective_minutes, result.break_minutes), ("met", 480, 60))
+        self.assertEqual(result.direction_source, "alternation")
+
+    def test_overnight_pair(self) -> None:
+        result = compute_day([Punch(_t(22, 10), "entry"), Punch(_t(3, 40, day=11), "exit")], target_minutes=300)
+        self.assertEqual((result.status, result.effective_minutes), ("met", 330))
+
+    def test_today_open_clean(self) -> None:
+        punches = [Punch(_t(9, 0), "entry"), Punch(_t(12, 0), "exit"), Punch(_t(13, 0), "entry")]
+        result = compute_day(punches, target_minutes=480, now=_t(17, 0), is_today=True)
+        self.assertEqual(
+            (result.status, result.gross_minutes, result.effective_minutes, result.break_minutes),
+            ("open", 480, 420, 60),
+        )
+        self.assertIsNone(result.segments[-1].end)
+
+    def test_empty(self) -> None:
+        result = compute_day([], target_minutes=480)
+        self.assertEqual((result.status, result.effective_minutes, result.segments), ("empty", 0, ()))
+
+
+class OrphanTolerantPairingTest(unittest.TestCase):
+    def test_clean_days_have_no_anomalies(self) -> None:
+        punches = [Punch(_t(9, 0), "entry"), Punch(_t(13, 0), "exit"),
+                   Punch(_t(14, 0), "entry"), Punch(_t(18, 0), "exit")]
+        result = compute_day(punches, target_minutes=480)
+        self.assertEqual((result.status, result.effective_minutes, len(result.segments)), ("met", 480, 2))
+        self.assertEqual(result.anomalies, ())
+
+    def test_entry_entry_exit_counts_the_later_pair(self) -> None:
+        punches = [Punch(_t(9, 0), "entry"), Punch(_t(14, 33), "entry"), Punch(_t(18, 0), "exit")]
+        result = compute_day(punches, target_minutes=480)
+        self.assertEqual(result.status, "short")
+        self.assertEqual(result.effective_minutes, 207)
+        self.assertEqual([(s.start, s.end) for s in result.segments], [(_t(14, 33), _t(18, 0))])
+        self.assertEqual(result.anomalies, ("No exit after 09:00",))
+
+    def test_leading_exit_is_flagged_and_pair_counts(self) -> None:
+        punches = [Punch(_t(8, 0), "exit"), Punch(_t(9, 0), "entry"), Punch(_t(17, 0), "exit")]
+        result = compute_day(punches, target_minutes=480)
+        self.assertEqual((result.status, result.effective_minutes), ("met", 480))
+        self.assertEqual(result.anomalies, ("Exit at 08:00 with no entry",))
+
+    def test_today_trailing_entry_after_orphans_is_open(self) -> None:
+        punches = [Punch(_t(14, 33), "entry"), Punch(_t(17, 52), "entry"), Punch(_t(19, 44), "entry")]
+        result = compute_day(punches, target_minutes=480, now=_t(22, 0), is_today=True)
+        self.assertEqual(result.status, "open")
+        self.assertEqual(result.effective_minutes, 136)
+        self.assertEqual(result.segments[-1], Segment(start=_t(19, 44), end=None))
+        self.assertEqual(result.anomalies, ("No exit after 14:33", "No exit after 17:52"))
+
+    def test_past_day_single_entry_is_incomplete(self) -> None:
+        result = compute_day([Punch(_t(9, 0), "entry")], target_minutes=480)
+        self.assertEqual((result.status, result.effective_minutes, result.gross_minutes), ("incomplete", 0, None))
+        self.assertEqual(result.anomalies, ("No exit after 09:00",))
+
+    def test_alternation_odd_count_past_day_counts_pairs(self) -> None:
+        punches = [Punch(_t(9, 0)), Punch(_t(13, 0)), Punch(_t(14, 0)), Punch(_t(18, 0)), Punch(_t(19, 0))]
+        result = compute_day(punches, target_minutes=480)
+        self.assertEqual((result.status, result.effective_minutes, result.gross_minutes), ("met", 480, 540))
+        self.assertEqual(result.anomalies, ("No exit after 19:00",))

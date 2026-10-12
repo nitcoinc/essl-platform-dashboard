@@ -11,9 +11,10 @@ def _at(h, m=0):
     return D.replace(hour=h, minute=m)
 
 
-def _result(status, effective, segments):
+def _result(status, effective, segments, anomalies=()):
     return DayResult(status=status, gross_minutes=None, effective_minutes=effective,
-                     break_minutes=0, segments=tuple(segments), direction_source="raw_byte")
+                     break_minutes=0, segments=tuple(segments), direction_source="raw_byte",
+                     anomalies=tuple(anomalies))
 
 
 class HeadlineTest(unittest.TestCase):
@@ -27,6 +28,12 @@ class HeadlineTest(unittest.TestCase):
         r = _result("met", 510, [Segment(_at(9), _at(13)), Segment(_at(14), _at(18, 30))])
         h = day_story.headline(r, 480, None, is_today=False, weekend=False)
         self.assertEqual((h.text, h.tone), ("Target met at 18:00", "ok"))
+
+    def test_flagged_met_day_reads_as_met_with_review_note(self) -> None:
+        r = _result("met", 480, [Segment(_at(9), _at(17)), Segment(_at(18), None)], ["No exit after 18:00"])
+        h = day_story.headline(r, 480, None, is_today=False, weekend=False)
+        self.assertEqual((h.text, h.tone), ("Target met at 17:00 · needs review", "ok"))
+        self.assertNotIn("Missing exit", h.text)
 
     def test_short_incomplete_weekend_and_not_in(self) -> None:
         short = _result("short", 400, [Segment(_at(9), _at(15, 40))])

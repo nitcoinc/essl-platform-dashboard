@@ -2,12 +2,14 @@
 
    hr.html and admin.html carried byte-identical copies of this five-branch
    ladder, and week.html carried a third that differed only in its short label.
-   Callers that need different wording pass it in (week shows "Short by 1h 30m"). #}
-{% macro status_chip(status, short_label='Short') -%}
+   Callers that need different wording pass it in (week shows "Short by 1h 30m").
+   anomalies (R3) adds a "Needs review" marker carrying the text, never colour alone. #}
+{% macro status_chip(status, short_label='Short', anomalies=()) -%}
 {% if status == 'met' %}<span class="status-chip status-met">Met</span>
 {% elif status == 'short' %}<span class="status-chip status-short">{{ short_label }}</span>
 {% elif status == 'incomplete' %}<span class="status-chip status-incomplete">Incomplete - no exit recorded</span>
 {% elif status == 'open' %}<span class="status-chip status-open">Running</span>
 {% else %}<span class="status-chip status-empty">No punches</span>
 {% endif %}
+{% if anomalies %}<span class="chip review-flag" title="{{ anomalies|join('; ') }}">Needs review<span class="visually-hidden">: {{ anomalies|join('; ') }}</span></span>{% endif %}
 {%- endmacro %}
