@@ -22,6 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from essl_hub.collector_main import merge_device_configs  # noqa: E402
 from essl_hub.collectors import collect  # noqa: E402
 from essl_hub.config import DEVICES  # noqa: E402
 from essl_hub.db import Database  # noqa: E402
@@ -54,7 +55,6 @@ def main(argv: list[str] | None = None, *, database: Database | None = None, dow
     parser.add_argument("--apply", action="store_true", help="write the changes")
     args = parser.parse_args(argv)
 
-    c3_devices = [d for d in DEVICES if d.protocol == "c3-pullsdk"]
     own = database is None
     if own:
         database = Database(
@@ -63,6 +63,9 @@ def main(argv: list[str] | None = None, *, database: Database | None = None, dow
             auth_token=os.getenv("TURSO_AUTH_TOKEN", ""),
         )
         database.sync()
+    # Every non-retired C3 row in the DB, not just the seeded ones.
+    rows = database.device_connection_info()
+    c3_devices = [d for d in merge_device_configs(DEVICES, rows) if d.protocol == "c3-pullsdk"]
     ids = [d.id for d in c3_devices]
     marks = ",".join("?" * len(ids))
     with database.connect() as connection:

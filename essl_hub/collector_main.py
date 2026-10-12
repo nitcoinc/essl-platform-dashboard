@@ -33,21 +33,36 @@ def merge_device_configs(
     rows: list[dict[str, object]],
     device_id: str | None = None,
 ) -> list[DeviceConfig]:
-    """Overlay database connection info on the static device list."""
-    by_id = {row["id"]: row for row in rows}
+    """Build the poll list from the non-retired database rows (the DB is
+    authoritative). ``static`` only supplies ``password_env`` (and any field a
+    row lacks) for the seeded devices; a static device with no row is not polled."""
+    by_id = {device.id: device for device in static}
     merged: list[DeviceConfig] = []
-    for device in static:
-        row = by_id.get(device.id)
-        if row is not None:
-            device = dataclasses.replace(
-                device,
-                ip=row["ip"],
-                port=row["port"],
-                password=row.get("comm_password") or None,
-            )
+    for row in rows:
+        if row.get("retired_at"):
+            continue
+        base = by_id.get(row["id"])
+        protocol = row.get("protocol") or (base.protocol if base else None)
+        if not protocol:
+            continue
+        device = DeviceConfig(
+            id=str(row["id"]),
+            site=str(row.get("site") or (base.site if base else row["id"])),
+            model=str(row.get("model") or (base.model if base else "")),
+            ip=str(row["ip"]),
+            port=int(row["port"]),
+            protocol=str(protocol),
+            password_env=base.password_env if base else "",
+            password=row.get("comm_password") or None,
+        )
         if device_id is None or device.id == device_id:
             merged.append(device)
     return merged
+
+
+def static_devices(device_id: str | None = None) -> list[DeviceConfig]:
+    """Seed list polled until the first database read succeeds."""
+    return [d for d in DEVICES if device_id is None or d.id == device_id]
 
 
 def refresh_devices(
@@ -319,7 +334,7 @@ def run_forever(
 ) -> None:
     if state is None:
         state = PollState(heartbeat_seconds=heartbeat_write_seconds())
-    devices = merge_device_configs(DEVICES, [], device_id=device_id)
+    devices = static_devices(device_id)
     while True:
         try:
             devices = run_cycle(

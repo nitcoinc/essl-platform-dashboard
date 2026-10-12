@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import socket
 import threading
 from contextlib import contextmanager
@@ -19,7 +20,7 @@ _TZ = ZoneInfo(TIMEZONE_NAME)
 _logger = logging.getLogger(__name__)
 
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Seconds the TCP probe waits before calling the primary unreachable. libsql's
 # own replica connect can block ~134s holding the GIL on a black-holed address
@@ -160,7 +161,7 @@ def primary_reachable(sync_url: str, timeout: float = PROBE_TIMEOUT_SECONDS) -> 
 # reported at the previous check: anything committed then must be local now.
 FRESHNESS_SQL = (
     "SELECT (SELECT coalesce(max(rowid), 0) FROM punches),"
-    " (SELECT coalesce(max(last_attempt), '') FROM devices)"
+    " (SELECT coalesce(max(last_attempt), '') FROM devices WHERE retired_at IS NULL)"
 )
 # Consecutive behind-checks before the replica file is rebuilt from scratch.
 STALE_CHECKS_BEFORE_REBUILD = 2
@@ -386,7 +387,28 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
     ),
     # v3: manual backups removed; Turso keeps point-in-time history (R5).
     3: ("DROP TABLE IF EXISTS backups",),
+    # v4: the devices table is authoritative (admins add and retire devices).
+    # SQLite has no ADD COLUMN IF NOT EXISTS; migrate_schema skips a column
+    # that already exists, so a re-run or a race stays safe.
+    4: (
+        "ALTER TABLE devices ADD COLUMN retired_at TIMESTAMP",
+        "ALTER TABLE devices ADD COLUMN created_at TIMESTAMP",
+    ),
 }
+
+_ADD_COLUMN = re.compile(r"^\s*ALTER TABLE (\w+) ADD COLUMN (\w+)", re.IGNORECASE)
+
+
+def _column_exists(connection: Any, table: str, column: str) -> bool:
+    rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(row["name"] == column for row in rows)
+
+
+def _run_migration_statement(connection: Any, statement: str) -> None:
+    match = _ADD_COLUMN.match(statement)
+    if match and _column_exists(connection, match.group(1), match.group(2)):
+        return
+    connection.execute(statement)
 
 DEFAULT_TARGET_MINUTES = "480"
 DEFAULT_DAY_START_HOUR = "6"
@@ -644,7 +666,7 @@ class Database:
             for target in sorted(MIGRATIONS):
                 if version < target:
                     for statement in MIGRATIONS[target]:
-                        connection.execute(statement)
+                        _run_migration_statement(connection, statement)
             # Turso rejects PRAGMA writes, so the version lives in settings;
             # local files (tests, migrate_postgres output) also get the pragma.
             connection.execute(
@@ -658,19 +680,21 @@ class Database:
     create_schema = migrate_schema
 
     def seed_defaults(self, devices: Iterable[DeviceConfig]) -> None:
+        """Insert the static devices only if missing. The DB is authoritative:
+        an existing row's site, model, connection and retirement are kept."""
         devices = tuple(devices)
         with self.transaction() as connection:
             for device in devices:
                 connection.execute(
                     """
-                    INSERT INTO devices (id, site, model, ip, port, protocol)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT (id) DO UPDATE SET
-                        site = excluded.site,
-                        model = excluded.model,
-                        protocol = excluded.protocol
+                    INSERT INTO devices (id, site, model, ip, port, protocol, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (id) DO NOTHING
                     """,
-                    (device.id, device.site, device.model, device.ip, device.port, device.protocol),
+                    (
+                        device.id, device.site, device.model, device.ip, device.port,
+                        device.protocol, _now(),
+                    ),
                 )
             connection.execute(
                 "INSERT INTO settings (key, value) VALUES ('daily_target_minutes', ?) "
@@ -736,7 +760,8 @@ class Database:
     def device_connection_info(self) -> list[dict[str, object]]:
         with self.connect() as connection:
             rows = connection.execute(
-                "SELECT id, ip, port, comm_password, connection_updated_at FROM devices ORDER BY id"
+                "SELECT id, site, model, protocol, ip, port, comm_password, connection_updated_at "
+                "FROM devices WHERE retired_at IS NULL ORDER BY site, created_at, id"
             ).fetchall()
         return list(rows)
 
@@ -877,7 +902,7 @@ class Database:
                 SELECT d.*,
                     (SELECT COUNT(*) FROM punches p WHERE p.device_id = d.id) AS stored_punches
                 FROM devices d
-                ORDER BY CASE d.id WHEN 'uppal-x990' THEN 0 ELSE 1 END, d.site
+                ORDER BY d.site, d.created_at, d.id
                 """
             ).fetchall()
         return list(rows)
@@ -1307,9 +1332,12 @@ class Database:
         return {row["status"]: row["n"] for row in rows}
 
     def min_device_last_success(self) -> datetime | None:
-        """Oldest successful poll across devices; None if any device never succeeded."""
+        """Oldest successful poll across active devices; None if any never succeeded.
+        Retired devices are not polled, so they never hold the watermark back."""
         with self.connect() as connection:
-            rows = connection.execute("SELECT last_success FROM devices").fetchall()
+            rows = connection.execute(
+                "SELECT last_success FROM devices WHERE retired_at IS NULL"
+            ).fetchall()
         values = [row["last_success"] for row in rows]
         if not values or any(v is None for v in values):
             return None

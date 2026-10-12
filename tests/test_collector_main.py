@@ -16,13 +16,22 @@ from essl_hub.config import DEVICES
 from essl_hub.spool import Spool
 
 
+def _seeded_rows() -> list[dict]:
+    """What device_connection_info returns right after seeding config.DEVICES."""
+    return [
+        {"id": d.id, "site": d.site, "model": d.model, "protocol": d.protocol,
+         "ip": d.ip, "port": d.port, "comm_password": None, "connection_updated_at": None}
+        for d in DEVICES
+    ]
+
+
 class FakeDatabase:
     def __init__(self, connection_info: list[dict] | None = None) -> None:
         self.writes: list[dict] = []
         self.successes: list[dict] = []
         self.failures: list[tuple[str, str]] = []
         self.inserted_punches: list[dict] = []
-        self.connection_info = list(connection_info or [])
+        self.connection_info = list(_seeded_rows() if connection_info is None else connection_info)
         self.drift_checked: list | None = None
         self.offline = False
         self.last_sync_ok_at = None
@@ -352,27 +361,38 @@ class MergeDeviceConfigsTest(unittest.TestCase):
         self.assertEqual(merged[0].port, 5000)
         self.assertEqual(merged[0].password, "s3cret")
 
-    def test_static_values_are_kept_when_a_device_has_no_row(self) -> None:
-        rows = [
-            {
-                "id": DEVICES[0].id,
-                "ip": "10.0.0.9",
-                "port": 5000,
-                "comm_password": "s3cret",
-            }
-        ]
+    def test_a_static_device_with_no_row_is_not_polled(self) -> None:
+        rows = [{"id": DEVICES[0].id, "ip": "10.0.0.9", "port": 5000, "comm_password": None}]
         merged = merge_device_configs(DEVICES, rows)
-        self.assertEqual(merged[1].ip, DEVICES[1].ip)
-        self.assertEqual(merged[1].port, DEVICES[1].port)
-        self.assertFalse(merged[1].password)
+        self.assertEqual([d.id for d in merged], [DEVICES[0].id])
 
-    def test_rows_whose_id_is_not_in_the_static_list_are_dropped(self) -> None:
+    def test_a_db_only_third_device_yields_three_configs(self) -> None:
+        third = {
+            "id": "kondapur-c3-400", "site": "Kondapur", "model": "C3-400",
+            "protocol": "c3-pullsdk", "ip": "192.168.1.203", "port": 4370,
+            "comm_password": None,
+        }
+        merged = merge_device_configs(DEVICES, _seeded_rows() + [third])
+        self.assertEqual(len(merged), 3)
+        added = merged[2]
+        self.assertEqual(
+            (added.id, added.site, added.protocol, added.ip),
+            ("kondapur-c3-400", "Kondapur", "c3-pullsdk", "192.168.1.203"),
+        )
+        self.assertIsNone(config.password_for(added))
+
+    def test_a_db_row_without_a_protocol_is_skipped(self) -> None:
         rows = [{"id": "ghost-device", "ip": "1.2.3.4", "port": 1, "comm_password": None}]
+        self.assertEqual(merge_device_configs(DEVICES, rows), [])
+
+    def test_a_retired_row_is_excluded(self) -> None:
+        rows = _seeded_rows()
+        rows[1]["retired_at"] = "2026-10-12 10:00:00"
         merged = merge_device_configs(DEVICES, rows)
-        self.assertEqual([d.id for d in merged], [d.id for d in DEVICES])
+        self.assertEqual([d.id for d in merged], [DEVICES[0].id])
 
     def test_device_id_filter_keeps_only_the_requested_device(self) -> None:
-        merged = merge_device_configs(DEVICES, [], device_id=DEVICES[1].id)
+        merged = merge_device_configs(DEVICES, _seeded_rows(), device_id=DEVICES[1].id)
         self.assertEqual([d.id for d in merged], [DEVICES[1].id])
 
     def test_null_comm_password_falls_back_to_the_environment_password(self) -> None:
@@ -402,28 +422,21 @@ class MergeDeviceConfigsTest(unittest.TestCase):
         with patch.dict(os.environ, {"ESSL_X990_PASSWORD": "envpw"}):
             self.assertEqual(config.password_for(device), "dbpw")
 
-    def test_empty_merge_equals_the_static_env_configured_list(self) -> None:
-        previous = merge_device_configs(DEVICES, [])
-        self.assertEqual([d.id for d in previous], [d.id for d in DEVICES])
-        for merged, static in zip(previous, DEVICES):
-            self.assertEqual(merged.ip, static.ip)
-            self.assertEqual(merged.port, static.port)
-            self.assertFalse(merged.password)
+    def test_no_rows_means_nothing_to_poll(self) -> None:
+        # every device retired: nothing is polled, the static list is not a fallback
+        self.assertEqual(merge_device_configs(DEVICES, []), [])
+
+    def test_boot_list_equals_the_static_env_configured_list(self) -> None:
+        self.assertEqual(collector_main.static_devices(), list(DEVICES))
+        self.assertEqual(collector_main.static_devices(DEVICES[1].id), [DEVICES[1]])
 
 
 class RefreshDevicesTest(unittest.TestCase):
     def test_success_returns_the_merged_list(self) -> None:
-        database = FakeDatabase(
-            connection_info=[
-                {
-                    "id": DEVICES[0].id,
-                    "ip": "10.9.9.9",
-                    "port": 4371,
-                    "comm_password": None,
-                }
-            ]
-        )
-        merged = refresh_devices(database, merge_device_configs(DEVICES, []))
+        rows = _seeded_rows()
+        rows[0].update(ip="10.9.9.9", port=4371)
+        database = FakeDatabase(connection_info=rows)
+        merged = refresh_devices(database, collector_main.static_devices())
         self.assertEqual(merged[0].ip, "10.9.9.9")
         self.assertEqual(merged[0].port, 4371)
         self.assertEqual(merged[1].ip, DEVICES[1].ip)
@@ -433,7 +446,7 @@ class RefreshDevicesTest(unittest.TestCase):
             def device_connection_info(self):
                 raise RuntimeError("postgres is unreachable")
 
-        previous = merge_device_configs(DEVICES, [])
+        previous = collector_main.static_devices()
         with self.assertLogs(collector_main._logger, level="WARNING") as captured:
             result = refresh_devices(BrokenDatabase(), previous)
         self.assertIs(result, previous)
@@ -473,6 +486,68 @@ class DirectionRepairTest(unittest.TestCase):
             collector=lambda d: CollectionResult([self._event()], "TCP history", "SN", "FW"),
         )
         self.assertEqual(len(database.successes), 1)
+
+
+class DynamicDevicesCycleTest(unittest.TestCase):
+    """U4: the devices table is authoritative for what the collector polls."""
+
+    def setUp(self) -> None:
+        import tempfile
+
+        from essl_hub.db import Database
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.database = Database(os.path.join(tmp.name, "essl.db"))
+        self.addCleanup(self.database.close)
+        self.database.initialize(DEVICES)
+        self.spool = Spool(":memory:")
+        self.state = collector_main.PollState(heartbeat_seconds=300, clock=_Clock())
+        self.polled: list[str] = []
+
+    def _collector(self, device):
+        self.polled.append(device.id)
+        return CollectionResult([], "TCP realtime", "SN", "FW")
+
+    def _cycle(self) -> list[str]:
+        self.polled = []
+        with patch.object(self.database, "sync", return_value=True):
+            collector_main.run_cycle(
+                self.database, self.spool, collector_main.static_devices(),
+                collector=self._collector, state=self.state,
+            )
+        return sorted(self.polled)
+
+    def _add_third(self) -> None:
+        with self.database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO devices (id, site, model, ip, port, protocol, created_at) "
+                "VALUES ('kondapur-c3-400', 'Kondapur', 'C3-400', '192.168.1.203', 4370, "
+                "'c3-pullsdk', '2026-10-12 10:00:00')"
+            )
+
+    def test_a_newly_added_row_is_polled_on_the_next_cycle(self) -> None:
+        self.assertEqual(self._cycle(), sorted(d.id for d in DEVICES))
+        self._add_third()
+        self.assertEqual(self._cycle(), sorted([*(d.id for d in DEVICES), "kondapur-c3-400"]))
+
+    def test_a_retired_row_is_not_polled(self) -> None:
+        self._cycle()
+        with self.database.transaction() as connection:
+            connection.execute(
+                "UPDATE devices SET retired_at='2026-10-12 11:00:00' WHERE id=?", (DEVICES[1].id,)
+            )
+        self.assertEqual(self._cycle(), [DEVICES[0].id])
+
+    def test_c3_history_schedule_is_tracked_per_new_device_id(self) -> None:
+        from essl_hub import collectors
+
+        self._add_third()
+        self.addCleanup(collectors._C3_HISTORY_AT.pop, DEVICES[1].id, None)
+        self.addCleanup(collectors._C3_HISTORY_AT.pop, "kondapur-c3-400", None)
+        collectors._C3_HISTORY_AT[DEVICES[1].id] = collectors.time.monotonic()
+        self.assertFalse(collectors._c3_history_due(DEVICES[1].id))
+        self.assertTrue(collectors._c3_history_due("kondapur-c3-400"))
 
 
 if __name__ == "__main__":

@@ -174,7 +174,9 @@ class MigrateTest(unittest.TestCase):
         check = db_module.Database(target, sync_url="")
         self.addCleanup(check.close)
         with check.connect() as c:
-            self.assertEqual(c.execute("PRAGMA user_version").fetchone()["user_version"], 3)
+            self.assertEqual(
+                c.execute("PRAGMA user_version").fetchone()["user_version"], db_module.SCHEMA_VERSION
+            )
             self.assertEqual(c.execute("SELECT COUNT(*) AS n FROM employees").fetchone()["n"], 1)
 
     def test_main_full_empty_source_exits_zero(self):

@@ -15,6 +15,8 @@ class DeviceConfig:
     password_env: str
     password: str | None = None
 
+# Seed-only: inserted into the devices table when missing, never overwritten.
+# The database is authoritative; admins add and retire devices there.
 DEVICES = (
     DeviceConfig(
         id="uppal-x990",
@@ -40,7 +42,7 @@ DEVICES = (
 def password_for(device: DeviceConfig) -> str | None:
     if device.password not in (None, ""):
         return device.password
-    value = os.getenv(device.password_env)
+    value = os.getenv(device.password_env) if device.password_env else None
     return value if value not in (None, "") else None
 
 

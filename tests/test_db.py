@@ -212,8 +212,107 @@ class DatabaseTest(unittest.TestCase):
         for row in rows:
             self.assertEqual(
                 set(row.keys()),
-                {"id", "ip", "port", "comm_password", "connection_updated_at"},
+                {"id", "site", "model", "protocol", "ip", "port", "comm_password",
+                 "connection_updated_at"},
             )
+
+    def _retire(self, device_id: str) -> None:
+        with self.database.transaction() as connection:
+            connection.execute(
+                "UPDATE devices SET retired_at=? WHERE id=?", (db_module._now(), device_id)
+            )
+
+    def test_device_connection_info_skips_retired_devices(self) -> None:
+        self._retire("gachibowli-c3-400")
+        self.assertEqual(
+            [row["id"] for row in self.database.device_connection_info()], ["uppal-x990"]
+        )
+
+    def test_seed_keeps_edited_site_model_ip_and_retirement(self) -> None:
+        with self.database.transaction() as connection:
+            connection.execute(
+                "UPDATE devices SET site='Uppal HQ', model='X990-B', ip='10.1.1.1', "
+                "retired_at='2026-10-12 09:00:00' WHERE id='uppal-x990'"
+            )
+        self.database.initialize(self.devices)
+        row = self.database.device_by_id("uppal-x990")
+        self.assertEqual(
+            (row["site"], row["model"], row["ip"]), ("Uppal HQ", "X990-B", "10.1.1.1")
+        )
+        self.assertIsNotNone(row["retired_at"])
+
+    def test_seed_inserts_missing_static_devices_with_created_at(self) -> None:
+        row = self.database.device_by_id("uppal-x990")
+        self.assertIsNotNone(row["created_at"])
+        self.assertIsNone(row["retired_at"])
+
+    def test_devices_order_by_site_then_created_time(self) -> None:
+        with self.database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO devices (id, site, model, ip, port, protocol, created_at) "
+                "VALUES ('aaa-c3', 'Uppal', 'C3-400', '10.0.0.3', 4370, 'c3-pullsdk', "
+                "'2999-01-01 00:00:00')"
+            )
+        self.assertEqual(
+            [row["id"] for row in self.database.devices()],
+            ["gachibowli-c3-400", "uppal-x990", "aaa-c3"],
+        )
+
+    def test_min_device_last_success_ignores_retired_devices(self) -> None:
+        old = datetime(2026, 1, 1, 9, 0, 0)
+        recent = datetime(2026, 10, 12, 9, 0, 0)
+        with self.database.transaction() as connection:
+            connection.execute("UPDATE devices SET last_success=? WHERE id='uppal-x990'", (recent,))
+            connection.execute(
+                "UPDATE devices SET last_success=? WHERE id='gachibowli-c3-400'", (old,)
+            )
+        self.assertEqual(self.database.min_device_last_success(), old)
+        self._retire("gachibowli-c3-400")
+        self.assertEqual(self.database.min_device_last_success(), recent)
+
+    def test_freshness_watermark_ignores_retired_devices(self) -> None:
+        with self.database.transaction() as connection:
+            connection.execute(
+                "UPDATE devices SET last_attempt='2026-10-12 09:00:00' WHERE id='uppal-x990'"
+            )
+            connection.execute(
+                "UPDATE devices SET last_attempt='2026-10-12 10:00:00' WHERE id='gachibowli-c3-400'"
+            )
+        self._retire("gachibowli-c3-400")
+        with self.database.connect() as connection:
+            marks = self.database._watermarks(connection)
+        self.assertEqual(str(marks[1]), "2026-10-12 09:00:00")
+
+    def test_v3_to_v4_adds_device_columns_keeps_rows_and_reruns_safely(self) -> None:
+        self.database.close()
+        path = os.path.join(self._tmp.name, "v3.db")
+        old = db_module.Database(path)
+        self.addCleanup(old.close)
+        with mock.patch.object(db_module, "SCHEMA_VERSION", 3), \
+                mock.patch.dict(db_module.MIGRATIONS, {}, clear=False):
+            db_module.MIGRATIONS.pop(4)
+            old.initialize(self.devices[:0])
+            with old.transaction() as connection:
+                connection.execute(
+                    "INSERT INTO devices (id, site, model, ip, port, protocol) "
+                    "VALUES ('uppal-x990', 'Uppal', 'X990', '10.2.2.2', 4370, 'zk-attendance')"
+                )
+        with old.connect() as connection:
+            columns = {r["name"] for r in connection.execute("PRAGMA table_info(devices)").fetchall()}
+        self.assertNotIn("retired_at", columns)
+        old.migrate_schema()
+        with old.transaction() as connection:  # simulate a re-run of step 4
+            connection.execute("UPDATE settings SET value='3' WHERE key='schema_version'")
+            connection.execute("PRAGMA user_version=3")
+        old.migrate_schema()
+        with old.connect() as connection:
+            columns = {r["name"] for r in connection.execute("PRAGMA table_info(devices)").fetchall()}
+            version = connection.execute("PRAGMA user_version").fetchone()["user_version"]
+        self.assertTrue({"retired_at", "created_at"} <= columns)
+        self.assertEqual(version, 4)
+        row = old.device_by_id("uppal-x990")
+        self.assertEqual(row["ip"], "10.2.2.2")
+        self.assertIsNone(row["retired_at"])
 
     def test_record_poll_commits_punches_and_device_row_together(self) -> None:
         inserted = self.database.record_poll(
@@ -641,7 +740,7 @@ class DatabaseTest(unittest.TestCase):
             exists = connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='backups'"
             ).fetchone()
-        self.assertEqual(version, 3)
+        self.assertEqual(version, db_module.SCHEMA_VERSION)
         self.assertIsNone(exists)
 
     def test_thread_reads_another_threads_committed_write_at_once(self) -> None:
