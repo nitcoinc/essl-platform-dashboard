@@ -29,7 +29,7 @@
 </div>
 
 {% if unmapped %}
-<div class="notice">{{ ui.icon('circle-alert') }}<p><strong>{{ unmapped|length }} device {{ 'ID has' if unmapped|length == 1 else 'IDs have' }} punches but no one on the roster</strong> ({{ unmapped|map(attribute='device_user_id')|join(', ') }}). Add {{ 'that person' if unmapped|length == 1 else 'those people' }} on the People page so their hours count.</p></div>
+<div class="notice">{{ ui.icon('circle-alert') }}<p><strong>{{ unmapped|length }} device {{ 'ID has' if unmapped|length == 1 else 'IDs have' }} punches but no one on the roster</strong> ({{ unmapped|map(attribute='device_user_id')|join(', ') }}). {% if nav_issue_count is defined %}<a href="{{ url_for('people.id_issues_view') }}">Fix on the ID issues page</a> so their hours count.{% else %}Add {{ 'that person' if unmapped|length == 1 else 'those people' }} on the People page so their hours count.{% endif %}</p></div>
 {% endif %}
 
 <section class="export-panel" id="export" aria-labelledby="export-heading">

@@ -756,15 +756,26 @@ input[type="file"]::file-selector-button {
 .subtab:hover { color: var(--text); }
 .subtab[aria-current="page"] { color: var(--text); border-bottom-color: var(--accent); }
 .subtab-count { min-width: 20px; padding: 0 6px; font-size: var(--text-12); line-height: 20px; text-align: center; color: var(--bad-text); background: var(--bad-bg); border-radius: 999px; font-variant-numeric: tabular-nums; }
-.issue-detail { margin: var(--s1) 0 0; max-width: 46ch; font-size: var(--text-13); color: var(--text-secondary); white-space: normal; }
-.issue-who { display: block; font-weight: 500; }
-.issue-device-name { display: block; font-size: var(--text-13); color: var(--text-secondary); }
-.issue-row td { vertical-align: top; padding-top: var(--s3); padding-bottom: var(--s3); height: auto; }
-.issue-actions { display: flex; flex-wrap: wrap; gap: var(--s2); justify-content: flex-end; align-items: center; max-width: 360px; margin-left: auto; }
+.issue-list { display: grid; gap: var(--s3); }
+.issue-card { display: grid; gap: var(--s2); min-width: 0; padding: var(--s4); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg); }
+.issue-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s3); }
+.issue-head h2 { margin: 0; font-size: var(--text-16); }
+.issue-meta { font-size: var(--text-13); color: var(--text-secondary); }
+.issue-impact { margin: 0; font-size: var(--text-14); font-weight: 500; color: var(--text); }
+.issue-detail, .issue-help { margin: 0; max-width: 72ch; font-size: var(--text-13); color: var(--text-secondary); overflow-wrap: anywhere; }
+.issue-help { flex-basis: 100%; }
+.issue-primary { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; }
+.issue-more > summary { cursor: pointer; width: fit-content; font-size: var(--text-13); font-weight: 500; color: var(--text-secondary); border-radius: var(--radius-sm); }
+.issue-more > summary:hover { color: var(--text); }
+.issue-actions { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; margin-top: var(--s3); }
+.issue-confirm { margin-bottom: var(--s5); padding: var(--s4); background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius-lg); }
+.issue-confirm h2 { margin: 0 0 var(--s2); font-size: var(--text-16); font-weight: 600; }
+.issue-confirm p { margin: 0 0 var(--s3); }
+.issue-confirm-actions { display: flex; flex-wrap: wrap; gap: var(--s2); }
 .inline-form { display: inline; }
 .link-button { padding: 0; border: 0; background: none; color: var(--accent); font: inherit; cursor: pointer; text-decoration: underline; }
 .issue-restore { margin-top: var(--s4); }
-.issue-id { font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.issue-id { font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .nav-count { margin-left: auto; min-width: 20px; padding: 0 6px; font-size: var(--text-12); line-height: 20px; text-align: center; color: var(--bad-text); background: var(--bad-bg); border-radius: 999px; font-variant-numeric: tabular-nums; }
 .notice-ok { background: var(--ok-bg); border-color: transparent; color: var(--ok-text); }
 .notice-ok strong, .notice-ok .icon { color: var(--ok-text); }
@@ -775,12 +786,12 @@ input[type="file"]::file-selector-button {
 .issue-guide h2 { margin: 0 0 var(--s2); font-size: var(--text-14); font-weight: 600; }
 .issue-guide ul { margin: 0; padding: 0; list-style: none; display: grid; gap: var(--s2); font-size: var(--text-13); color: var(--text-secondary); }
 .issue-guide .footnote { margin: var(--s3) 0 0; }
-.issue-link-form { display: flex; gap: var(--s1); width: 100%; justify-content: flex-end; }
-.issue-link-form select, .issue-link-form input { min-width: 0; flex: 1; max-width: 240px; height: 30px; font-size: var(--text-13); }
-@media (max-width: 720px) {
-  .issue-actions { justify-content: flex-start; max-width: none; margin-left: 0; }
-  .issue-link-form { justify-content: flex-start; }
-  .issue-link-form select, .issue-link-form input { max-width: none; }
+.issue-link-form { display: flex; gap: var(--s2); width: 100%; max-width: 420px; }
+.issue-link-form input { min-width: 0; flex: 1; }
+@media (max-width: 767px) {
+  .issue-link-form { max-width: none; }
+  .issue-primary .button, .issue-primary form:not(.issue-link-form), .issue-confirm-actions .button { flex: 1 1 auto; }
+  .issue-primary form:not(.issue-link-form) .button { width: 100%; }
 }
 
 /* Devices: add form, retire action, retired group */

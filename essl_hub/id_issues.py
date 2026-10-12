@@ -31,10 +31,45 @@ class Issue:
     punch_count: int = 0
     last_seen: datetime | None = None
     sites: str = ""
+    first_seen: datetime | None = None
 
     @property
     def key(self) -> str:
+        """Dismissal key. A "same person" dismissal also carries the device
+        name, so a later rename on the device brings the issue back."""
+        if self.kind == "name":
+            return f"name:{self.device_user_id}:{' '.join(sorted(_words(self.device_name)))}"
         return f"{self.kind}:{self.device_user_id}"
+
+    @property
+    def impact(self) -> str:
+        """One plain sentence on what the issue costs."""
+        n = self.punch_count
+        punches = f"{n} {'punch' if n == 1 else 'punches'}"
+        since = f" since {self.first_seen.day} {self.first_seen.strftime('%b')}" if self.first_seen else ""
+        if self.kind == "unknown":
+            return f"{punches}{since} count for nobody."
+        if self.kind == "shared":
+            return f"{punches}{since} are not counted for anyone."
+        if self.kind == "name":
+            return f"{punches}{since} count for {self.employee_name}, but the device calls this ID “{self.device_name}”."
+        if self.kind == "placeholder":
+            return f"No door punch can count for {self.employee_name} until a device ID is set."
+        return f"{self.employee_name} has no door hours: no device has seen ID {self.device_user_id}."
+
+
+@dataclass(frozen=True)
+class Fix:
+    """The one most likely fix for an issue.
+
+    action: link (give employee_id the device_user_id, via a confirm step),
+    add (new person), set_id (type an ID), same (dismiss a name difference),
+    none.
+    """
+    action: str
+    label: str
+    device_user_id: str = ""
+    employee_id: int | None = None
 
 
 def _words(name: str) -> set[str]:
@@ -77,6 +112,55 @@ def suggestions(issues: list[Issue]) -> dict[str, list[Issue]]:
     return pairs
 
 
+def _number(uid: str) -> int | None:
+    """Numeric part of an ID written as optional letters then digits
+    ("NP0128" and "128" both give 128); None for anything else."""
+    match = re.fullmatch(r"[A-Za-z]*0*(\d+)", uid or "")
+    return int(match.group(1)) if match else None
+
+
+def id_twins(issues: list[Issue]) -> dict[str, Issue]:
+    """Unknown device IDs that are a roster ID in another format (roster
+    "128", device "NP0128"), keyed by Issue.key both ways. Only unambiguous
+    one-to-one pairs count."""
+    unknown: dict[int, list[Issue]] = {}
+    for i in issues:
+        if i.kind == "unknown" and _number(i.device_user_id) is not None:
+            unknown.setdefault(_number(i.device_user_id), []).append(i)
+    never: dict[int, list[Issue]] = {}
+    for i in issues:
+        if i.kind == "never" and _number(i.device_user_id) is not None:
+            never.setdefault(_number(i.device_user_id), []).append(i)
+    twins: dict[str, Issue] = {}
+    for number, found in unknown.items():
+        roster = never.get(number, [])
+        if len(found) == 1 and len(roster) == 1:
+            twins[found[0].key] = roster[0]
+            twins[roster[0].key] = found[0]
+    return twins
+
+
+def primary_fix(issue: Issue, pairs: dict[str, list[Issue]], twins: dict[str, Issue]) -> Fix:
+    """The single most likely fix, shown as the card's primary button."""
+    twin = twins.get(issue.key)
+    matches = pairs.get(issue.key, [])
+    if issue.kind == "unknown":
+        if twin:
+            return Fix("link", f"Change ID to {issue.device_user_id}", issue.device_user_id, twin.employee_id)
+        if matches:
+            return Fix("link", f"Link to {matches[0].employee_name}", issue.device_user_id, matches[0].employee_id)
+        return Fix("add", "Add as new person", issue.device_user_id)
+    if issue.kind in ("placeholder", "never"):
+        if twin:
+            return Fix("link", f"Change ID to {twin.device_user_id}", twin.device_user_id, issue.employee_id)
+        if matches:
+            return Fix("link", f"Use {matches[0].device_user_id}", matches[0].device_user_id, issue.employee_id)
+        return Fix("set_id", "Set device ID", employee_id=issue.employee_id)
+    if issue.kind == "name":
+        return Fix("same", "Same person", issue.device_user_id, issue.employee_id)
+    return Fix("none", "Nothing to do")
+
+
 def find_issues(summary: list[dict], employees: list[dict], dismissed: set[str] | frozenset = frozenset()) -> list[Issue]:
     by_id = {str(row["device_user_id"]): row for row in summary}
     roster = {str(e["device_user_id"]): e for e in employees}
@@ -85,7 +169,7 @@ def find_issues(summary: list[dict], employees: list[dict], dismissed: set[str] 
     for uid, row in sorted(by_id.items()):
         common = dict(
             device_user_id=uid, device_name=row.get("device_name") or "", punch_count=int(row.get("punch_count") or 0),
-            last_seen=row.get("last_seen"), sites=row.get("sites") or "",
+            last_seen=row.get("last_seen"), sites=row.get("sites") or "", first_seen=row.get("first_seen"),
         )
         employee = roster.get(uid)
         if uid.startswith("C3-"):
@@ -96,7 +180,9 @@ def find_issues(summary: list[dict], employees: list[dict], dismissed: set[str] 
                                 detail="Hours are not counted until someone with this device ID is added.", **common))
         elif not names_agree(common["device_name"], employee["name"]):
             issues.append(Issue("name", "warn", title="Device name differs from the roster",
-                                detail=f"The device calls {uid} “{common['device_name']}”; the roster says “{employee['name']}”. Check it is the same person.",
+                                detail=(f"The device calls {uid} “{common['device_name']}”; the roster says “{employee['name']}”. "
+                                        "If it is the same person, mark it so (or fix the name on the device itself). "
+                                        "If it is someone else, change the roster ID here."),
                                 employee_id=employee["id"], employee_name=employee["name"], **common))
 
     for uid, employee in sorted(roster.items(), key=lambda kv: kv[1]["name"]):

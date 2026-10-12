@@ -117,10 +117,13 @@ class FakeDatabase:
             uid = p.get("device_user_id")
             if not uid:
                 continue
-            row = rows.setdefault(uid, {"device_user_id": uid, "punch_count": 0, "last_seen": None, "device_name": "", "sites": set()})
+            row = rows.setdefault(uid, {"device_user_id": uid, "punch_count": 0, "first_seen": None, "last_seen": None, "device_name": "", "sites": set()})
             row["punch_count"] += 1
+            row["first_seen"] = min(filter(None, [row["first_seen"], p["event_timestamp"]]))
+            # Device name is the latest punch's, like the SQL.
+            if row["last_seen"] is None or p["event_timestamp"] >= row["last_seen"]:
+                row["device_name"] = p.get("employee_name") or ""
             row["last_seen"] = max(filter(None, [row["last_seen"], p["event_timestamp"]]))
-            row["device_name"] = max(row["device_name"], p.get("employee_name") or "")
             if p.get("site"):
                 row["sites"].add(p["site"])
         return [{**r, "sites": ",".join(sorted(r["sites"]))} for r in rows.values()]
@@ -992,8 +995,60 @@ class AdminViewTest(unittest.TestCase):
         page = self.client.get("/people/issues").text
         self.assertIn("Name differs", page)
         csrf = re.search(r'name="csrf" value="([^"]+)"', page).group(1)
-        self.client.post("/people/issues/dismiss", data={"csrf": csrf, "key": "name:NP0002"})
+        self.client.post("/people/issues/dismiss", data={"csrf": csrf, "key": "name:NP0002:das mohan"})
         self.assertNotIn("Name differs", self.client.get("/people/issues").text)
+        # A rename on the device brings the issue back.
+        self.database.insert_punches([{"fingerprint": "fp-nm2", "device_id": DEVICES[0].id, "site": "Uppal",
+                                       "device_user_id": "NP0002", "employee_name": "Suresh K",
+                                       "event_timestamp": _ist_now() + timedelta(seconds=5)}])
+        self.assertIn("Name differs", self.client.get("/people/issues").text)
+
+    def test_device_name_is_the_latest_punch_name(self) -> None:
+        now = _ist_now()
+        self.database.insert_punches([
+            {"fingerprint": "fp-a", "device_id": DEVICES[0].id, "site": "Uppal", "device_user_id": "NP0777",
+             "employee_name": "Zara Old", "event_timestamp": now - timedelta(days=2)},
+            {"fingerprint": "fp-b", "device_id": DEVICES[0].id, "site": "Uppal", "device_user_id": "NP0777",
+             "employee_name": "Bala New", "event_timestamp": now},
+        ])
+        page = self.client.get("/people/issues").text
+        self.assertIn("On device: <strong>Bala New</strong>", page)
+        self.assertNotIn("Zara Old", page)
+
+    def test_link_confirm_states_punch_count(self) -> None:
+        self.database.upsert_employee(device_user_id="sita@example.com", name="Sita Rao", email="sita@example.com")
+        self.database.insert_punches([{"fingerprint": f"fp-c{i}", "device_id": DEVICES[0].id, "site": "Uppal",
+                                       "device_user_id": "NP0231", "employee_name": "Sita R",
+                                       "event_timestamp": _ist_now() - timedelta(minutes=i)} for i in range(3)])
+        page = self.client.get("/people/issues?confirm=1&device_user_id=NP0231&person=sita@example.com").text
+        self.assertIn("Link NP0231 to Sita Rao?", page)
+        self.assertIn("<strong>3 punches</strong> will start counting for Sita Rao", page)
+        # Nothing changes until the confirm form posts.
+        self.assertEqual(self.database.employee_by_email("sita@example.com")["device_user_id"], "sita@example.com")
+
+    def test_crafted_error_param_is_not_rendered(self) -> None:
+        page = self.client.get("/people/issues?error=Call+999+now&linked=X&who=Evil").text
+        # Only the theme form's escaped return URL may echo the query.
+        self.assertNotIn('class="notice notice-bad"', page)
+        self.assertNotIn("Linked X to Evil", page)
+
+    def test_never_punched_dismiss_lowers_badge(self) -> None:
+        self.database.upsert_employee(device_user_id="NP0500", name="Ghost", email="ghost@example.com")
+        page = self.client.get("/people/issues").text
+        before = int(re.search(r'class="subtab-count"[^>]*>(\d+)<', page).group(1))
+        csrf = re.search(r'name="csrf" value="([^"]+)"', page).group(1)
+        self.client.post("/people/issues/dismiss", data={"csrf": csrf, "key": "never:NP0500"})
+        page = self.client.get("/people/issues").text
+        self.assertNotIn("never:NP0500", page)
+        after = re.search(r'class="subtab-count"[^>]*>(\d+)<', page)
+        self.assertEqual(int(after.group(1)) if after else 0, before - 1)
+
+    def test_htmx_partial_skips_badge(self) -> None:
+        from essl_hub.routes import people as people_routes
+
+        with patch.object(people_routes, "issue_count", side_effect=AssertionError("badge computed")):
+            response = self.client.get("/people", headers={"HX-Request": "true"})
+        self.assertEqual(response.status_code, 200)
 
     def test_old_devices_ids_url_redirects_to_people(self) -> None:
         response = self.client.get("/devices/ids")
@@ -1012,6 +1067,8 @@ class AdminViewTest(unittest.TestCase):
                                     follow_redirects=True)
         self.assertIn("Linked NP0231 to Sita Rao", response.text)
         self.assertIn("1 past punch now count", response.text)
+        # The flash shows once.
+        self.assertNotIn("Linked NP0231", self.client.get("/people/issues").text)
         self.assertEqual(self.database.employee_by_id(sita["id"])["device_user_id"], "NP0231")
         self.assertNotIn("Not on roster", response.text)
 

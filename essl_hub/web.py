@@ -10,7 +10,7 @@ from .config import DEVICES
 from .db import Database, OfflineError
 from .routes import BLUEPRINTS
 from .routes import people as people_routes
-from .routes.common import SESSION_COOKIE, _theme, current_sync_health
+from .routes.common import SESSION_COOKIE, _htmx_partial, _theme, current_sync_health
 
 _logger = logging.getLogger(__name__)
 WEB_SYNC_SECONDS = 60
@@ -69,6 +69,9 @@ def create_app(database: Database | None = None) -> Flask:
         # HR and admin see how many ID issues wait on the People nav entry.
         employee = g.get("employee")
         if not employee or employee["role"] not in access.EDITOR_ROLES:
+            return {}
+        # An htmx fragment has no nav, so skip the punch scan behind the count.
+        if _htmx_partial():
             return {}
         return {"nav_issue_count": people_routes.issue_count()}
 

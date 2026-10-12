@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import csv
+import hashlib
+import hmac
 import io
 import json
 import time
@@ -510,6 +513,54 @@ def forget_issue_count() -> None:
     _count_cache.clear()
 
 
+# Feedback after a fix rides in a short-lived cookie signed with the
+# session's own CSRF secret, so no URL parameter (crafted or stale) is ever
+# rendered as a message.
+_FLASH_COOKIE = "es_flash"
+
+
+def _flash_sign(payload: str) -> str:
+    return hmac.new((g.csrf_token or "").encode(), payload.encode(), hashlib.sha256).hexdigest()
+
+
+def _redirect_with_flash(endpoint: str, **message):
+    response = redirect(url_for(endpoint))
+    payload = base64.urlsafe_b64encode(json.dumps(message).encode()).decode()
+    response.set_cookie(_FLASH_COOKIE, f"{payload}.{_flash_sign(payload)}", max_age=120,
+                        httponly=True, samesite="Lax", secure=request.is_secure)
+    return response
+
+
+def _take_flash() -> dict:
+    raw = request.cookies.get(_FLASH_COOKIE) or ""
+    payload, _, signature = raw.partition(".")
+    if not payload or not g.csrf_token or not hmac.compare_digest(signature, _flash_sign(payload)):
+        return {}
+    try:
+        message = json.loads(base64.urlsafe_b64decode(payload.encode()))
+    except ValueError:
+        return {}
+    return message if isinstance(message, dict) else {}
+
+
+def _issue_error(message: str):
+    return _redirect_with_flash("people.id_issues_view", error=message)
+
+
+def _resolve_person(raw: str) -> dict | None:
+    """A roster person from the link picker: an id, an email or a device ID."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    if raw.isdigit() and database.employee_by_id(int(raw)):
+        return database.employee_by_id(int(raw))
+    return database.employee_by_email(raw) or database.employee_by_device_user_id(raw)
+
+
+def _punch_count(device_user_id: str) -> int:
+    return next((int(r["punch_count"] or 0) for r in database.device_id_summary() if str(r["device_user_id"]) == device_user_id), 0)
+
+
 @bp.get("/people/issues")
 @_role_required(*access.EDITOR_ROLES)
 def id_issues_view():
@@ -518,21 +569,47 @@ def id_issues_view():
     order = {"bad": 0, "warn": 1, "info": 2}
     issues.sort(key=lambda i: (order[i.severity], i.kind, i.device_user_id))
     counts = {kind: sum(1 for i in issues if i.kind == kind) for kind in ("unknown", "placeholder", "never", "name", "shared")}
-    return render_template(
+    pairs = id_issues.suggestions(issues)
+    twins = id_issues.id_twins(issues)
+    flash = _take_flash()
+    confirm = None
+    if request.args.get("confirm"):
+        confirm = _link_preview(request.args.get("device_user_id") or "", request.args.get("person") or "")
+        if isinstance(confirm, str):
+            flash, confirm = {"error": confirm}, None
+    response = make_response(render_template(
         "id_issues.html",
         employee=g.employee,
         issues=issues,
         counts=counts,
         issue_count=id_issues.actionable(issues),
-        suggestions=id_issues.suggestions(issues),
-        link_targets=[i for i in issues if i.kind in ("placeholder", "never")],
+        suggestions=pairs,
+        twins=twins,
+        fixes={i.key: id_issues.primary_fix(i, pairs, twins) for i in issues},
+        lost_punches=sum(i.punch_count for i in issues if i.kind == "unknown"),
+        roster=database.employees(),
         dismissed_count=len(dismissed),
         csrf_token=g.csrf_token,
-        linked=request.args.get("linked"),
-        linked_name=request.args.get("who"),
-        linked_punches=_int_or_zero(request.args.get("punches") or "0"),
-        error=request.args.get("error"),
-    )
+        flash=flash,
+        confirm=confirm,
+        checked_at=_now_naive(),
+    ))
+    if request.cookies.get(_FLASH_COOKIE):
+        response.delete_cookie(_FLASH_COOKIE)
+    return response
+
+
+def _link_preview(device_user_id: str, person: str) -> dict | str:
+    """What linking would do, for the confirm step; an error string when it
+    cannot be done."""
+    device_user_id = device_user_id.strip()
+    target = _resolve_person(person)
+    if target is None or not device_user_id:
+        return "Choose a person and a device ID."
+    clash = database.employee_by_device_user_id(device_user_id)
+    if clash is not None and clash["id"] != target["id"]:
+        return f"{clash['name']} already uses device ID {device_user_id}."
+    return {"device_user_id": device_user_id, "employee": target, "punches": _punch_count(device_user_id)}
 
 
 @bp.post("/people/issues/dismiss")
@@ -543,7 +620,7 @@ def id_issues_dismiss():
     dismissed = _dismissed()
     if request.form.get("restore"):
         dismissed = set()
-    elif key.startswith("name:"):
+    elif key.startswith(("name:", "never:")):
         dismissed.add(key)
     database.set_setting(id_issues.DISMISSED_SETTING, json.dumps(sorted(dismissed)))
     forget_issue_count()
@@ -559,19 +636,19 @@ def id_issues_link():
     device_user_id = (request.form.get("device_user_id") or "").strip()
     target = database.employee_by_id(_int_or_zero(request.form.get("employee_id")))
     if target is None or not device_user_id:
-        return redirect(url_for("people.id_issues_view", error="Choose a person and a device ID."))
+        return _issue_error("Choose a person and a device ID.")
     if not access.can_modify_employee(g.employee, target, "device_user_id"):
-        return redirect(url_for("people.id_issues_view", error="Only an admin can change an admin's device ID."))
+        return _issue_error("Only an admin can change an admin's device ID.")
     clash = database.employee_by_device_user_id(device_user_id)
     if clash is not None and clash["id"] != target["id"]:
-        return redirect(url_for("people.id_issues_view", error=f"{clash['name']} already uses device ID {device_user_id}."))
+        return _issue_error(f"{clash['name']} already uses device ID {device_user_id}.")
     message = roster.identity_error(target["name"], target["email"], device_user_id)
     if message:
-        return redirect(url_for("people.id_issues_view", error=_sentence(message)))
+        return _issue_error(_sentence(message))
     try:
         database.update_employee(target["id"], name=target["name"], email=target["email"], device_user_id=device_user_id)
     except IntegrityError:
-        return redirect(url_for("people.id_issues_view", error=f"Device ID {device_user_id} is already in use."))
+        return _issue_error(f"Device ID {device_user_id} is already in use.")
     forget_issue_count()
-    punches = next((r["punch_count"] for r in database.device_id_summary() if str(r["device_user_id"]) == device_user_id), 0)
-    return redirect(url_for("people.id_issues_view", linked=device_user_id, who=target["name"], punches=punches))
+    return _redirect_with_flash("people.id_issues_view", linked=device_user_id, who=target["name"],
+                                punches=_punch_count(device_user_id))

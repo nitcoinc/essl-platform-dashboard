@@ -99,6 +99,18 @@ class DatabaseTest(unittest.TestCase):
         inserts = [s for s in statements if s.startswith("INSERT INTO punches")]
         self.assertEqual(len(inserts), 3)  # 251 rows / 100 per statement
 
+    def test_device_id_summary_uses_latest_punch_name(self) -> None:
+        # "Zed" sorts after "Bala", so MAX(name) would pick the old one.
+        self.database.insert_punches([
+            self._punch(fingerprint="fp-old", employee_name="Zed Old", event_timestamp=datetime(2026, 9, 1, 9, 0)),
+            self._punch(fingerprint="fp-new", employee_name="Bala New", event_timestamp=datetime(2026, 9, 10, 9, 0)),
+        ])
+        (row,) = self.database.device_id_summary()
+        self.assertEqual(row["device_name"], "Bala New")
+        self.assertEqual(row["punch_count"], 2)
+        self.assertEqual(row["first_seen"], datetime(2026, 9, 1, 9, 0))
+        self.assertEqual(row["last_seen"], datetime(2026, 9, 10, 9, 0))
+
     def test_duplicate_fingerprint_inserts_once(self) -> None:
         inserted_first = self.database.insert_punches([self._punch()])
         inserted_second = self.database.insert_punches([self._punch()])

@@ -1193,20 +1193,24 @@ class Database:
         with self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT device_user_id, COUNT(*) AS punch_count,
-                    MAX(event_timestamp) AS last_seen, MAX(employee_name) AS device_name,
-                    GROUP_CONCAT(DISTINCT site) AS sites
-                FROM punches
-                WHERE device_user_id IS NOT NULL AND device_user_id <> ''
-                GROUP BY device_user_id
+                SELECT p.device_user_id, COUNT(*) AS punch_count,
+                    MIN(p.event_timestamp) AS first_seen, MAX(p.event_timestamp) AS last_seen,
+                    (SELECT l.employee_name FROM punches l
+                        WHERE l.device_user_id = p.device_user_id
+                        ORDER BY l.event_timestamp DESC, l.id DESC LIMIT 1) AS device_name,
+                    GROUP_CONCAT(DISTINCT p.site) AS sites
+                FROM punches p
+                WHERE p.device_user_id IS NOT NULL AND p.device_user_id <> ''
+                GROUP BY p.device_user_id
                 """,
             ).fetchall()
         summary = []
         for row in rows:
             item = dict(row)
-            # MAX() drops the column's declared type, so the timestamp comes back as text.
-            if isinstance(item["last_seen"], str):
-                item["last_seen"] = datetime.fromisoformat(item["last_seen"])
+            # MIN()/MAX() drop the column's declared type, so timestamps come back as text.
+            for column in ("first_seen", "last_seen"):
+                if isinstance(item[column], str):
+                    item[column] = datetime.fromisoformat(item[column])
             summary.append(item)
         return summary
 

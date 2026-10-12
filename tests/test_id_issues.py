@@ -32,8 +32,42 @@ class FindIssuesTest(unittest.TestCase):
         self.assertEqual(kinds, {("unknown", "NP0231"), ("name", "NP0002"), ("shared", "C3-2"), ("placeholder", "admin@x.com"), ("never", "NP0500")})
 
     def test_dismissed_name_mismatch_is_hidden(self) -> None:
-        issues = find_issues([_seen("NP0002", "Chandra")], [_emp(2, "NP0002", "Ravi")], {"name:NP0002"})
+        issues = find_issues([_seen("NP0002", "Chandra")], [_emp(2, "NP0002", "Ravi")], {"name:NP0002:chandra"})
         self.assertEqual(issues, [])
+
+    def test_same_person_dismissal_returns_when_device_name_changes(self) -> None:
+        dismissed = {i.key for i in find_issues([_seen("NP0002", "Chandra")], [_emp(2, "NP0002", "Ravi")])}
+        self.assertEqual(find_issues([_seen("NP0002", "Chandra")], [_emp(2, "NP0002", "Ravi")], dismissed), [])
+        again = find_issues([_seen("NP0002", "Mohan Das")], [_emp(2, "NP0002", "Ravi")], dismissed)
+        self.assertEqual([i.kind for i in again], ["name"])
+
+    def test_never_punched_dismissal_hides_it(self) -> None:
+        self.assertEqual(find_issues([], [_emp(4, "NP0500", "Ghost")], {"never:NP0500"}), [])
+
+
+class PrimaryFixTest(unittest.TestCase):
+    def _fixes(self, summary, employees):
+        from essl_hub.id_issues import id_twins, primary_fix, suggestions
+
+        issues = find_issues(summary, employees)
+        pairs, twins = suggestions(issues), id_twins(issues)
+        return {i.key: primary_fix(i, pairs, twins) for i in issues}, {i.key: i for i in issues}
+
+    def test_unknown_with_matching_roster_name_links_and_states_impact(self) -> None:
+        summary = [{**_seen("NP0231", "Sita R", n=42), "first_seen": datetime(2026, 10, 3)}]
+        fixes, issues = self._fixes(summary, [_emp(7, "sita@example.com", "Sita Rao")])
+        fix = fixes["unknown:NP0231"]
+        self.assertEqual((fix.action, fix.label, fix.employee_id), ("link", "Link to Sita Rao", 7))
+        self.assertEqual(issues["unknown:NP0231"].impact, "42 punches since 3 Oct count for nobody.")
+
+    def test_id_format_twin_suggests_change_id(self) -> None:
+        fixes, _ = self._fixes([_seen("NP0128", "Somebody Else")], [_emp(5, "128", "Kiran")])
+        self.assertEqual((fixes["unknown:NP0128"].label, fixes["unknown:NP0128"].employee_id), ("Change ID to NP0128", 5))
+        self.assertEqual((fixes["never:128"].label, fixes["never:128"].device_user_id), ("Change ID to NP0128", "NP0128"))
+
+    def test_unknown_without_match_adds_a_person(self) -> None:
+        fixes, _ = self._fixes([_seen("NP0900", "Zed")], [])
+        self.assertEqual(fixes["unknown:NP0900"].action, "add")
 
 
 
