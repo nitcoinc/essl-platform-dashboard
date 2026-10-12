@@ -762,6 +762,20 @@ input[type="file"]::file-selector-button {
 /* ---------- Team ---------- */
 .topbar .subject-name { margin: 0 0 var(--s1); font-size: var(--text-16); font-weight: 600; color: var(--text); }
 .team-table td.num { white-space: nowrap; }
+.team-table { table-layout: fixed; min-width: 920px; }
+.team-table .col-select { width: 48px; }
+.team-table .col-person { width: 27%; }
+.team-table .col-manager { width: 17%; }
+.team-table .col-first, .team-table .col-last, .team-table .col-effective { width: 10%; }
+.team-table .col-today { width: 15%; }
+.team-table .col-actions { width: 9%; }
+.team-table td { overflow: hidden; text-overflow: ellipsis; }
+.team-table td[data-label="Manager"], .team-table .person-name, .team-table .person-email { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.team-table td.row-actions { overflow: visible; }
+@media (max-width: 767.98px) {
+  .team-table { table-layout: auto; min-width: 0; }
+  .team-table colgroup { display: none; }
+}
 .select-cell { width: 40px; }
 .export-panel { margin-top: var(--s10); padding-top: var(--s6); border-top: 1px solid var(--border); scroll-margin-top: var(--s6); }
 .export-panel h2 { font-size: var(--text-16); font-weight: 600; }

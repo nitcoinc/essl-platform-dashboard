@@ -2463,6 +2463,25 @@ class RolesAndVisibilityTest(unittest.TestCase):
         self.assertIn("HX-Request", restore.headers.get("Vary", ""))
         self.assertIn("HX-Request", partial.headers.get("Vary", ""))
 
+    def test_team_table_has_a_colgroup_matching_its_header(self) -> None:
+        a, *_ = self._team()
+        self._sign_in(a)
+        for headers in ({}, {"HX-Request": "true"}):
+            page = self.client.get("/team?q=p4", headers=headers)
+            table = re.search(r'<table class="[^"]*team-table.*?</table>', page.text, re.S).group(0)
+            colgroup = re.search(r"<colgroup>(.*?)</colgroup>", table, re.S)
+            self.assertIsNotNone(colgroup, headers)
+            head = re.search(r"<thead>(.*?)</thead>", table, re.S).group(1)
+            self.assertEqual(colgroup.group(1).count("<col "), head.count("<th "), headers)
+
+    def test_team_history_restore_keeps_full_page_with_colgroup(self) -> None:
+        a, *_ = self._team()
+        self._sign_in(a)
+        restore = self.client.get("/team", headers={"HX-Request": "true", "HX-History-Restore-Request": "true"})
+        self.assertIn("<html", restore.text)
+        self.assertIn("<colgroup>", restore.text)
+        self.assertIn("HX-Request", restore.headers.get("Vary", ""))
+
     def test_team_puts_incomplete_and_empty_days_first(self) -> None:
         a, b, c, _ = self._team()
         # The first minutes of today's work day (default start 06:00).
