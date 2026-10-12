@@ -1105,6 +1105,93 @@ class LiveTodayTest(unittest.TestCase):
         self.assertNotIn("7:42:30", page)
 
 
+class QuickViewTest(unittest.TestCase):
+    """Quick-view drawer fragment: same Today context as /day, same access."""
+
+    DAY = datetime(2026, 9, 9)
+
+    def setUp(self) -> None:
+        self.app, self.database = _make_app()
+        self.client = self.app.test_client()
+        from essl_hub import mail as mail_module
+
+        self.captured = {}
+        original = mail_module.send_login_code
+        mail_module.send_login_code = lambda e, c: self.captured.update(code=c)
+        self.addCleanup(lambda: setattr(mail_module, "send_login_code", original))
+        self.ravi = self._person("118", "Ravi Kumar")
+        common, me = _fixed_now(self.DAY + timedelta(hours=11))
+        common.start()
+        me.start()
+        self.addCleanup(common.stop)
+        self.addCleanup(me.stop)
+
+    def _person(self, uid: str, name: str, role: str = "employee") -> dict:
+        email = f"{uid}@example.com"
+        self.database.upsert_employee(device_user_id=uid, name=name, email=email)
+        person = self.database.employee_by_email(email)
+        if role != "employee":
+            self.database.set_employee_role(person["id"], role)
+        return self.database.employee_by_email(email)
+
+    def _sign_in(self, person: dict) -> None:
+        self.client.post("/signin", data={"email": person["email"]})
+        self.client.post("/signin/verify", data={"code": self.captured["code"]})
+
+    def _quick(self, employee_id: int, query: str = ""):
+        return self.client.get(f"/quick/{employee_id}{query}", headers={"HX-Request": "true"})
+
+    def test_hr_gets_fragment_with_name_live_region_and_links(self) -> None:
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        response = self._quick(self.ravi["id"])
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("HX-Request", response.headers.get("Vary", ""))
+        page = response.text
+        self.assertNotIn("<html", page)
+        self.assertIn('id="quick-view-title"', page)
+        self.assertIn(">Ravi Kumar</h2>", page)
+        self.assertIn('id="day-live"', page)
+        self.assertIn(f'href="/day?employee={self.ravi["id"]}"', page)
+        self.assertIn(f'href="/week?employee={self.ravi["id"]}"', page)
+
+    def test_person_inside_gets_live_region_polling_their_day(self) -> None:
+        self.database.insert_punches([_punch_row("qv-1", self.DAY + timedelta(hours=9), "entry")])
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        page = self._quick(self.ravi["id"]).text
+        self.assertIn('data-live="true"', page)
+        self.assertIn(f'data-poll="/day?employee={self.ravi["id"]}&amp;date=2026-09-09"', page)
+
+    def test_edit_details_only_from_people_for_editors(self) -> None:
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        self.assertIn("Edit details", self._quick(self.ravi["id"], "?from=people").text)
+        self.assertNotIn("Edit details", self._quick(self.ravi["id"]).text)
+
+    def test_manager_sees_subtree_only_and_unknown_is_404(self) -> None:
+        boss = self._person("900", "Boss", "manager")
+        other = self._person("901", "Other")
+        self.database.set_employee_manager(self.ravi["id"], boss["id"])
+        self._sign_in(boss)
+        self.assertEqual(self._quick(self.ravi["id"]).status_code, 200)
+        self.assertEqual(self._quick(other["id"]).status_code, 404)
+        self.assertEqual(self._quick(99999).status_code, 404)
+        self.assertNotIn("Edit details", self._quick(self.ravi["id"], "?from=people").text)
+
+    def test_no_punches_shows_empty_state(self) -> None:
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        self.assertIn("No punches yet today", self._quick(self.ravi["id"]).text)
+
+    def test_expired_session_gets_hx_redirect(self) -> None:
+        response = self._quick(self.ravi["id"])
+        self.assertEqual(response.headers.get("HX-Redirect"), "/signin")
+        self.assertNotIn("<form", response.text)
+
+    def test_plain_get_redirects_to_full_day(self) -> None:
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        response = self.client.get(f"/quick/{self.ravi['id']}")
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.headers["Location"].endswith(f"/day?employee={self.ravi['id']}"))
+
+
 class AdminViewTest(unittest.TestCase):
     def setUp(self) -> None:
         self.app, self.database = _make_app()

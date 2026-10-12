@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from flask import Blueprint, abort, g, make_response, render_template, request
+from flask import Blueprint, abort, g, make_response, redirect, render_template, request, url_for
 
 from .. import access, charts, day_story
 from ..hours import work_day
 from .common import (
+    ROLE_LABELS,
     _TZ,
     _day_for_employee,
     _day_start_hour,
@@ -44,6 +45,58 @@ def _subject() -> dict:
     if target is None:
         abort(404)
     return target
+
+
+def _day_context(subject: dict, day, today, request_now, target_minutes: int, day_start_hour: int) -> dict:
+    """The context _day_live.html needs for one subject and day; shared by
+    /day and the quick-view drawer so both render the same Today."""
+    result = _day_for_employee(
+        database, subject, day, target_minutes, now=request_now, day_start_hour=day_start_hour
+    )
+    is_today = day == today
+    now = request_now if is_today else None
+    stretch_seconds = 0
+    if result.status == "open" and now is not None:
+        stretch_seconds = max(0, int((now - result.segments[-1].start).total_seconds()))
+    reached = day_story.target_reached_at(result, target_minutes, now)
+    last_synced = None
+    stale_sync = False
+    previous_entry = None
+    if is_today:
+        last_synced = database.min_device_last_success()
+        stale_sync = last_synced is not None and request_now - last_synced > timedelta(minutes=5)
+        if not result.segments:
+            # Rollover while inside: say where the open stretch went.
+            previous = _day_for_employee(
+                database, subject, day - timedelta(days=1), target_minutes, now=request_now,
+                day_start_hour=day_start_hour,
+            )
+            if previous.segments and previous.segments[-1].end is None:
+                previous_entry = previous.segments[-1].start
+    return dict(
+        stretch_seconds=stretch_seconds,
+        subject=subject,
+        day=day,
+        result=result,
+        headline=day_story.headline(
+            result, target_minutes, now, is_today=is_today, weekend=day.weekday() >= 5
+        ),
+        today_label=day_story.today_label(result, target_minutes),
+        review_label=day_story.review_label(result),
+        live_state=day_story.live_state(result, target_minutes),
+        left_text=day_story.left_text(result.effective_seconds, target_minutes * 60),
+        log=day_story.log_items(result, now),
+        ring_percent=day_story.ring_percent(result, target_minutes),
+        finish_at=reached if result.status == "open" else None,
+        last_synced=last_synced,
+        stale_sync=stale_sync,
+        previous_entry=previous_entry,
+        request_now=request_now,
+        server_epoch_ms=int(request_now.replace(tzinfo=_TZ).timestamp() * 1000),
+        target_minutes=target_minutes,
+        today=today,
+        day_start=_day_start_label(day_start_hour),
+    )
 
 
 @bp.get("/week")
@@ -104,56 +157,40 @@ def day_view():
         response = make_response("", 200)
         response.headers["HX-Refresh"] = "true"
         return _vary_htmx(response)
-    result = _day_for_employee(
-        database, subject, day, target_minutes, now=request_now, day_start_hour=day_start_hour
-    )
-    is_today = day == today
-    now = request_now if is_today else None
-    stretch_seconds = 0
-    if result.status == "open" and now is not None:
-        stretch_seconds = max(0, int((now - result.segments[-1].start).total_seconds()))
-    reached = day_story.target_reached_at(result, target_minutes, now)
-    last_synced = None
-    stale_sync = False
-    previous_entry = None
-    if is_today:
-        last_synced = database.min_device_last_success()
-        stale_sync = last_synced is not None and request_now - last_synced > timedelta(minutes=5)
-        if not result.segments:
-            # Rollover while inside: say where the open stretch went.
-            previous = _day_for_employee(
-                database, subject, day - timedelta(days=1), target_minutes, now=request_now,
-                day_start_hour=day_start_hour,
-            )
-            if previous.segments and previous.segments[-1].end is None:
-                previous_entry = previous.segments[-1].start
-    context = dict(
-        stretch_seconds=stretch_seconds,
+    context = _day_context(subject, day, today, request_now, target_minutes, day_start_hour)
+    context.update(
         active="day",
         employee=g.employee,
-        subject=subject,
-        day=day,
         prev_date=day - timedelta(days=1),
         next_date=day + timedelta(days=1),
-        result=result,
-        headline=day_story.headline(
-            result, target_minutes, now, is_today=is_today, weekend=day.weekday() >= 5
-        ),
-        today_label=day_story.today_label(result, target_minutes),
-        review_label=day_story.review_label(result),
-        live_state=day_story.live_state(result, target_minutes),
-        left_text=day_story.left_text(result.effective_seconds, target_minutes * 60),
-        log=day_story.log_items(result, now),
-        ring_percent=day_story.ring_percent(result, target_minutes),
-        finish_at=reached if result.status == "open" else None,
-        last_synced=last_synced,
-        stale_sync=stale_sync,
-        previous_entry=previous_entry,
-        request_now=request_now,
-        server_epoch_ms=int(request_now.replace(tzinfo=_TZ).timestamp() * 1000),
-        target_minutes=target_minutes,
-        today=today,
-        day_start=_day_start_label(day_start_hour),
     )
     template = "_day_live.html" if partial else "day.html"
     return _vary_htmx(make_response(render_template(template, **context)))
+
+
+@bp.get("/quick/<int:employee_id>")
+@_login_required
+def quick_view(employee_id: int):
+    """One person's Today for the quick-view drawer. A plain navigation (no
+    htmx, or a history restore) goes to the full Day page instead."""
+    if not access.can_view(database, g.employee, employee_id):
+        abort(404)
+    subject = database.employee_by_id(employee_id)
+    if subject is None:
+        abort(404)
+    if not _htmx_partial():
+        return _vary_htmx(redirect(url_for("me.day_view", employee=employee_id)))
+    target_minutes = _target_minutes(database)
+    day_start_hour = _day_start_hour(database)
+    request_now = _now_naive()
+    today = work_day(request_now, day_start_hour)
+    context = _day_context(subject, today, today, request_now, target_minutes, day_start_hour)
+    manager = database.employee_by_id(subject["manager_id"]) if subject.get("manager_id") else None
+    context.update(
+        employee=g.employee,
+        manager_name=manager["name"] if manager else None,
+        role_label=ROLE_LABELS.get(subject["role"], subject["role"]),
+        # Mirrors person_edit's guard, and only offered from People.
+        can_edit=request.args.get("from") == "people" and g.employee["role"] in access.EDITOR_ROLES,
+    )
+    return _vary_htmx(make_response(render_template("_quick_view.html", **context)))
