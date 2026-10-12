@@ -81,5 +81,41 @@ class SecondsTest(unittest.TestCase):
         self.assertEqual(day_story.target_reached_at(r, 480, None), _at(17).replace(second=30))
 
 
+def _scored(status, effective_seconds, segments, anomalies=()):
+    return DayResult(status=status, gross_minutes=None, effective_minutes=effective_seconds // 60,
+                     break_minutes=0, segments=tuple(segments), direction_source="raw_byte",
+                     anomalies=tuple(anomalies), effective_seconds=effective_seconds)
+
+
+class TodayStateTest(unittest.TestCase):
+    """U11: the Today card's label, data-state and left/over line."""
+
+    def test_left_rounds_up_and_over_rounds_down(self) -> None:
+        self.assertEqual(day_story.left_text(28800 - 1019, 28800), "17m left")
+        self.assertEqual(day_story.left_text(28800 - 1021, 28800), "18m left")
+        self.assertEqual(day_story.left_text(7205, 28800), "6h 00m left")
+        self.assertEqual(day_story.left_text(28800, 28800), "+0m over")
+        self.assertEqual(day_story.left_text(28800 + 779, 28800), "+12m over")
+        self.assertEqual(day_story.left_text(28800 + 3900, 28800), "+1h 05m over")
+
+    def test_labels_and_states_follow_the_state_table(self) -> None:
+        cases = [
+            (_scored("open", 7200, [Segment(_at(9), None)]), "Inside", "inside"),
+            (_scored("open", 29520, [Segment(_at(9), None)]), "Inside · Target met", "inside"),
+            (_scored("short", 27780, [Segment(_at(10), _at(17, 43))]), "Out since 17:43:00", "out"),
+            (_scored("met", 29520, [Segment(_at(9), _at(17, 12))]), "Out · Target met", "met"),
+            (_scored("incomplete", 0, []), "Incomplete: no exit yet", "out"),
+        ]
+        for result, label, state in cases:
+            with self.subTest(label=label):
+                self.assertEqual(day_story.today_label(result, 480), label)
+                self.assertEqual(day_story.live_state(result, 480), state)
+
+    def test_review_label_names_the_gap(self) -> None:
+        r = _scored("open", 3600, [Segment(_at(14, 33), None)], ["No exit after 14:33"])
+        self.assertEqual(day_story.review_label(r), "Needs review: no exit after 14:33")
+        self.assertIsNone(day_story.review_label(_scored("met", 29000, [])))
+
+
 if __name__ == "__main__":
     unittest.main()

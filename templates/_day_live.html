@@ -1,0 +1,116 @@
+{#- Today's refresh region (U11): everything below the topbar. Rendered alone
+    for an htmx poll; static/timer.js reads the data- attributes. -#}
+{% import "_ui.html" as ui %}
+{% set other = subject.id != employee.id %}
+{% set is_today = day == today %}
+{% set live = result.status == 'open' %}
+{% set eff_s = result.effective_seconds %}
+{% set target_s = target_minutes * 60 %}
+{#- Today with only unpaired swipes still gets the card, with an empty ring. -#}
+{% set lone_today = is_today and result.status == 'incomplete' %}
+<div id="day-live" class="day-live"
+  data-live="{{ 'true' if live else 'false' }}"
+  data-base-seconds="{{ eff_s }}"
+  data-target-seconds="{{ target_s }}"
+  data-state="{{ live_state }}"
+  data-server-epoch-ms="{{ server_epoch_ms }}"
+  data-updated="{{ request_now.strftime('%H:%M:%S') }}"
+  {%- if is_today %} data-poll="{{ url_for('me.day_view', employee=subject.id, date=day.isoformat()) }}"{% endif %}>
+{% if result.segments or lone_today %}
+<section class="day-card tone-{{ headline.tone }}" aria-labelledby="day-headline">
+  <div class="day-card-main">
+    <div class="ring">
+      <svg viewBox="0 0 120 120" role="img" aria-label="{{ ui.hours(result.effective_minutes)|striptags }} effective, {{ ring_percent }}% of the {{ ui.hours(target_minutes)|striptags }} target">
+        <circle class="ring-track" cx="60" cy="60" r="52" pathLength="100"></circle>
+        <circle class="ring-fill" cx="60" cy="60" r="52" pathLength="100" style="stroke-dashoffset: {{ 100 - ring_percent }}"
+          data-ring-seconds="{{ eff_s }}" data-ring-target="{{ target_s }}"></circle>
+      </svg>
+      <div class="ring-center">
+        {% if lone_today %}
+        <span class="figure-of">of {{ ui.clock(target_s) }}</span>
+        {% else %}
+        <span class="figure-value{{ ' is-live' if live }}" aria-hidden="true" data-tick="{{ eff_s }}">{{ ui.clock(eff_s) }}</span>
+        <span class="visually-hidden" data-tick-hours="{{ eff_s }}">{{ ui.hours(result.effective_minutes)|striptags }}</span>
+        <span class="figure-of">of {{ ui.clock(target_s) }}</span>
+        {% endif %}
+      </div>
+    </div>
+    <div class="day-card-text">
+      <p class="figure-label">Effective hours</p>
+      {% if is_today %}
+      <h2 class="day-headline" id="day-headline">{% if live %}<span class="live-dot" aria-hidden="true"></span>{% endif %}{{ today_label }}</h2>
+      {% if review_label %}<p class="review-line">{{ review_label }}</p>{% endif %}
+      {% if result.status != 'incomplete' %}<p class="left-line" data-left>{{ left_text }}</p>{% endif %}
+      {% else %}
+      <h2 class="day-headline" id="day-headline">{{ headline.text }}</h2>
+      {% endif %}
+      {% if live %}
+      {% set open_seg = result.segments[-1] %}
+      <p class="live-line">Inside since <span class="num">{{ open_seg.start.strftime('%H:%M:%S') }}</span>. This stretch <span class="num" aria-hidden="true" data-tick="{{ stretch_seconds }}" data-timer-seconds="{{ stretch_seconds }}">{{ ui.clock(stretch_seconds) }}</span><span class="visually-hidden">{{ ui.hours(stretch_seconds // 60)|striptags }}</span>.</p>
+      {% if finish_at and eff_s < target_s %}<p class="finish-line">{{ ui.icon('clock') }}<span>Target reached at <strong class="num">{{ finish_at.strftime('%H:%M') }}</strong> if you stay in.</span></p>{% endif %}
+      {% endif %}
+      {% if is_today and stale_sync %}<p class="sync-note">Doors last synced <span class="num">{{ last_synced.strftime('%H:%M') }}</span></p>{% endif %}
+      {% if is_today %}<p class="sync-line" data-sync-line hidden></p>{% endif %}
+    </div>
+  </div>
+
+  {% if result.segments %}
+  <div class="in-out">
+    <div class="in-out-tile">
+      <span class="in-out-label">{{ ui.icon('log-in') }}First in</span>
+      <span class="in-out-value num">{{ result.segments[0].start.strftime('%H:%M:%S') }}</span>
+    </div>
+    <div class="in-out-tile">
+      <span class="in-out-label">{{ ui.icon('log-out') }}Last out</span>
+      <span class="in-out-value num">{% if live %}<span class="muted">Inside</span>{% elif result.segments[-1].end %}{{ result.segments[-1].end.strftime('%H:%M:%S') }}{% else %}<span class="muted">Missing</span>{% endif %}</span>
+    </div>
+  </div>
+  <dl class="day-facts-quiet">
+    <div><dt>Gross</dt><dd>{% if result.gross_seconds is not none %}<span class="num"{% if live %} data-tick="{{ result.gross_seconds }}"{% endif %}>{{ ui.clock(result.gross_seconds) }}</span>{% else %}<span class="muted">Incomplete</span>{% endif %}</dd></div>
+    <div><dt>Breaks</dt><dd><span class="num">{{ ui.clock(result.break_seconds) }}</span></dd></div>
+  </dl>
+  {% endif %}
+</section>
+{% endif %}
+
+{% if result.anomalies %}
+<div class="notice review-notice">{{ ui.icon('circle-alert') }}<p><strong>Needs review.</strong> {{ result.anomalies|join('; ') }}. {% if result.status == 'incomplete' %}Nothing paired, so this day counts zero.{% else %}Only the paired time counts.{% endif %} Ask HR to record an explanation.</p></div>
+{% elif result.status == 'incomplete' %}
+<div class="notice">{{ ui.icon('circle-alert') }}<p>A punch on this day has no matching entry or exit, so it counts zero effective hours. Ask HR to record an explanation.</p></div>
+{% endif %}
+
+{% if log %}
+<section class="day-section" aria-labelledby="log-heading">
+  <h2 id="log-heading">Attendance log</h2>
+  <ol class="day-log">
+    {% for item in log %}
+    {% if item.kind == 'break' %}
+    <li class="log-gap"><span class="log-gap-text">Break <span class="num">{{ ui.clock(item.seconds) }}</span></span></li>
+    {% elif item.kind == 'in' %}
+    <li class="log-node is-in"><span class="log-dot" aria-hidden="true"></span><span class="log-time num">{{ item.time.strftime('%H:%M:%S') }}{% if item.time.date() > day %}<sup title="Next calendar day">+1</sup>{% endif %}</span><span class="log-label">In</span>{% if item.seconds is not none %}<span class="log-meta">Inside <span class="num" data-log-stretch="{{ item.seconds }}"{% if live and loop.revindex == 2 %} data-tick="{{ item.seconds }}"{% endif %}>{{ ui.clock(item.seconds) }}</span></span>{% endif %}</li>
+    {% elif item.kind == 'out' %}
+    <li class="log-node is-out"><span class="log-dot" aria-hidden="true"></span><span class="log-time num">{{ item.time.strftime('%H:%M:%S') }}{% if item.time.date() > day %}<sup title="Next calendar day">+1</sup>{% endif %}</span><span class="log-label">Out</span></li>
+    {% elif item.kind == 'now' %}
+    <li class="log-node is-now"><span class="log-dot" aria-hidden="true"></span><span class="log-time num">{{ item.time.strftime('%H:%M:%S') }}{% if item.time.date() > day %}<sup title="Next calendar day">+1</sup>{% endif %}</span><span class="log-label">Now, inside</span></li>
+    {% else %}
+    <li class="log-node is-missing"><span class="log-dot" aria-hidden="true"></span><span class="log-time">--:--:--</span><span class="log-label">No exit recorded</span></li>
+    {% endif %}
+    {% endfor %}
+  </ol>
+  <p class="footnote">Hours come only from the door devices. Nobody can add or edit a punch by hand.</p>
+</section>
+{% elif not lone_today %}
+<div class="day-empty">
+{% if day.weekday() >= 5 and not is_today %}
+{{ ui.empty_state('Weekend', 'No scans at the door on this ' ~ day.strftime('%A') ~ '.', 'calendar-days') }}
+{% elif is_today %}
+{{ ui.empty_state('No punches yet today', 'Hours start counting from the first scan at the door.', 'clock') }}
+{% if previous_entry %}<p class="day-empty-sync">Last punch: entry at <span class="num">{{ previous_entry.strftime('%H:%M') }}</span> on the previous work day</p>{% endif %}
+{% if last_synced %}<p class="day-empty-sync">Doors last synced at <span class="num">{{ last_synced.strftime('%H:%M') }}</span></p>{% endif %}
+<p class="sync-line" data-sync-line hidden></p>
+{% else %}
+{{ ui.empty_state('No punches on this day', 'The door devices recorded no scans for ' ~ ('this person' if other else 'you') ~ '.', 'clock') }}
+{% endif %}
+</div>
+{% endif %}
+</div>

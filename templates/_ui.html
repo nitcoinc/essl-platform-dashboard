@@ -22,6 +22,11 @@
 {% if minutes is none %}<span class="muted">-</span>{% else %}<span class="num">{{ minutes // 60 }}h {{ '%02d'|format(minutes % 60) }}m</span>{% endif %}
 {%- endmacro %}
 
+{# Today's stopwatch durations read as "7:42:05" (H:MM:SS); plain text so it can sit in a ticking element. #}
+{% macro clock(seconds) -%}
+{{ seconds // 3600 }}:{{ '%02d'|format(seconds % 3600 // 60) }}:{{ '%02d'|format(seconds % 60) }}
+{%- endmacro %}
+
 {# columns: list of (label, align) where align is 'left' or 'num'. Body comes from caller(). #}
 {% macro table(columns, caption=None) -%}
 <div class="table-scroll">

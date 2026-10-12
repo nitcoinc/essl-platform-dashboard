@@ -101,3 +101,44 @@ def ring_percent(result: DayResult, target_minutes: int) -> int:
     if target_minutes <= 0:
         return 100
     return min(100, round(result.effective_minutes * 100 / target_minutes))
+
+
+def _short(minutes: int) -> str:
+    return f"{minutes}m" if minutes < 60 else _fmt(minutes)
+
+
+def left_text(effective_seconds: int, target_seconds: int) -> str:
+    """The Today remainder (R18): "17m left" rounds up, "+12m over" rounds down.
+    static/timer.js re-derives the same text on every tick."""
+    if effective_seconds >= target_seconds:
+        return f"+{_short((effective_seconds - target_seconds) // 60)} over"
+    return f"{_short(-(-(target_seconds - effective_seconds) // 60))} left"
+
+
+def live_state(result: DayResult, target_minutes: int) -> str:
+    """The data-state timer.js compares across refreshes: inside | met | out."""
+    if result.status == "open":
+        return "inside"
+    if result.status in ("met", "short") and result.effective_seconds >= target_minutes * 60:
+        return "met"
+    return "out"
+
+
+def today_label(result: DayResult, target_minutes: int) -> str:
+    """The Today card's state label; never colour alone (U11 state table)."""
+    met = result.effective_seconds >= target_minutes * 60
+    if result.status == "open":
+        return "Inside · Target met" if met else "Inside"
+    if result.status == "incomplete":
+        return "Incomplete: no exit yet"
+    if met:
+        return "Out · Target met"
+    last_out = next((s.end for s in reversed(result.segments) if s.end is not None), None)
+    return f"Out since {last_out:%H:%M:%S}" if last_out else "Out"
+
+
+def review_label(result: DayResult) -> str | None:
+    if not result.anomalies:
+        return None
+    text = "; ".join(result.anomalies)
+    return "Needs review: " + text[0].lower() + text[1:]

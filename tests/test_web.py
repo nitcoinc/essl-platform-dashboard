@@ -883,6 +883,209 @@ class HoursRenderingTest(unittest.TestCase):
         self.assertIn("Effective (h)", response.text)
 
 
+class LiveTodayTest(unittest.TestCase):
+    """U11: the live #day-live region, its states, polling and partials."""
+
+    DAY = datetime(2026, 9, 9)  # a Wednesday
+
+    def setUp(self) -> None:
+        self.app, self.database = _make_app()
+        self.database.upsert_employee(device_user_id="118", name="Ravi Kumar", email="ravi.kumar@example.com")
+        self.client = self.app.test_client()
+        from essl_hub import mail as mail_module
+
+        self.captured = {}
+        original = mail_module.send_login_code
+        mail_module.send_login_code = lambda e, c: self.captured.update(code=c)
+        self.addCleanup(lambda: setattr(mail_module, "send_login_code", original))
+
+    def _sign_in(self, email: str = "ravi.kumar@example.com") -> None:
+        self.client.post("/signin", data={"email": email})
+        self.client.post("/signin/verify", data={"code": self.captured["code"]})
+
+    def _at(self, at: datetime) -> None:
+        common, me = _fixed_now(at)
+        common.start()
+        me.start()
+        self.addCleanup(common.stop)
+        self.addCleanup(me.stop)
+
+    def _punches(self, *rows) -> None:
+        self.database.insert_punches(
+            [_punch_row(f"lv-{i}", self.DAY + offset, direction) for i, (offset, direction) in enumerate(rows)]
+        )
+
+    def _today(self, at: timedelta, *rows, headers=None) -> str:
+        self._sign_in()
+        self._punches(*rows)
+        self._at(self.DAY + at)
+        return self.client.get("/day", headers=headers or {}).text
+
+    @staticmethod
+    def _attr(page: str, name: str) -> str:
+        return re.search(rf'{name}="([^"]*)"', page).group(1)
+
+    def test_live_render_carries_one_instant_for_ring_stretch_and_epoch(self) -> None:
+        page = self._today(timedelta(hours=11, seconds=5), (timedelta(hours=9), "entry"))
+        self.assertEqual(self._attr(page, "data-base-seconds"), "7205")
+        self.assertEqual(self._attr(page, "data-target-seconds"), "28800")
+        self.assertEqual(self._attr(page, "data-live"), "true")
+        self.assertEqual(self._attr(page, "data-state"), "inside")
+        expected = int((self.DAY + timedelta(hours=11, seconds=5)).replace(tzinfo=_IST).timestamp() * 1000)
+        self.assertEqual(self._attr(page, "data-server-epoch-ms"), str(expected))
+        # ring digits, this stretch, the open log stretch and gross (inside
+        # since first in) all agree to the second
+        self.assertEqual(page.count('data-tick="7205"'), 4)
+        self.assertIn(">2:00:05<", page)
+
+    def test_inside_under_target(self) -> None:
+        page = self._today(timedelta(hours=11, seconds=5), (timedelta(hours=9), "entry"))
+        self.assertIn('<span class="live-dot" aria-hidden="true"></span>Inside</h2>', page)
+        self.assertIn('data-left>6h 00m left<', page)
+
+    def test_inside_met(self) -> None:
+        page = self._today(timedelta(hours=17, minutes=12), (timedelta(hours=9), "entry"))
+        self.assertIn("Inside · Target met</h2>", page)
+        self.assertIn("data-left>+12m over<", page)
+        self.assertEqual(self._attr(page, "data-state"), "inside")
+
+    def test_out_under_target_is_frozen(self) -> None:
+        page = self._today(
+            timedelta(hours=18),
+            (timedelta(hours=10), "entry"),
+            (timedelta(hours=17, minutes=43), "exit"),
+        )
+        self.assertIn("Out since 17:43:00</h2>", page)
+        self.assertIn("data-left>17m left<", page)
+        self.assertEqual(self._attr(page, "data-live"), "false")
+        self.assertEqual(self._attr(page, "data-state"), "out")
+        self.assertIn("data-poll=", page)
+
+    def test_out_met(self) -> None:
+        page = self._today(
+            timedelta(hours=18),
+            (timedelta(hours=9), "entry"),
+            (timedelta(hours=17, minutes=12), "exit"),
+        )
+        self.assertIn("Out · Target met</h2>", page)
+        self.assertIn("data-left>+12m over<", page)
+        self.assertEqual(self._attr(page, "data-state"), "met")
+
+    def test_review_flag_adds_needs_review_line(self) -> None:
+        page = self._today(
+            timedelta(hours=15),
+            (timedelta(hours=8), "entry"),
+            (timedelta(hours=9), "entry"),
+            (timedelta(hours=12), "exit"),
+            (timedelta(hours=14, minutes=33), "entry"),
+        )
+        self.assertIn("Inside</h2>", page)
+        self.assertIn('<p class="review-line">Needs review: no exit after 08:00</p>', page)
+        self.assertIn("data-left>", page)
+
+    def test_today_with_no_complete_pair_shows_incomplete_and_empty_ring(self) -> None:
+        page = self._today(timedelta(hours=12), (timedelta(hours=10), "exit"))
+        self.assertIn("Incomplete: no exit yet</h2>", page)
+        self.assertNotIn("data-left", page)
+        self.assertNotIn('class="figure-value', page)
+        self.assertNotIn("No punches yet today", page)
+        self.assertIn("data-poll=", page)
+
+    def test_no_punches_still_polls_and_notes_previous_day_entry(self) -> None:
+        self._sign_in()
+        self.database.insert_punches([_punch_row("lv-prev", self.DAY - timedelta(hours=2), "entry")])
+        self._at(self.DAY + timedelta(hours=7))
+        page = self.client.get("/day").text
+        self.assertIn("No punches yet today", page)
+        self.assertIn('id="day-live"', page)
+        self.assertIn('data-poll="/day?employee=1&amp;date=2026-09-09"', page)
+        self.assertIn('Last punch: entry at <span class="num">22:00</span> on the previous work day', page)
+
+    def test_past_day_is_static(self) -> None:
+        self._sign_in()
+        self._punches((timedelta(hours=9), "entry"), (timedelta(hours=17), "exit"))
+        self._at(datetime(2026, 9, 12, 12))
+        page = self.client.get("/day?date=2026-09-09").text
+        self.assertIn("Target met at 17:00</h2>", page)
+        self.assertNotIn("data-poll=", page)
+        self.assertNotIn("data-left", page)
+        self.assertEqual(self._attr(page, "data-live"), "false")
+
+    def test_htmx_request_gets_only_the_region_and_restore_gets_the_page(self) -> None:
+        partial = self._today(
+            timedelta(hours=11), (timedelta(hours=9), "entry"), headers={"HX-Request": "true"}
+        )
+        self.assertTrue(partial.lstrip().startswith("<div id=\"day-live\""))
+        self.assertNotIn("<html", partial)
+        self.assertIn('<ol class="day-log">', partial)
+        self.assertNotIn("live-status", partial)
+        restore = self.client.get("/day", headers={"HX-Request": "true", "HX-History-Restore-Request": "true"})
+        self.assertIn("<html", restore.text)
+        self.assertIn("HX-Request", restore.headers.get("Vary", ""))
+
+    def test_poll_for_a_rolled_over_date_refreshes_the_page(self) -> None:
+        self._sign_in()
+        self._at(self.DAY + timedelta(days=1, hours=6, seconds=1))
+        response = self.client.get("/day?date=2026-09-09", headers={"HX-Request": "true"})
+        self.assertEqual(response.headers.get("HX-Refresh"), "true")
+        self.assertEqual(response.text, "")
+
+    def test_unauthenticated_partial_gets_hx_redirect_not_signin_html(self) -> None:
+        response = self.client.get("/day", headers={"HX-Request": "true"})
+        self.assertEqual(response.headers.get("HX-Redirect"), "/signin")
+        self.assertNotIn("<form", response.text)
+        self.assertEqual(self.client.get("/day").status_code, 302)
+
+    def test_manager_poll_for_a_report_returns_the_reports_region(self) -> None:
+        self.database.upsert_employee(device_user_id="900", name="Boss", email="boss@example.com")
+        boss = self.database.employee_by_email("boss@example.com")
+        self.database.set_employee_role(boss["id"], "manager")
+        ravi = self.database.employee_by_email("ravi.kumar@example.com")
+        self.database.set_employee_manager(ravi["id"], boss["id"])
+        self._sign_in("boss@example.com")
+        self._punches((timedelta(hours=9), "entry"))
+        self._at(self.DAY + timedelta(hours=10))
+        page = self.client.get(
+            f"/day?employee={ravi['id']}&date=2026-09-09", headers={"HX-Request": "true"}
+        ).text
+        self.assertEqual(self._attr(page, "data-base-seconds"), "3600")
+        self.assertIn(f'data-poll="/day?employee={ravi["id"]}&amp;date=2026-09-09"', page)
+
+    def test_ring_digits_are_silent_and_status_region_is_outside_and_empty(self) -> None:
+        page = self._today(timedelta(hours=11), (timedelta(hours=9), "entry"))
+        self.assertIn('class="figure-value is-live" aria-hidden="true" data-tick=', page)
+        self.assertIn('<span class="visually-hidden" data-tick-hours="7200">2h 00m</span>', page)
+        self.assertNotIn('role="timer"', page)
+        self.assertNotIn('aria-live="polite" data-timer', page)
+        status = '<div id="live-status" class="visually-hidden" role="status" aria-live="polite"></div>'
+        self.assertIn(status, page)
+        region_end = page.index('<script src="/static/timer.js"')
+        self.assertGreater(page.index(status), region_end)
+        self.assertIn('role="img" aria-label="2h 00m effective, 25% of the 8h 00m target"', page)
+
+    def test_log_times_have_seconds_and_stretches_sum_to_the_ring(self) -> None:
+        page = self._today(
+            timedelta(hours=15, minutes=7, seconds=9),
+            (timedelta(hours=9, seconds=12), "entry"),
+            (timedelta(hours=12, minutes=30, seconds=41), "exit"),
+            (timedelta(hours=13, minutes=2, seconds=3), "entry"),
+        )
+        self.assertIn('log-time num">09:00:12</span>', page)
+        self.assertIn('log-time num">12:30:41</span>', page)
+        stretches = [int(v) for v in re.findall(r'data-log-stretch="(\d+)"', page)]
+        self.assertEqual(len(stretches), 2)
+        self.assertEqual(sum(stretches), int(self._attr(page, "data-base-seconds")))
+        self.assertIn("Break <span class=\"num\">0:31:22</span>", page)
+
+    def test_week_table_keeps_hours_and_minutes(self) -> None:
+        self._sign_in()
+        self._punches((timedelta(hours=9), "entry"), (timedelta(hours=16, minutes=42, seconds=30), "exit"))
+        self._at(datetime(2026, 9, 11, 12))
+        page = self.client.get("/week").text
+        self.assertIn("7h 42m", page)
+        self.assertNotIn("7:42:30", page)
+
+
 class AdminViewTest(unittest.TestCase):
     def setUp(self) -> None:
         self.app, self.database = _make_app()
@@ -2910,9 +3113,10 @@ class ScreensTest(unittest.TestCase):
         )
         page = client.get(f"/day?date={day.isoformat()}").text
         self.assertIn('<ol class="day-log">', page)
-        self.assertRegex(page, r'log-time num">09:00</span><span class="log-label">In</span><span class="log-meta">Inside <span class="num">8h 30m')
-        self.assertIn('log-time num">17:30</span><span class="log-label">Out', page)
-        self.assertIn('class="ring" role="img" aria-label="100% of the', page)
+        self.assertIn('log-time num">09:00:00</span><span class="log-label">In</span><span class="log-meta">Inside <span class="num" data-log-stretch="30600">8:30:00', page)
+        self.assertIn('log-time num">17:30:00</span><span class="log-label">Out', page)
+        self.assertIn('role="img" aria-label="8h 30m effective, 100% of the', page)
+        self.assertNotIn("data-poll=", page)  # past days never poll
 
     def test_week_renders_bars_and_target_line(self) -> None:
         page = self._client_as("employee").get("/week").text

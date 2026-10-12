@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta
 from functools import wraps
 from zoneinfo import ZoneInfo
 
-from flask import abort, current_app, g, redirect, request, url_for
+from flask import abort, current_app, g, make_response, redirect, request, url_for
 from werkzeug.local import LocalProxy
 
 from .. import config, roster
@@ -92,6 +92,12 @@ def _login_required(view):
     @wraps(view)
     def wrapper(*args, **kwargs):
         if g.employee is None:
+            if request.headers.get("HX-Request"):
+                # A 302 would be followed by htmx and land the sign-in form
+                # inside the swapped region; send the whole tab instead.
+                response = make_response("", 200)
+                response.headers["HX-Redirect"] = url_for("auth.signin")
+                return response
             return redirect(url_for("auth.signin"))
         return view(*args, **kwargs)
 

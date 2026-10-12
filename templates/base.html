@@ -101,6 +101,8 @@
       <main class="main-content" id="main-content" tabindex="-1">
         <div class="shell-bar">{{ shell_tools() }}</div>
         {% block content %}{% endblock %}
+        {#- Outside any swapped region, so Today's state changes are heard. -#}
+        <div id="live-status" class="visually-hidden" role="status" aria-live="polite"></div>
       </main>
     </div>
     <script>

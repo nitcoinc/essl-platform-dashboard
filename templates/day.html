@@ -3,8 +3,6 @@
 {% set other = subject.id != employee.id %}
 {% set emp = subject.id if other else None %}
 {% set is_today = day == today %}
-{% set live = result.status == 'open' %}
-{% set remaining = target_minutes - result.effective_minutes %}
 {% block title %}{{ subject.name if other else ('Today' if is_today else 'My day') }} - eSSL Attendance Hub{% endblock %}
 {% block content %}
 <header class="topbar">
@@ -22,86 +20,7 @@
   </nav>
 </header>
 
-{% if result.segments %}
-<section class="day-card tone-{{ headline.tone }}" aria-labelledby="day-headline">
-  <div class="day-card-main">
-    <div class="ring" role="img" aria-label="{{ ring_percent }}% of the {{ ui.hours(target_minutes)|striptags }} target">
-      <svg viewBox="0 0 120 120" aria-hidden="true">
-        <circle class="ring-track" cx="60" cy="60" r="52" pathLength="100"></circle>
-        <circle class="ring-fill" cx="60" cy="60" r="52" pathLength="100" style="stroke-dashoffset: {{ 100 - ring_percent }}"
-          data-ring-seconds="{{ result.effective_minutes * 60 }}" data-ring-target="{{ target_minutes * 60 }}" data-live="{{ 'true' if live else 'false' }}"></circle>
-      </svg>
-      <div class="ring-center">
-        <span class="figure-value{{ ' is-live' if live }}" aria-live="polite" data-timer-seconds="{{ result.effective_minutes * 60 }}" data-live="{{ 'true' if live else 'false' }}">{{ ui.hours(result.effective_minutes) }}</span>
-        <span class="figure-of">of {{ ui.hours(target_minutes) }}</span>
-      </div>
-    </div>
-    <div class="day-card-text">
-      <p class="figure-label">Effective hours</p>
-      <h2 class="day-headline" id="day-headline">{% if live %}<span class="live-dot" aria-hidden="true"></span>{% endif %}{{ headline.text }}</h2>
-      {% if live %}
-      {% set open_seg = result.segments[-1] %}
-      <p class="live-line">Inside since <span class="num">{{ open_seg.start.strftime('%H:%M') }}</span>. This stretch <span class="num" role="timer" data-timer-seconds="{{ stretch_seconds }}" data-live="true">{{ ui.hours(stretch_seconds // 60) }}</span>.</p>
-      {% if finish_at and remaining > 0 %}<p class="finish-line">{{ ui.icon('clock') }}<span>Target reached at <strong class="num">{{ finish_at.strftime('%H:%M') }}</strong> if you stay in.</span></p>{% endif %}
-      {% endif %}
-    </div>
-  </div>
-
-  <div class="in-out">
-    <div class="in-out-tile">
-      <span class="in-out-label">{{ ui.icon('log-in') }}First in</span>
-      <span class="in-out-value num">{{ result.segments[0].start.strftime('%H:%M') }}</span>
-    </div>
-    <div class="in-out-tile">
-      <span class="in-out-label">{{ ui.icon('log-out') }}Last out</span>
-      <span class="in-out-value num">{% if live %}<span class="muted">Inside</span>{% elif result.segments[-1].end %}{{ result.segments[-1].end.strftime('%H:%M') }}{% else %}<span class="muted">Missing</span>{% endif %}</span>
-    </div>
-  </div>
-  <dl class="day-facts-quiet">
-    <div><dt>Gross</dt><dd>{% if result.gross_minutes is not none %}{{ ui.hours(result.gross_minutes) }}{% else %}<span class="muted">Incomplete</span>{% endif %}</dd></div>
-    <div><dt>Breaks</dt><dd>{{ ui.hours(result.break_minutes) }}</dd></div>
-  </dl>
-</section>
-{% endif %}
-
-{% if result.anomalies %}
-<div class="notice review-notice">{{ ui.icon('circle-alert') }}<p><strong>Needs review.</strong> {{ result.anomalies|join('; ') }}. {% if result.status == 'incomplete' %}Nothing paired, so this day counts zero.{% else %}Only the paired time counts.{% endif %} Ask HR to record an explanation.</p></div>
-{% elif result.status == 'incomplete' %}
-<div class="notice">{{ ui.icon('circle-alert') }}<p>A punch on this day has no matching entry or exit, so it counts zero effective hours. Ask HR to record an explanation.</p></div>
-{% endif %}
-
-{% if log %}
-<section class="day-section" aria-labelledby="log-heading">
-  <h2 id="log-heading">Attendance log</h2>
-  <ol class="day-log">
-    {% for item in log %}
-    {% if item.kind == 'break' %}
-    <li class="log-gap"><span class="log-gap-text">Break {{ ui.hours(item.minutes) }}</span></li>
-    {% elif item.kind == 'in' %}
-    <li class="log-node is-in"><span class="log-dot" aria-hidden="true"></span><span class="log-time num">{{ item.time.strftime('%H:%M') }}{% if item.time.date() > day %}<sup title="Next calendar day">+1</sup>{% endif %}</span><span class="log-label">In</span>{% if item.minutes is not none %}<span class="log-meta">Inside {{ ui.hours(item.minutes) }}</span>{% endif %}</li>
-    {% elif item.kind == 'out' %}
-    <li class="log-node is-out"><span class="log-dot" aria-hidden="true"></span><span class="log-time num">{{ item.time.strftime('%H:%M') }}{% if item.time.date() > day %}<sup title="Next calendar day">+1</sup>{% endif %}</span><span class="log-label">Out</span></li>
-    {% elif item.kind == 'now' %}
-    <li class="log-node is-now"><span class="log-dot" aria-hidden="true"></span><span class="log-time num">{{ item.time.strftime('%H:%M') }}{% if item.time.date() > day %}<sup title="Next calendar day">+1</sup>{% endif %}</span><span class="log-label">Now, inside</span></li>
-    {% else %}
-    <li class="log-node is-missing"><span class="log-dot" aria-hidden="true"></span><span class="log-time">--:--</span><span class="log-label">No exit recorded</span></li>
-    {% endif %}
-    {% endfor %}
-  </ol>
-  <p class="footnote">Hours come only from the door devices. Nobody can add or edit a punch by hand.</p>
-</section>
-{% else %}
-<div class="day-empty">
-{% if day.weekday() >= 5 and not is_today %}
-{{ ui.empty_state('Weekend', 'No scans at the door on this ' ~ day.strftime('%A') ~ '.', 'calendar-days') }}
-{% elif is_today %}
-{{ ui.empty_state('No punches yet today', 'Hours start counting from the first scan at the door.', 'clock') }}
-{% if last_synced %}<p class="day-empty-sync">Doors last synced at <span class="num">{{ last_synced.strftime('%H:%M') }}</span></p>{% endif %}
-{% else %}
-{{ ui.empty_state('No punches on this day', 'The door devices recorded no scans for ' ~ ('this person' if other else 'you') ~ '.', 'clock') }}
-{% endif %}
-</div>
-{% endif %}
+{% include "_day_live.html" %}
 
 <script src="{{ url_for('static', filename='timer.js') }}" defer></script>
 {% endblock %}
