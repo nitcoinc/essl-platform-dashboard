@@ -124,6 +124,7 @@ No Python is needed on the host: the installer and the device test run inside th
 6. [Fixing ID issues](#fixing-id-issues)
 7. [Fix the Uppal address](#fix-the-uppal-address)
    - [Add, retire or re-enable a device](#add-retire-or-re-enable-a-device)
+   - [Sign-in branding](#sign-in-branding)
 8. [Cutover from the Postgres stack](#cutover-from-the-postgres-stack)
 9. [Sync health and offline behaviour](#sync-health-and-offline-behaviour)
 10. [Nightly export](#nightly-export)
@@ -339,6 +340,15 @@ The devices table is the source of truth; `.env` IPs only seed the first two row
 - **Re-enable**: clears `retired_at`; polling resumes on the same id.
 
 Two active devices can't share an IP:port. Adding an address that belongs to a retired device offers **Re-enable** instead of a new id, so history stays under one id. There is no delete.
+
+## Sign-in branding
+
+On **Settings → Sign-in branding** (admin) upload a logo and pick the sign-in background: **Default**, **Brand colour** (hex) or **Uploaded image**. The sign-in, code and setup pages show them in light and dark; the card itself stays solid so its text keeps AA contrast, and dark theme dims a background image with a scrim.
+
+- Formats: PNG, JPEG or WebP, checked by file signature (the extension is ignored). SVG is refused.
+- Caps: logo 512 KB, background 1.5 MB (plus the global `ESSL_MAX_UPLOAD_MB`).
+- Images live in the database (`branding_assets`, schema v5), so every replica and the nightly export carry them. They are served publicly at `/brand/logo` and `/brand/background` with an ETag and a 5-minute cache; the page adds `?v=<hash>` so a change shows at once.
+- **Reset** puts either asset back to the default. With nothing uploaded, sign-in looks as before. Email keeps `static/email-logo.png`.
 
 ## Cutover from the Postgres stack
 

@@ -42,6 +42,17 @@ def upload_too_large(error):
     # import page, so everyone else keeps the default 413 response.
     if g.employee is None or g.employee["role"] not in access.EDITOR_ROLES:
         return error.get_response()
+    if request.endpoint == "admin.settings_upload_branding" and g.employee["role"] == "admin":
+        from .admin import _render_settings
+
+        return _render_settings(
+            status=413,
+            brand_error=(
+                f"That file is larger than the {_max_upload_mb()} MB upload limit. "
+                "Use a smaller image."
+            ),
+            brand_error_key=request.view_args.get("key") if request.view_args else None,
+        )
     return _render_import(
         error=(
             f"That file is larger than the {_max_upload_mb()} MB upload limit. "

@@ -80,6 +80,23 @@ def create_app(database: Database | None = None) -> Flask:
             return {}
         return {"sync_health": current_sync_health(database)[0]}
 
+    @app.context_processor
+    def signin_branding() -> dict:
+        # Lazy: only the auth pages call it, so app pages pay no query.
+        def branding() -> dict:
+            versions = database.branding_versions()
+            mode = database.setting("signin_background", "default")
+            if mode == "image" and "background" not in versions:
+                mode = "default"
+            return {
+                "logo_version": versions.get("logo", "")[:12] or None,
+                "background_version": versions.get("background", "")[:12] or None,
+                "mode": mode,
+                "color": database.setting("signin_background_color", "#3451c7"),
+            }
+
+        return {"signin_branding": branding}
+
     @app.errorhandler(OfflineError)
     def offline(exc: OfflineError) -> tuple[str, int]:
         # A write that cannot reach the primary is an outage, not a bug (KTD11).
@@ -91,7 +108,9 @@ def create_app(database: Database | None = None) -> Flask:
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["Cache-Control"] = "no-store"
+        # Brand images carry their own short cache with an ETag (U6).
+        if request.endpoint != "auth.brand_asset":
+            response.headers["Cache-Control"] = "no-store"
         return response
 
     @app.before_request

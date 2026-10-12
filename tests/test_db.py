@@ -78,6 +78,7 @@ class DatabaseTest(unittest.TestCase):
                 "api_keys",
                 "settings",
                 "frappe_sync_log",
+                "branding_assets",
             },
         )
 
@@ -309,10 +310,45 @@ class DatabaseTest(unittest.TestCase):
             columns = {r["name"] for r in connection.execute("PRAGMA table_info(devices)").fetchall()}
             version = connection.execute("PRAGMA user_version").fetchone()["user_version"]
         self.assertTrue({"retired_at", "created_at"} <= columns)
-        self.assertEqual(version, 4)
+        self.assertEqual(version, db_module.SCHEMA_VERSION)
         row = old.device_by_id("uppal-x990")
         self.assertEqual(row["ip"], "10.2.2.2")
         self.assertIsNone(row["retired_at"])
+
+    def test_v4_to_v5_adds_branding_assets_and_reruns_safely(self) -> None:
+        self.database.close()
+        path = os.path.join(self._tmp.name, "v4.db")
+        old = db_module.Database(path)
+        self.addCleanup(old.close)
+        with mock.patch.object(db_module, "SCHEMA_VERSION", 4), \
+                mock.patch.dict(db_module.MIGRATIONS, {}, clear=False):
+            db_module.MIGRATIONS.pop(5)
+            old.initialize(self.devices[:0])
+        with old.connect() as connection:
+            tables = {r["name"] for r in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        self.assertNotIn("branding_assets", tables)
+        old.migrate_schema()
+        with old.transaction() as connection:  # simulate a re-run of step 5
+            connection.execute("UPDATE settings SET value='4' WHERE key='schema_version'")
+            connection.execute("PRAGMA user_version=4")
+        old.migrate_schema()
+        with old.connect() as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()["user_version"]
+        self.assertEqual(version, 5)
+        self.assertEqual(old.branding_versions(), {})
+
+    def test_branding_asset_round_trip_replace_and_delete(self) -> None:
+        self.database.initialize(self.devices)
+        png = b"\x89PNG\r\n\x1a\n" + b"\x01" * 10
+        self.database.set_branding_asset("logo", content_type="image/png", data=png, sha256="a" * 64)
+        asset = self.database.branding_asset("logo")
+        self.assertEqual(asset["data"], png)
+        self.assertEqual(asset["content_type"], "image/png")
+        self.database.set_branding_asset("logo", content_type="image/webp", data=b"RIFF", sha256="b" * 64)
+        self.assertEqual(self.database.branding_versions(), {"logo": "b" * 64})
+        self.database.delete_branding_asset("logo")
+        self.assertIsNone(self.database.branding_asset("logo"))
 
     def test_record_poll_commits_punches_and_device_row_together(self) -> None:
         inserted = self.database.record_poll(

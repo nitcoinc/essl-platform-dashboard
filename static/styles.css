@@ -29,6 +29,7 @@
   --accent-hover: #2a43a8;
   --accent-text: #ffffff;
   --accent-subtle: #eef1fc;
+  --auth-scrim: rgba(255, 255, 255, 0);
 
   /* Semantic roles */
   --bg: var(--gray-25);
@@ -114,6 +115,7 @@
     --accent-hover: #9aabf8;
     --accent-text: #0e0e10;
     --accent-subtle: #1c2140;
+    --auth-scrim: rgba(14, 14, 16, 0.55);
 
     --hover: rgba(236, 236, 240, 0.06);
 
@@ -152,6 +154,7 @@
     --accent-hover: #9aabf8;
     --accent-text: #0e0e10;
     --accent-subtle: #1c2140;
+    --auth-scrim: rgba(14, 14, 16, 0.55);
 
     --hover: rgba(236, 236, 240, 0.06);
 
@@ -589,6 +592,20 @@ input[type="file"]::file-selector-button {
 .auth-card .button { width: 100%; }
 .auth-brand { padding: 0; margin-bottom: var(--s2); }
 .auth-card .auth-error { margin-top: 0; }
+/* Sign-in branding (U6): the background stays behind a solid card so card
+   text keeps its normal AA contrast in both themes. */
+.auth-bg-color { background: var(--auth-bg); }
+.auth-bg-image { background: linear-gradient(var(--auth-scrim), var(--auth-scrim)), var(--auth-bg-image) center / cover no-repeat, var(--bg); }
+.auth-bg-color .auth-card, .auth-bg-image .auth-card {
+  padding: var(--s6); background: var(--surface); border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg); box-shadow: 0 8px 24px rgba(23, 23, 28, 0.12);
+}
+.auth-logo img { display: block; max-width: 180px; max-height: 48px; width: auto; height: auto; }
+.brand-preview { display: flex; align-items: center; gap: var(--s4); flex-wrap: wrap; margin-bottom: var(--s3); }
+.brand-preview img { max-width: 180px; max-height: 64px; padding: var(--s2); background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius); }
+.brand-modes { display: flex; flex-direction: column; gap: var(--s2); border: 0; padding: 0; margin: 0; }
+.brand-modes label { display: flex; align-items: center; gap: var(--s2); font-size: var(--text-13); }
+.brand-modes input[type="color"] { width: 44px; height: 28px; padding: 0; }
 .code-input { font-size: var(--text-20) !important; letter-spacing: 0.3em; font-variant-numeric: tabular-nums; }
 .auth-note { font-size: var(--text-13); color: var(--text-secondary); }
 

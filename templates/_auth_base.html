@@ -12,9 +12,16 @@
   </head>
   <body>
     {% include "_icons.html" %}
-    <main class="auth-wrap">
+    {% set b = signin_branding() %}
+    {# The background sits behind a solid card, never under text (DESIGN.md). #}
+    <main class="auth-wrap{% if b.mode == 'color' %} auth-bg-color{% elif b.mode == 'image' %} auth-bg-image{% endif %}"
+      {%- if b.mode == 'color' %} style="--auth-bg: {{ b.color }}"{% elif b.mode == 'image' %} style="--auth-bg-image: url('{{ url_for('auth.brand_asset', key='background', v=b.background_version) }}')"{% endif %}>
       <div class="auth-card">
+        {% if b.logo_version %}
+        <div class="auth-brand auth-logo"><img src="{{ url_for('auth.brand_asset', key='logo', v=b.logo_version) }}" alt="Attendance Hub"></div>
+        {% else %}
         <div class="brand auth-brand"><span class="brand-mark">{{ ui.icon('scan-line') }}</span><span class="brand-name">Attendance Hub</span></div>
+        {% endif %}
         {% block card %}{% endblock %}
       </div>
     </main>
