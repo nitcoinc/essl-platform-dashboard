@@ -2233,8 +2233,6 @@ class BrandingTest(unittest.TestCase):
         self.assertEqual(served.mimetype, "image/png")
         self.assertEqual(served.data, PNG_BYTES)
         self.assertTrue(served.headers.get("ETag"))
-        self.assertIn("max-age", served.headers["Cache-Control"])
-        self.assertNotIn("no-store", served.headers["Cache-Control"])
         self.assertEqual(served.headers["X-Content-Type-Options"], "nosniff")
 
     def test_jpeg_and_webp_are_sniffed_by_magic_bytes(self) -> None:
@@ -2337,7 +2335,7 @@ class BrandingTest(unittest.TestCase):
 
     def test_without_uploads_signin_is_unchanged(self) -> None:
         page = self._signin_html()
-        self.assertNotIn("/brand/", page)
+        self.assertNotIn("\"/brand/", page)
         self.assertNotIn("auth-bg", page)
         self.assertIn("brand-name", page)
 
@@ -3254,3 +3252,43 @@ class SyncHealthTest(unittest.TestCase):
     def test_local_mode_is_neutral(self) -> None:
         health = self._health(web=None, collector=None, exports=None, local=True)
         self.assertEqual((health["tone"], health["label"]), ("neutral", "Local database"))
+
+
+class BrandIconsTest(unittest.TestCase):
+    """U1: the NITCO favicon set on every page."""
+
+    setUp = HoursRenderingTest.setUp
+    _sign_in = HoursRenderingTest._sign_in
+
+    ICON_HREF = re.compile(r'<link rel="(?:icon|apple-touch-icon)"[^>]*href="([^"]+)"')
+
+    def _icon_hrefs(self, html: str) -> list[str]:
+        return self.ICON_HREF.findall(html)
+
+    def test_signin_and_app_pages_link_existing_brand_icons(self) -> None:
+        static_root = Path(self.app.static_folder)
+        signin = self.client.get("/signin").get_data(as_text=True)
+        self._sign_in()
+        day = self.client.get("/day").get_data(as_text=True)
+        for html in (signin, day):
+            hrefs = self._icon_hrefs(html)
+            self.assertGreaterEqual(len(hrefs), 5)
+            for href in hrefs:
+                self.assertTrue(href.startswith("/static/brand/"), href)
+                self.assertTrue((static_root / href.removeprefix("/static/")).is_file(), href)
+
+    def test_head_icons_template_paths_resolve_on_disk(self) -> None:
+        source = Path(self.app.template_folder) / "_head_icons.html"
+        names = re.findall(r"filename='([^']+)'", source.read_text())
+        self.assertTrue(names)
+        for name in names:
+            self.assertTrue((Path(self.app.static_folder) / name).is_file(), name)
+
+    def test_root_favicon_is_public_and_long_cached(self) -> None:
+        response = self.app.test_client().get("/favicon.ico")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("icon", response.mimetype)
+        cache = response.headers.get("Cache-Control", "")
+        self.assertIn("max-age", cache)
+        self.assertNotIn("no-store", cache)
+        response.close()

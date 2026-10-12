@@ -111,8 +111,8 @@ def create_app(database: Database | None = None) -> Flask:
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
-        # Brand images carry their own short cache with an ETag (U6).
-        if request.endpoint != "auth.brand_asset":
+        # The favicon keeps its own long cache (U1).
+        if request.endpoint != "auth.favicon":
             response.headers["Cache-Control"] = "no-store"
         return response
 

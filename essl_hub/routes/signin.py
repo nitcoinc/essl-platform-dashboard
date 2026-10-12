@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import secrets
 
-from flask import Blueprint, Response, abort, current_app, g, redirect, render_template, request, url_for
+from flask import Blueprint, Response, abort, current_app, g, redirect, render_template, request, send_from_directory, url_for
 
 from .. import auth, turnstile
 from .common import (
@@ -205,6 +205,19 @@ def brand_asset(key: str) -> Response:
     # Overrides the global no-store; ?v=<sha> in the page busts it on change.
     response.headers["Cache-Control"] = f"public, max-age={BRAND_MAX_AGE}"
     return response.make_conditional(request)
+
+
+FAVICON_MAX_AGE = 7 * 24 * 3600
+
+
+@bp.get("/favicon.ico")
+def favicon() -> Response:
+    # Public: browsers ask for /favicon.ico before anyone signs in.
+    response = send_from_directory(
+        current_app.static_folder, "brand/favicon.ico", mimetype="image/x-icon", max_age=FAVICON_MAX_AGE
+    )
+    response.headers["Cache-Control"] = f"public, max-age={FAVICON_MAX_AGE}"
+    return response
 
 
 @bp.get("/")

@@ -7,6 +7,7 @@
     <meta name="color-scheme" content="{{ 'light dark' if theme == 'system' else theme }}">
     <link rel="preload" href="{{ url_for('static', filename='fonts/InterVariable-latin.woff2') }}" as="font" type="font/woff2" crossorigin>
     <title>{% block title %}{% endblock %} - eSSL Attendance Hub</title>
+    {% include "_head_icons.html" %}
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
     {% if turnstile_site_key %}<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>{% endif %}
   </head>
