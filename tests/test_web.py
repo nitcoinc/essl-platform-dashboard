@@ -25,7 +25,8 @@ def _ist_now() -> datetime:
 
 
 def _ist_today():
-    return _ist_now().date()
+    # The app's "today" is the work day containing now (default start 06:00).
+    return (_ist_now() - timedelta(hours=6)).date()
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -604,6 +605,24 @@ class WebFlowTest(unittest.TestCase):
         self.assertEqual(role_response.status_code, 404)
 
 
+def _punch_row(fingerprint: str, at: datetime, direction: str, uid: str = "118") -> dict:
+    return {
+        "fingerprint": fingerprint,
+        "device_id": DEVICES[1].id,
+        "site": "Gachibowli",
+        "device_user_id": uid,
+        "event_timestamp": at,
+        "trusted_direction": direction,
+    }
+
+
+def _fixed_now(at: datetime):
+    """Pin the routes' clock (not auth's) so work-day rules are deterministic."""
+    return patch.multiple("essl_hub.routes.common", _now_naive=lambda: at), patch(
+        "essl_hub.routes.me._now_naive", lambda: at
+    )
+
+
 class HoursRenderingTest(unittest.TestCase):
     def setUp(self) -> None:
         self.app, self.database = _make_app()
@@ -708,6 +727,61 @@ class HoursRenderingTest(unittest.TestCase):
         self.assertIn("Missing exit punch", response.text)
         self.assertIn("No exit recorded", response.text)
 
+    def _at(self, at: datetime):
+        common, me = _fixed_now(at)
+        common.start()
+        me.start()
+        self.addCleanup(common.stop)
+        self.addCleanup(me.stop)
+
+    def test_at_three_am_today_is_still_the_previous_work_day_and_open(self) -> None:
+        self._sign_in()
+        day = datetime(2026, 9, 9)  # a Wednesday
+        self.database.insert_punches([_punch_row("fp-n1", day + timedelta(hours=22, minutes=10), "entry")])
+        self._at(day + timedelta(days=1, hours=3))
+        response = self.client.get("/day")
+        self.assertIn("<h1>Today</h1>", response.text)
+        self.assertIn("Wednesday 09 September 2026", response.text)
+        self.assertIn("work day from 06:00", response.text)
+        self.assertIn("Now, inside", response.text)
+        self.assertIn("+1</sup>", response.text)  # the 03:00 "now" node
+
+    def test_night_shift_day_view_marks_post_midnight_exit(self) -> None:
+        self._sign_in()
+        day = datetime(2026, 9, 9)
+        self.database.insert_punches([
+            _punch_row("fp-n1", day + timedelta(hours=22, minutes=10), "entry"),
+            _punch_row("fp-n2", day + timedelta(days=1, hours=3, minutes=40), "exit"),
+        ])
+        self._at(datetime(2026, 9, 12, 12))
+        response = self.client.get("/day?date=2026-09-09")
+        self.assertIn("5h 30m", response.text)
+        self.assertEqual(response.text.count("+1</sup>"), 1)
+        next_day = self.client.get("/day?date=2026-09-10")
+        self.assertNotIn("5h 30m", next_day.text)
+
+    def test_week_at_monday_three_am_still_shows_previous_week(self) -> None:
+        self._sign_in()
+        self._at(datetime(2026, 9, 14, 3))  # Monday
+        response = self.client.get("/week")
+        self.assertIn("Mon 07 Sep to Fri 11 Sep 2026", response.text)
+        self.assertIn("work days from 06:00", response.text)
+
+    def test_day_start_zero_restores_midnight_days(self) -> None:
+        self._sign_in()
+        self.database.set_setting("day_start_hour", "0")
+        day = datetime(2026, 9, 9)
+        self.database.insert_punches([
+            _punch_row("fp-n1", day + timedelta(hours=22, minutes=10), "entry"),
+            _punch_row("fp-n2", day + timedelta(days=1, hours=3, minutes=40), "exit"),
+        ])
+        self._at(datetime(2026, 9, 10, 3))
+        response = self.client.get("/day")
+        self.assertIn("Thursday 10 September 2026", response.text)
+        self.assertIn("work day from 00:00", response.text)
+        past = self.client.get("/day?date=2026-09-09")
+        self.assertIn("Missing exit punch", past.text)
+
     def test_employee_navigation_has_neither_hr_nor_admin_links(self) -> None:
         self._sign_in()
         page = self.client.get("/week")
@@ -808,6 +882,28 @@ class AdminViewTest(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.database.setting("daily_target_minutes"), "450")
+
+    def test_setting_day_start_hour_is_stored_and_confirmed(self) -> None:
+        self.assertEqual(self.database.setting("day_start_hour", "6"), "6")
+        self.assertIn('name="hour"', self.client.get("/settings").text)
+        response = self.client.post(
+            "/settings/day-start", data={"hour": "0", "csrf": self._csrf()}, follow_redirects=True
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.database.setting("day_start_hour"), "0")
+        self.assertIn("Work days now start at 00:00.", response.text)
+
+    def test_day_start_hour_outside_range_is_refused_inline(self) -> None:
+        for bad in ("24", "-1", "abc", ""):
+            response = self.client.post("/settings/day-start", data={"hour": bad, "csrf": self._csrf()})
+            self.assertEqual(response.status_code, 400, bad)
+            self.assertIn("Enter a whole hour from 0 to 23.", response.text)
+        self.assertIsNone(self.database.setting("day_start_hour"))
+
+    def test_day_start_hour_requires_csrf(self) -> None:
+        response = self.client.post("/settings/day-start", data={"hour": "5"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIsNone(self.database.setting("day_start_hour"))
 
     def test_covers_r21_unmapped_device_id_is_shown_on_the_devices_page(self) -> None:
         # Covers R21.
@@ -1280,6 +1376,24 @@ class ApiHoursTest(unittest.TestCase):
             headers={"Authorization": f"Bearer {key}"},
         )
         self.assertEqual(revoked_response.status_code, 401)
+
+    def test_hours_response_carries_day_start_and_uses_the_work_day(self) -> None:
+        key = self._create_key()
+        self.client.post("/signout")
+        day = datetime(2026, 9, 1)
+        self.database.insert_punches([
+            _punch_row("fp-a1", day + timedelta(hours=22, minutes=10), "entry"),
+            _punch_row("fp-a2", day + timedelta(days=1, hours=3, minutes=40), "exit"),
+        ])
+        response = self.client.get(
+            "/api/v1/hours?from=2026-09-01&to=2026-09-02",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+        body = response.get_json()
+        self.assertEqual(body["day_start"], "06:00")
+        ravi = {r["date"]: r for r in body["results"] if r["device_user_id"] == "118"}
+        self.assertEqual(ravi["2026-09-01"]["effective_minutes"], 330)
+        self.assertEqual(ravi["2026-09-02"]["status"], "empty")
 
     def test_range_longer_than_cap_is_refused(self) -> None:
         key = self._create_key()
@@ -1769,8 +1883,8 @@ class RolesAndVisibilityTest(unittest.TestCase):
 
     def test_team_puts_incomplete_and_empty_days_first(self) -> None:
         a, b, c, _ = self._team()
-        now = _ist_now().replace(second=0, microsecond=0)
-        start = now.replace(hour=0, minute=1)
+        # The first minutes of today's work day (default start 06:00).
+        start = datetime.combine(_ist_today(), datetime.min.time()) + timedelta(hours=6, minutes=1)
         # P40: a full closed day (met or short). P41: a lone exit (incomplete).
         punches = [
             ("40", start, "entry"), ("40", start + timedelta(minutes=5), "exit"),

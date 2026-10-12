@@ -189,8 +189,8 @@ def verify(
         for table in tables:
             source_rows = source.rows(table)
             target_rows = connection.execute(f"SELECT * FROM {table}").fetchall()
-            if table == "settings":  # schema_version is ours, not Postgres's
-                target_rows = [r for r in target_rows if r["key"] != "schema_version"]
+            if table == "settings":  # schema_version and day_start_hour are ours, not Postgres's
+                target_rows = [r for r in target_rows if r["key"] not in ("schema_version", "day_start_hour")]
             line = f"{table}: source={len(source_rows)} target={len(target_rows)}"
             out(line)
             if table == "punches":

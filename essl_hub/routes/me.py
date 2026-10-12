@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from flask import Blueprint, abort, g, render_template, request
 
 from .. import access, charts, day_story
 from .common import (
-    _TZ,
     _day_for_employee,
+    _day_start_hour,
+    _day_start_label,
     _login_required,
+    _now_naive,
     _parse_date,
     _target_minutes,
     _today,
@@ -46,7 +48,8 @@ def week_view() -> str:
     subject = _subject()
     offset = request.args.get("offset", 0, type=int)
     target_minutes = _target_minutes(database)
-    today = _today()
+    day_start_hour = _day_start_hour(database)
+    today = _today(day_start_hour)
     monday = today - timedelta(days=today.weekday()) + timedelta(weeks=offset)
     days = []
     week_total = 0
@@ -75,6 +78,7 @@ def week_view() -> str:
         target_minutes=target_minutes,
         offset=offset,
         today=today,
+        day_start=_day_start_label(day_start_hour),
     )
 
 
@@ -83,10 +87,12 @@ def week_view() -> str:
 def day_view() -> str:
     target_minutes = _target_minutes(database)
     subject = _subject()
-    day = _parse_date(request.args.get("date")) or _today()
+    day_start_hour = _day_start_hour(database)
+    today = _today(day_start_hour)
+    day = _parse_date(request.args.get("date")) or today
     result = _day_for_employee(database, subject, day, target_minutes)
-    is_today = day == _today()
-    now = datetime.now(_TZ).replace(tzinfo=None) if is_today else None
+    is_today = day == today
+    now = _now_naive() if is_today else None
     stretch_seconds = 0
     if result.status == "open" and now is not None:
         stretch_seconds = max(0, int((now - result.segments[-1].start).total_seconds()))
@@ -112,5 +118,6 @@ def day_view() -> str:
         finish_at=reached if result.status == "open" else None,
         last_synced=last_synced,
         target_minutes=target_minutes,
-        today=_today(),
+        today=today,
+        day_start=_day_start_label(day_start_hour),
     )

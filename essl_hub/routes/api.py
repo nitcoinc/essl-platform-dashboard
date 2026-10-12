@@ -13,6 +13,8 @@ from .common import (
     API_RANGE_MAX_DAYS,
     _date_range,
     _day_for_employee,
+    _day_start_hour,
+    _day_start_label,
     _parse_date,
     _now_naive,
     _target_minutes,
@@ -71,6 +73,8 @@ def api_hours() -> tuple[Response, int] | Response:
             "per_page": per_page,
             "total": total,
             "pages": max(1, (total + per_page - 1) // per_page),
+            # Work days run from this local time to the same time next day (R6).
+            "day_start": _day_start_label(_day_start_hour(database)),
         }
     )
 

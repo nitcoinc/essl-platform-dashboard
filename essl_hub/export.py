@@ -16,7 +16,7 @@ from datetime import date, datetime, timedelta
 import openpyxl
 from openpyxl.styles import Font
 
-from .hours import DayResult, Punch, compute_day
+from .hours import DEFAULT_DAY_START_HOUR, DayResult, Punch, compute_day, work_day, work_day_window
 
 MAX_RANGE_DAYS = 93
 HEADER = (
@@ -66,18 +66,20 @@ def day_results(
     target_minutes: int,
     today: date,
     now: datetime | None,
+    day_start_hour: int = DEFAULT_DAY_START_HOUR,
 ) -> dict[tuple[int, date], DayResult]:
-    """compute_day for every (person, day) in the range, from one punch query.
+    """compute_day for every (person, work day) in the range, from one punch
+    query spanning the first day's window start to the last day's window end.
     ``now`` is only used for ``today``, matching the single-day views."""
     rows = database.punches_for_device_users_range(
         [p["device_user_id"] for p in people],
-        datetime.combine(start, datetime.min.time()),
-        datetime.combine(end + timedelta(days=1), datetime.min.time()),
+        work_day_window(start, day_start_hour)[0],
+        work_day_window(end, day_start_hour)[1],
     )
     grouped: dict[tuple[str, date], list[Punch]] = defaultdict(list)
     for row in rows:
         stamp = row["event_timestamp"]
-        grouped[(row["device_user_id"], stamp.date())].append(
+        grouped[(row["device_user_id"], work_day(stamp, day_start_hour))].append(
             Punch(timestamp=stamp, trusted_direction=row["trusted_direction"])
         )
     results = {}
@@ -105,11 +107,13 @@ def export_rows(
     target_minutes: int,
     today: date,
     now: datetime | None,
+    day_start_hour: int = DEFAULT_DAY_START_HOUR,
 ) -> list[list[object]]:
     """Rows in HEADER order, by date then name. Minutes stay ints (gross is
     None when the day cannot be computed)."""
     results = day_results(
-        database, people, start, end, target_minutes=target_minutes, today=today, now=now
+        database, people, start, end, target_minutes=target_minutes, today=today, now=now,
+        day_start_hour=day_start_hour,
     )
     ordered = sorted(people, key=lambda p: (p["name"].lower(), p["id"]))
     rows = []

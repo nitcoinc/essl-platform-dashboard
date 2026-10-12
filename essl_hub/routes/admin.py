@@ -10,6 +10,7 @@ from flask import Blueprint, Response, abort, g, redirect, render_template, requ
 from .. import access, config, hashing
 from .common import (
     _ago,
+    _day_start_hour,
     _login_required,
     _now_naive,
     _require_csrf,
@@ -75,6 +76,9 @@ def _render_settings(status: int = 200, **overrides):
         "key_error": None,
         "csrf_token": g.csrf_token,
         "target_saved": request.args.get("saved") == "target",
+        "day_start_hour": _day_start_hour(database),
+        "day_start_saved": request.args.get("saved") == "day-start",
+        "day_start_error": None,
     }
     context.update(overrides)
     return render_template("settings.html", **context), status
@@ -182,6 +186,20 @@ def settings_set_target() -> Response:
     total = max(1, min(24 * 60, hours * 60 + minutes))
     database.set_setting("daily_target_minutes", str(total))
     return redirect(url_for("admin.settings_view", saved="target"))
+
+
+@bp.post("/settings/day-start")
+@_role_required("admin")
+def settings_set_day_start():
+    _require_csrf()
+    raw = (request.form.get("hour") or "").strip()
+    if not raw.isdigit() or not 0 <= int(raw) <= 23:
+        return _render_settings(
+            status=400,
+            day_start_error="Enter a whole hour from 0 to 23.",
+        )
+    database.set_setting("day_start_hour", str(int(raw)))
+    return redirect(url_for("admin.settings_view", saved="day-start"))
 
 
 @bp.post("/settings/keys")

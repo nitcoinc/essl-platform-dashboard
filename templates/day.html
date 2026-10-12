@@ -12,7 +12,7 @@
     {% if other %}<a class="back-link" href="{{ url_for('team.team_view') }}">{{ ui.icon('arrow-left') }}<span>{{ 'Everyone' if employee.role in ('hr', 'admin') else 'Team' }}</span></a>
     <p class="subject-name">{{ subject.name }}</p>{% endif %}
     <h1>{{ 'Today' if is_today else day.strftime('%A') }}</h1>
-    <p>{{ day.strftime('%A %d %B %Y') }}</p>
+    <p>{{ day.strftime('%A %d %B %Y') }} <span class="muted">· work day from {{ day_start }}</span></p>
   </div>
   <nav class="topbar-actions pager day-pager" aria-label="Day">
     <a class="button button-secondary button-icon" href="{{ url_for('me.day_view', employee=emp, date=prev_date.isoformat()) }}" aria-label="Previous day" title="Previous day">{{ ui.icon('chevron-left') }}</a>
@@ -76,11 +76,11 @@
     {% if item.kind == 'break' %}
     <li class="log-gap"><span class="log-gap-text">Break {{ ui.hours(item.minutes) }}</span></li>
     {% elif item.kind == 'in' %}
-    <li class="log-node is-in"><span class="log-dot" aria-hidden="true"></span><span class="log-time num">{{ item.time.strftime('%H:%M') }}</span><span class="log-label">In</span>{% if item.minutes is not none %}<span class="log-meta">Inside {{ ui.hours(item.minutes) }}</span>{% endif %}</li>
+    <li class="log-node is-in"><span class="log-dot" aria-hidden="true"></span><span class="log-time num">{{ item.time.strftime('%H:%M') }}{% if item.time.date() > day %}<sup title="Next calendar day">+1</sup>{% endif %}</span><span class="log-label">In</span>{% if item.minutes is not none %}<span class="log-meta">Inside {{ ui.hours(item.minutes) }}</span>{% endif %}</li>
     {% elif item.kind == 'out' %}
-    <li class="log-node is-out"><span class="log-dot" aria-hidden="true"></span><span class="log-time num">{{ item.time.strftime('%H:%M') }}</span><span class="log-label">Out</span></li>
+    <li class="log-node is-out"><span class="log-dot" aria-hidden="true"></span><span class="log-time num">{{ item.time.strftime('%H:%M') }}{% if item.time.date() > day %}<sup title="Next calendar day">+1</sup>{% endif %}</span><span class="log-label">Out</span></li>
     {% elif item.kind == 'now' %}
-    <li class="log-node is-now"><span class="log-dot" aria-hidden="true"></span><span class="log-time num">{{ item.time.strftime('%H:%M') }}</span><span class="log-label">Now, inside</span></li>
+    <li class="log-node is-now"><span class="log-dot" aria-hidden="true"></span><span class="log-time num">{{ item.time.strftime('%H:%M') }}{% if item.time.date() > day %}<sup title="Next calendar day">+1</sup>{% endif %}</span><span class="log-label">Now, inside</span></li>
     {% else %}
     <li class="log-node is-missing"><span class="log-dot" aria-hidden="true"></span><span class="log-time">--:--</span><span class="log-label">No exit recorded</span></li>
     {% endif %}

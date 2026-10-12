@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from typing import Literal
 
 Direction = Literal["entry", "exit"]
 DayStatus = Literal["empty", "met", "short", "incomplete", "open"]
 DirectionSource = Literal["raw_byte", "alternation", "mixed", "none"]
+
+# A work day runs from this hour to the same hour next day (R1). Night shifts
+# cross calendar midnight, so a midnight cut splits one shift over two days.
+DEFAULT_DAY_START_HOUR = 6
 
 
 @dataclass(frozen=True)
@@ -102,11 +106,16 @@ def compute_day(
     )
 
 
-def group_by_day(punches: list[Punch]) -> dict[date, list[Punch]]:
-    buckets: dict[date, list[Punch]] = {}
-    for punch in punches:
-        buckets.setdefault(punch.timestamp.date(), []).append(punch)
-    return buckets
+def work_day(timestamp: datetime, day_start_hour: int) -> date:
+    """The work day containing ``timestamp`` (naive IST): before the day-start
+    hour a time still belongs to the previous calendar day's work day."""
+    return (timestamp - timedelta(hours=day_start_hour)).date()
+
+
+def work_day_window(day: date, day_start_hour: int) -> tuple[datetime, datetime]:
+    """The half-open [start, end) window of work day ``day``."""
+    start = datetime.combine(day, time(hour=day_start_hour))
+    return start, start + timedelta(days=1)
 
 
 def _resolve_directions(

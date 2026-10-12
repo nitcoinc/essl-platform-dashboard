@@ -10,6 +10,7 @@ from .. import access, export
 from .common import (
     TEAM_ROLES,
     XLSX_MIMETYPE,
+    _day_start_hour,
     _int_list,
     _login_required,
     _now_naive,
@@ -39,10 +40,12 @@ def _team_rows(query: str) -> list[dict]:
         if person["id"] in visible
         and (not lowered or lowered in person["name"].lower() or lowered in person["email"].lower())
     ]
-    today = _today()
+    day_start_hour = _day_start_hour(database)
+    today = _today(day_start_hour)
     results = export.day_results(
         database, people, today, today,
         target_minutes=_target_minutes(database), today=today, now=_now_naive(),
+        day_start_hour=day_start_hour,
     )
     rows = [
         {
@@ -107,8 +110,10 @@ def hr_redirect() -> Response:
 # --- Exports (U9) ------------------------------------------------------
 
 def _export(kind: str):
+    day_start_hour = _day_start_hour(database)
+    today = _today(day_start_hour)
     try:
-        start, end = export.parse_range(request.args.get("from"), request.args.get("to"), _today())
+        start, end = export.parse_range(request.args.get("from"), request.args.get("to"), today)
     except export.RangeError as exc:
         return _render_team(export_error=str(exc), status=400)
     visible = access.visible_employee_ids(database, g.employee)
@@ -126,7 +131,7 @@ def _export(kind: str):
     rows = export.export_rows(
         database, people, start, end,
         manager_names=names, target_minutes=_target_minutes(database),
-        today=_today(), now=_now_naive(),
+        today=today, now=_now_naive(), day_start_hour=day_start_hour,
     )
     filename = f"attendance-{start.isoformat()}-to-{end.isoformat()}.{kind}"
     headers = {"Content-Disposition": f"attachment; filename={filename}"}

@@ -77,6 +77,44 @@ class ExportTest(unittest.TestCase):
         self.assertEqual(sheet.cell(row=2, column=6).data_type, "n")
         self.assertEqual(sheet.cell(row=2, column=7).data_type, "n")
 
+    def test_night_shift_punch_after_midnight_lands_in_previous_work_day(self) -> None:
+        people = self._people(1)
+        start = datetime.combine(self.day, datetime.min.time())
+        self.database.insert_punches([
+            self._punch("100", start + timedelta(hours=22, minutes=10), "entry", 1),
+            self._punch("100", start + timedelta(days=1, hours=3, minutes=40), "exit", 2),
+        ])
+        first, second = self._rows(people, self.day, self.day + timedelta(days=1))
+        self.assertEqual(first[0], self.day.isoformat())
+        self.assertEqual(first[export.HEADER.index("effective_minutes")], 330)
+        self.assertEqual(first[export.HEADER.index("status")], "short")
+        self.assertEqual(second[export.HEADER.index("status")], "empty")
+
+    def test_range_query_reaches_into_the_next_morning(self) -> None:
+        people = self._people(1)
+        start = datetime.combine(self.day, datetime.min.time())
+        self.database.insert_punches([
+            self._punch("100", start + timedelta(hours=22), "entry", 1),
+            self._punch("100", start + timedelta(days=1, hours=5, minutes=59), "exit", 2),
+            self._punch("100", start + timedelta(hours=5), "entry", 3),  # previous work day
+        ])
+        (row,) = self._rows(people, self.day, self.day)
+        self.assertEqual(row[export.HEADER.index("effective_minutes")], 479)
+
+    def test_day_start_hour_zero_restores_calendar_days(self) -> None:
+        people = self._people(1)
+        start = datetime.combine(self.day, datetime.min.time())
+        self.database.insert_punches([
+            self._punch("100", start + timedelta(hours=22, minutes=10), "entry", 1),
+            self._punch("100", start + timedelta(days=1, hours=3, minutes=40), "exit", 2),
+        ])
+        first, second = export.export_rows(
+            self.database, people, self.day, self.day + timedelta(days=1), manager_names={},
+            target_minutes=480, today=date(2026, 10, 10), now=None, day_start_hour=0,
+        )
+        self.assertEqual(first[export.HEADER.index("status")], "incomplete")
+        self.assertEqual(second[export.HEADER.index("status")], "incomplete")
+
     def test_range_validation(self) -> None:
         today = date(2026, 10, 10)
         self.assertEqual(export.parse_range(None, None, today), (today, today))

@@ -15,7 +15,7 @@ from werkzeug.local import LocalProxy
 from .. import config, roster
 from ..config import TIMEZONE_NAME
 from ..db import Database
-from ..hours import DayResult, Punch, compute_day
+from ..hours import DEFAULT_DAY_START_HOUR, DayResult, Punch, compute_day, work_day, work_day_window
 
 
 _TZ = ZoneInfo(TIMEZONE_NAME)
@@ -124,6 +124,19 @@ def _target_minutes(database: Database) -> int:
     return int(database.setting("daily_target_minutes", "480"))
 
 
+def _day_start_hour(database: Database) -> int:
+    """The work-day start hour (R1); a missing or corrupt value falls back."""
+    try:
+        hour = int(database.setting("day_start_hour", str(DEFAULT_DAY_START_HOUR)))
+    except (TypeError, ValueError):
+        return DEFAULT_DAY_START_HOUR
+    return hour if 0 <= hour <= 23 else DEFAULT_DAY_START_HOUR
+
+
+def _day_start_label(day_start_hour: int) -> str:
+    return f"{day_start_hour:02d}:00"
+
+
 def _roster_rows(filename: str, raw: bytes) -> list[roster.RosterRow]:
     """Normalize an uploaded roster file into the (row, name, email, device ID)
     rows the CSV path already produces, branching on the file extension before
@@ -190,8 +203,11 @@ def _int_list(values: list[str]) -> list[int]:
     return [int(v) for v in values if v.strip().isdigit()]
 
 
-def _today() -> date:
-    return datetime.now(_TZ).date()
+def _today(day_start_hour: int | None = None) -> date:
+    """The work day containing now (R2): at 03:00 that is still yesterday's."""
+    if day_start_hour is None:
+        day_start_hour = _day_start_hour(database)
+    return work_day(_now_naive(), day_start_hour)
 
 
 def _parse_date(value: str | None) -> date | None:
@@ -211,16 +227,16 @@ def _date_range(start: date, end: date):
 
 
 def _day_for_employee(database: Database, employee: dict, day: date, target_minutes: int) -> DayResult:
-    start = datetime.combine(day, datetime.min.time())
-    end = start + timedelta(days=1)
+    day_start_hour = _day_start_hour(database)
+    start, end = work_day_window(day, day_start_hour)
     rows = database.punches_for_employee_range(employee["device_user_id"], start, end)
     punches = [
         Punch(timestamp=row["event_timestamp"], trusted_direction=row["trusted_direction"])
         for row in rows
     ]
-    today = _today()
-    is_today = day == today
-    now = datetime.now(_TZ).replace(tzinfo=None) if is_today else None
+    now = _now_naive()
+    is_today = day == work_day(now, day_start_hour)
+    now = now if is_today else None
     return compute_day(punches, target_minutes=target_minutes, now=now, is_today=is_today)
 
 

@@ -5,7 +5,7 @@
 <header class="topbar">
   <div>
     <h1>Settings</h1>
-    <p>The daily target and the keys your HRMS uses to read hours.</p>
+    <p>The daily target, when a work day starts, and the keys your HRMS uses to read hours.</p>
   </div>
 </header>
 
@@ -25,6 +25,21 @@
     {{ ui.button('Save target', 'primary', type='submit') }}
   </form>
   {% if target_saved %}<p class="device-note" role="status">{{ ui.icon('check') }}<span>Target saved: {{ ui.hours(target_minutes) }} a day.</span></p>{% endif %}
+</section>
+
+<section class="admin-section" aria-labelledby="day-start-heading">
+  <h2 id="day-start-heading">Work day starts at</h2>
+  <p class="section-intro">A work day runs from this hour to the same hour next day, so a night shift that crosses midnight counts as one day. Changing it re-scores every past day too.</p>
+  {% if day_start_error %}{{ ui.inline_error(day_start_error) }}{% endif %}
+  <form method="post" action="{{ url_for('admin.settings_set_day_start') }}" class="target-form">
+    <input type="hidden" name="csrf" value="{{ csrf_token }}">
+    <div class="field">
+      <label for="day-start-hour">Hour (0-23)</label>
+      <input id="day-start-hour" type="number" name="hour" min="0" max="23" value="{{ day_start_hour }}" inputmode="numeric"{% if day_start_error %} aria-invalid="true"{% endif %}>
+    </div>
+    {{ ui.button('Save start hour', 'primary', type='submit') }}
+  </form>
+  {% if day_start_saved %}<p class="device-note" role="status">{{ ui.icon('check') }}<span>Work days now start at {{ '%02d' % day_start_hour }}:00.</span></p>{% endif %}
 </section>
 
 <section class="admin-section" aria-labelledby="keys-heading">

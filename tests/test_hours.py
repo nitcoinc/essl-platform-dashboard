@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime
+from datetime import date, datetime
 
-from essl_hub.hours import Punch, compute_day, group_by_day
+from essl_hub.hours import Punch, compute_day, work_day, work_day_window
 
 
 def _t(hour: int, minute: int, day: int = 10) -> datetime:
@@ -122,17 +122,32 @@ class ComputeDayTest(unittest.TestCase):
         self.assertEqual(result.effective_minutes, 360)
 
 
-class GroupByDayTest(unittest.TestCase):
-    def test_groups_punches_by_calendar_day(self) -> None:
-        punches = [
-            Punch(_t(9, 0, day=9), "entry"),
-            Punch(_t(17, 0, day=9), "exit"),
-            Punch(_t(9, 0, day=10), "entry"),
-        ]
-        buckets = group_by_day(punches)
-        self.assertEqual(len(buckets), 2)
-        self.assertEqual(len(buckets[_t(9, 0, day=9).date()]), 2)
-        self.assertEqual(len(buckets[_t(9, 0, day=10).date()]), 1)
+class WorkDayTest(unittest.TestCase):
+    def test_night_shift_across_midnight_is_one_work_day(self) -> None:
+        punch_in, punch_out = _t(22, 10, day=9), _t(3, 40, day=10)
+        self.assertEqual(work_day(punch_in, 6), date(2026, 9, 9))
+        self.assertEqual(work_day(punch_out, 6), date(2026, 9, 9))
+        result = compute_day(
+            [Punch(punch_in, "entry"), Punch(punch_out, "exit")], target_minutes=480
+        )
+        self.assertEqual(result.status, "short")
+        self.assertEqual(result.effective_minutes, 330)
+
+    def test_day_start_hour_belongs_to_the_new_work_day(self) -> None:
+        self.assertEqual(work_day(_t(6, 0, day=10), 6), date(2026, 9, 10))
+        self.assertEqual(work_day(datetime(2026, 9, 10, 5, 59, 59), 6), date(2026, 9, 9))
+
+    def test_window_is_half_open_from_start_hour_to_next_day(self) -> None:
+        start, end = work_day_window(date(2026, 9, 9), 6)
+        self.assertEqual(start, _t(6, 0, day=9))
+        self.assertEqual(end, _t(6, 0, day=10))
+        self.assertEqual(work_day(start, 6), date(2026, 9, 9))
+        self.assertEqual(work_day(end, 6), date(2026, 9, 10))
+
+    def test_hour_zero_is_calendar_midnight(self) -> None:
+        self.assertEqual(work_day(_t(0, 0, day=10), 0), date(2026, 9, 10))
+        self.assertEqual(work_day(_t(23, 59, day=9), 0), date(2026, 9, 9))
+        self.assertEqual(work_day_window(date(2026, 9, 9), 0), (_t(0, 0, day=9), _t(0, 0, day=10)))
 
 
 if __name__ == "__main__":

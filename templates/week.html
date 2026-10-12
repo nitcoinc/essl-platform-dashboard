@@ -11,7 +11,7 @@
     {% if other %}<a class="back-link" href="{{ url_for('team.team_view') }}">{{ ui.icon('arrow-left') }}<span>{{ 'Everyone' if employee.role in ('hr', 'admin') else 'Team' }}</span></a>
     <p class="subject-name">{{ subject.name }}</p>{% endif %}
     <h1>{{ 'This week' if offset == 0 else ('Last week' if offset == -1 else 'Week of ' ~ days[0].date.strftime('%d %B')) }}</h1>
-    <p>{{ days[0].date.strftime('%a %d %b') }} to {{ days[-1].date.strftime('%a %d %b %Y') }}</p>
+    <p>{{ days[0].date.strftime('%a %d %b') }} to {{ days[-1].date.strftime('%a %d %b %Y') }} <span class="muted">· work days from {{ day_start }}</span></p>
   </div>
   <nav class="topbar-actions pager" aria-label="Week">
     <a class="button button-secondary button-icon" href="{{ url_for('me.week_view', employee=emp, offset=offset - 1) }}" aria-label="Previous week" title="Previous week">{{ ui.icon('chevron-left') }}</a>

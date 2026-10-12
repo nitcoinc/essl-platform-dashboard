@@ -389,6 +389,7 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
 }
 
 DEFAULT_TARGET_MINUTES = "480"
+DEFAULT_DAY_START_HOUR = "6"
 
 
 def _schema_version(connection: Any) -> int:
@@ -675,6 +676,11 @@ class Database:
                 "INSERT INTO settings (key, value) VALUES ('daily_target_minutes', ?) "
                 "ON CONFLICT (key) DO NOTHING",
                 (DEFAULT_TARGET_MINUTES,),
+            )
+            connection.execute(
+                "INSERT INTO settings (key, value) VALUES ('day_start_hour', ?) "
+                "ON CONFLICT (key) DO NOTHING",
+                (DEFAULT_DAY_START_HOUR,),
             )
 
     def initialize(self, devices: Iterable[DeviceConfig]) -> None:
