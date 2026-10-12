@@ -7,6 +7,7 @@ from datetime import timedelta
 from flask import Blueprint, abort, g, render_template, request
 
 from .. import access, charts, day_story
+from ..hours import work_day
 from .common import (
     _day_for_employee,
     _day_start_hour,
@@ -88,11 +89,14 @@ def day_view() -> str:
     target_minutes = _target_minutes(database)
     subject = _subject()
     day_start_hour = _day_start_hour(database)
-    today = _today(day_start_hour)
+    # One instant per request: the result, the stretch and (U11) the server
+    # epoch all derive from it, so ring and stretch never disagree by a second.
+    request_now = _now_naive()
+    today = work_day(request_now, day_start_hour)
     day = _parse_date(request.args.get("date")) or today
-    result = _day_for_employee(database, subject, day, target_minutes)
+    result = _day_for_employee(database, subject, day, target_minutes, now=request_now)
     is_today = day == today
-    now = _now_naive() if is_today else None
+    now = request_now if is_today else None
     stretch_seconds = 0
     if result.status == "open" and now is not None:
         stretch_seconds = max(0, int((now - result.segments[-1].start).total_seconds()))

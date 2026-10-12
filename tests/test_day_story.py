@@ -63,5 +63,23 @@ class LogTest(unittest.TestCase):
         self.assertEqual(day_story.ring_percent(_result("short", 240, []), 480), 50)
 
 
+class SecondsTest(unittest.TestCase):
+    def test_log_stretch_seconds_sum_to_effective_seconds(self) -> None:
+        from essl_hub.hours import Punch, compute_day
+
+        punches = [Punch(_at(9).replace(second=12), "entry"), Punch(_at(12, 40).replace(second=59), "exit"),
+                   Punch(_at(13, 15).replace(second=3), "entry")]
+        now = _at(16, 2).replace(second=41)
+        result = compute_day(punches, target_minutes=480, now=now, is_today=True)
+        items = day_story.log_items(result, now)
+        ins = [i.seconds for i in items if i.kind == "in"]
+        self.assertEqual(sum(ins), result.effective_seconds)
+        self.assertEqual([i.seconds for i in items if i.kind == "break"], [34 * 60 + 4])
+
+    def test_target_reached_at_uses_seconds(self) -> None:
+        r = _result("met", 480, [Segment(_at(9).replace(second=30), _at(17, 30))])
+        self.assertEqual(day_story.target_reached_at(r, 480, None), _at(17).replace(second=30))
+
+
 if __name__ == "__main__":
     unittest.main()

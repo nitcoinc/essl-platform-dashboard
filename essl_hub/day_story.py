@@ -17,6 +17,7 @@ class LogItem:
     kind: str  # "in" | "out" | "break" | "now" | "missing"
     time: datetime | None
     minutes: int | None = None  # stretch length on "in", gap on "break"
+    seconds: int | None = None  # exact length; "in" stretches sum to effective_seconds
 
 
 @dataclass(frozen=True)
@@ -29,23 +30,29 @@ def _fmt(minutes: int) -> str:
     return f"{minutes // 60}h {minutes % 60:02d}m"
 
 
-def _minutes(a: datetime, b: datetime) -> int:
-    return max(0, int((b - a).total_seconds() // 60))
+def _seconds(a: datetime, b: datetime) -> int:
+    return max(0, int((b - a).total_seconds()))
+
+
+def _stretch(kind: str, time: datetime | None, a: datetime, b: datetime) -> LogItem:
+    seconds = _seconds(a, b)
+    return LogItem(kind, time, seconds // 60, seconds)
 
 
 def target_reached_at(result: DayResult, target_minutes: int, now: datetime | None) -> datetime | None:
     """When effective time crossed (or, while inside, will cross) the target."""
+    target = target_minutes * 60
     done = 0
     for seg in result.segments:
         end = seg.end or now
         if end is None:
             return None
-        length = _minutes(seg.start, end)
-        if done + length >= target_minutes:
-            return seg.start + timedelta(minutes=target_minutes - done)
+        length = _seconds(seg.start, end)
+        if done + length >= target:
+            return seg.start + timedelta(seconds=target - done)
         done += length
     if result.status == "open" and now is not None:
-        return now + timedelta(minutes=target_minutes - done)
+        return now + timedelta(seconds=target - done)
     return None
 
 
@@ -75,16 +82,16 @@ def log_items(result: DayResult, now: datetime | None) -> list[LogItem]:
     previous_end: datetime | None = None
     for seg in result.segments:
         if previous_end is not None:
-            items.append(LogItem("break", None, _minutes(previous_end, seg.start)))
+            items.append(_stretch("break", None, previous_end, seg.start))
         end = seg.end
         if end is None and result.status == "open" and now is not None:
-            items.append(LogItem("in", seg.start, _minutes(seg.start, now)))
+            items.append(_stretch("in", seg.start, seg.start, now))
             items.append(LogItem("now", now))
         elif end is None:
             items.append(LogItem("in", seg.start))
             items.append(LogItem("missing", None))
         else:
-            items.append(LogItem("in", seg.start, _minutes(seg.start, end)))
+            items.append(_stretch("in", seg.start, seg.start, end))
             items.append(LogItem("out", end))
         previous_end = end
     return items

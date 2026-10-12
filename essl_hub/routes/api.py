@@ -46,10 +46,11 @@ def api_hours() -> tuple[Response, int] | Response:
     per_page = min(max(request.args.get("per_page", 200, type=int), 1), API_PAGE_SIZE_MAX)
     target_minutes = _target_minutes(database)
 
+    now = _now_naive()
     rows = []
     for employee in database.employees():
         for day in _date_range(start, end):
-            result = _day_for_employee(database, employee, day, target_minutes)
+            result = _day_for_employee(database, employee, day, target_minutes, now=now)
             rows.append(
                 {
                     "date": day.isoformat(),
@@ -58,6 +59,7 @@ def api_hours() -> tuple[Response, int] | Response:
                     "device_user_id": employee["device_user_id"],
                     "gross_minutes": result.gross_minutes,
                     "effective_minutes": result.effective_minutes,
+                    "effective_seconds": result.effective_seconds,
                     "status": result.status,
                     "anomalies": list(result.anomalies),
                 }

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from essl_hub.hours import Punch, Segment, compute_day, work_day, work_day_window
 
@@ -242,3 +242,52 @@ class OrphanTolerantPairingTest(unittest.TestCase):
         result = compute_day(punches, target_minutes=480)
         self.assertEqual((result.status, result.effective_minutes, result.gross_minutes), ("met", 480, 540))
         self.assertEqual(result.anomalies, ("No exit after 19:00",))
+
+
+class ExactSecondsTest(unittest.TestCase):
+    def _s(self, hour: int, minute: int, second: int) -> datetime:
+        return datetime(2026, 9, 10, hour, minute, second)
+
+    def test_six_stretches_sum_exact_seconds(self) -> None:
+        punches = []
+        start = self._s(6, 0, 0)
+        for i in range(6):
+            begin = start + timedelta(hours=1, minutes=30) * i
+            punches += [Punch(begin, "entry"), Punch(begin + timedelta(hours=1, minutes=20, seconds=50), "exit")]
+        result = compute_day(punches, target_minutes=480)
+        self.assertEqual(result.effective_seconds, 29_100)
+        self.assertEqual(result.effective_minutes, 485)
+        self.assertEqual(result.status, "met")
+
+    def test_status_and_display_agree_at_the_target(self) -> None:
+        short = compute_day([Punch(self._s(9, 0, 0), "entry"), Punch(self._s(16, 59, 30), "exit")], target_minutes=480)
+        self.assertEqual((short.status, short.effective_minutes), ("short", 479))
+        met = compute_day([Punch(self._s(9, 0, 0), "entry"), Punch(self._s(17, 0, 0), "exit")], target_minutes=480)
+        self.assertEqual((met.status, met.effective_minutes), ("met", 480))
+
+    def test_minute_view_adds_up_and_break_seconds_exact(self) -> None:
+        # gross 30,600 s; effective 28,830 s (break 1,770 s).
+        punches = [
+            Punch(self._s(9, 0, 0), "entry"),
+            Punch(self._s(13, 0, 0), "exit"),
+            Punch(self._s(13, 29, 30), "entry"),
+            Punch(self._s(17, 30, 0), "exit"),
+        ]
+        result = compute_day(punches, target_minutes=480)
+        self.assertEqual((result.gross_seconds, result.effective_seconds, result.break_seconds), (30_600, 28_830, 1_770))
+        self.assertEqual((result.gross_minutes, result.effective_minutes, result.break_minutes), (510, 480, 30))
+
+    def test_open_today_counts_elapsed_seconds(self) -> None:
+        punches = [Punch(self._s(9, 0, 15), "entry"), Punch(self._s(12, 0, 0), "exit"), Punch(self._s(13, 0, 0), "entry")]
+        result = compute_day(punches, target_minutes=480, now=self._s(14, 0, 45), is_today=True)
+        self.assertEqual(result.status, "open")
+        self.assertEqual(result.effective_seconds, (3 * 3600 - 15) + 3645)
+        self.assertEqual(result.gross_seconds, 5 * 3600 + 30)
+
+    def test_clean_whole_minute_day_has_matching_seconds(self) -> None:
+        result = compute_day([Punch(_t(9, 0), "entry"), Punch(_t(17, 30), "exit")], target_minutes=480)
+        self.assertEqual((result.effective_minutes, result.effective_seconds), (510, 510 * 60))
+
+    def test_incomplete_day_has_no_gross(self) -> None:
+        result = compute_day([Punch(_t(9, 0), "exit")], target_minutes=480)
+        self.assertEqual((result.status, result.gross_seconds, result.effective_seconds), ("incomplete", None, 0))

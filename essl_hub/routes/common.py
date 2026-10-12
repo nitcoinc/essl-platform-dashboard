@@ -242,7 +242,11 @@ def _date_range(start: date, end: date):
         day += timedelta(days=1)
 
 
-def _day_for_employee(database: Database, employee: dict, day: date, target_minutes: int) -> DayResult:
+def _day_for_employee(
+    database: Database, employee: dict, day: date, target_minutes: int, now: datetime | None = None
+) -> DayResult:
+    """Score one work day. Pass ``now`` to share one instant across a request,
+    so every figure on a page is measured from the same second (R17/U11)."""
     day_start_hour = _day_start_hour(database)
     start, end = work_day_window(day, day_start_hour)
     rows = database.punches_for_employee_range(employee["device_user_id"], start, end)
@@ -250,7 +254,7 @@ def _day_for_employee(database: Database, employee: dict, day: date, target_minu
         Punch(timestamp=row["event_timestamp"], trusted_direction=row["trusted_direction"])
         for row in rows
     ]
-    now = _now_naive()
+    now = now or _now_naive()
     is_today = day == work_day(now, day_start_hour)
     now = now if is_today else None
     return compute_day(punches, target_minutes=target_minutes, now=now, is_today=is_today)

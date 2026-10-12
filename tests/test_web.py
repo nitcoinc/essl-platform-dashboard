@@ -791,6 +791,19 @@ class HoursRenderingTest(unittest.TestCase):
         self.assertIn("Now, inside", response.text)
         self.assertIn("+1</sup>", response.text)  # the 03:00 "now" node
 
+    def test_day_view_reads_one_clock_instant_per_request(self) -> None:
+        # U10: a clock that ticks on every read must still yield one stretch
+        # value measured from the first (and only) read.
+        self._sign_in()
+        day = datetime(2026, 9, 9)
+        self.database.insert_punches([_punch_row("fp-s1", day + timedelta(hours=9), "entry")])
+        first = day + timedelta(hours=11, seconds=5)
+        ticks = iter(first + timedelta(seconds=n) for n in range(100))
+        clock = lambda: next(ticks)  # noqa: E731
+        with patch("essl_hub.routes.common._now_naive", clock), patch("essl_hub.routes.me._now_naive", clock):
+            response = self.client.get("/day")
+        self.assertIn('data-timer-seconds="7205"', response.text)
+
     def test_night_shift_day_view_marks_post_midnight_exit(self) -> None:
         self._sign_in()
         day = datetime(2026, 9, 9)
@@ -1651,6 +1664,23 @@ class ApiHoursTest(unittest.TestCase):
         ravi = [r for r in response.get_json()["results"] if r["device_user_id"] == "118"][0]
         self.assertEqual(ravi["effective_minutes"], 480)
         self.assertEqual(ravi["anomalies"], ["Exit at 08:00 with no entry"])
+
+    def test_hours_response_adds_exact_effective_seconds(self) -> None:
+        key = self._create_key()
+        self.client.post("/signout")
+        day = datetime(2026, 9, 1)
+        self.database.insert_punches([
+            _punch_row("fp-x1", day + timedelta(hours=9, seconds=10), "entry"),
+            _punch_row("fp-x2", day + timedelta(hours=16, minutes=59, seconds=40), "exit"),
+        ])
+        response = self.client.get(
+            "/api/v1/hours?from=2026-09-01&to=2026-09-01",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+        ravi = [r for r in response.get_json()["results"] if r["device_user_id"] == "118"][0]
+        self.assertEqual(ravi["effective_seconds"], 7 * 3600 + 59 * 60 + 30)
+        self.assertEqual(ravi["effective_minutes"], 479)
+        self.assertEqual(ravi["status"], "short")
 
     def test_range_longer_than_cap_is_refused(self) -> None:
         key = self._create_key()

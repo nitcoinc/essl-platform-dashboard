@@ -36,6 +36,10 @@ class DayResult:
     direction_source: DirectionSource
     # Review notes for unmatched swipes, e.g. "No exit after 14:33" (R3).
     anomalies: tuple[str, ...] = ()
+    # Exact durations (R17); the *_minutes fields are floored views of these.
+    effective_seconds: int = 0
+    gross_seconds: int | None = 0
+    break_seconds: int = 0
 
 
 def compute_day(
@@ -63,18 +67,10 @@ def compute_day(
     # R4: inside now on today's work day is open, whatever orphans came before.
     if open_start is not None and is_today and now is not None:
         segments.append(Segment(start=open_start, end=None))
-        effective = sum(_minutes(s.end - s.start) for s in segments if s.end is not None)
-        effective += _minutes(now - open_start)
-        gross = _minutes(now - segments[0].start)
-        return DayResult(
-            status="open",
-            gross_minutes=gross,
-            effective_minutes=effective,
-            break_minutes=gross - effective,
-            segments=tuple(segments),
-            direction_source=direction_source,
-            anomalies=anomalies,
-        )
+        effective = sum(_seconds(s.end - s.start) for s in segments if s.end is not None)
+        effective += _seconds(now - open_start)
+        gross = _seconds(now - segments[0].start)
+        return _scored("open", gross, effective, segments, direction_source, anomalies)
 
     closed = list(segments)
     if open_start is not None:
@@ -92,19 +88,40 @@ def compute_day(
             segments=tuple(segments),
             direction_source=direction_source,
             anomalies=anomalies,
+            gross_seconds=None,
         )
 
-    effective = sum(_minutes(s.end - s.start) for s in closed)
-    gross = _minutes(closed[-1].end - closed[0].start)
-    status: DayStatus = "met" if effective >= target_minutes else "short"
+    effective = sum(_seconds(s.end - s.start) for s in closed)
+    gross = _seconds(closed[-1].end - closed[0].start)
+    # R17: compare exact seconds; the target is whole minutes, so the floored
+    # minute display never disagrees with the status.
+    status: DayStatus = "met" if effective >= target_minutes * 60 else "short"
+    return _scored(status, gross, effective, segments, direction_source, anomalies)
+
+
+def _scored(
+    status: DayStatus,
+    gross: int,
+    effective: int,
+    segments: list[Segment],
+    direction_source: DirectionSource,
+    anomalies: tuple[str, ...],
+) -> DayResult:
+    """Build a scored result from exact seconds. Break minutes are gross minus
+    effective minutes so the minute view adds up (flooring break alone drifts)."""
+    gross_minutes = gross // 60
+    effective_minutes = effective // 60
     return DayResult(
         status=status,
-        gross_minutes=gross,
-        effective_minutes=effective,
-        break_minutes=gross - effective,
+        gross_minutes=gross_minutes,
+        effective_minutes=effective_minutes,
+        break_minutes=gross_minutes - effective_minutes,
         segments=tuple(segments),
         direction_source=direction_source,
         anomalies=anomalies,
+        effective_seconds=effective,
+        gross_seconds=gross,
+        break_seconds=gross - effective,
     )
 
 
@@ -177,5 +194,5 @@ def _anomaly_text(timestamp: datetime, direction: Direction) -> str:
     return f"Exit at {timestamp:%H:%M} with no entry"
 
 
-def _minutes(delta) -> int:
-    return int(delta.total_seconds() // 60)
+def _seconds(delta) -> int:
+    return int(delta.total_seconds())
