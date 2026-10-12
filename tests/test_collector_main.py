@@ -540,6 +540,25 @@ class SpoolCycleTest(unittest.TestCase):
         self.assertEqual(status["spool_depth"], 0)
         self.assertIsNone(status["spool_oldest_at"])
 
+    def test_status_times_are_ist_even_when_the_host_clock_is_utc(self) -> None:
+        # The web reads these as naive IST; a UTC container once made a live
+        # collector look 5.5 h stale ("Collector stopped reporting").
+        import time
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+        with patch.dict(os.environ, {"TZ": "UTC"}):
+            time.tzset()
+            database = _SwitchableDatabase()
+            database.offline = True
+            self.batches = [[_punch("fp-1")]]
+            with self.assertLogs(collector_main._logger, level="WARNING"):
+                status = self._cycle(database)
+        time.tzset()
+        ist_now = datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
+        for key in ("last_poll", "spool_oldest_at"):
+            stamp = datetime.fromisoformat(status[key])
+            self.assertLess(abs(ist_now - stamp), timedelta(minutes=1), key)
+
     def test_boot_with_turso_unreachable_polls_spools_and_reports_then_drains(self) -> None:
         database = _SwitchableDatabase()
         database.offline = True

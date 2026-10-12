@@ -8,10 +8,12 @@ import tempfile
 import time
 from datetime import datetime
 from typing import Callable
+from zoneinfo import ZoneInfo
 
 from .collectors import CollectionResult, collect
 from .config import (
     DEVICES,
+    TIMEZONE_NAME,
     DeviceConfig,
     collector_interval_seconds,
     collector_status_path,
@@ -281,7 +283,8 @@ def run_cycle(
             collect_once(database, device, collector=collector, state=state, spool=spool)
         except Exception:
             _logger.warning("poll cycle for %s failed; retrying next interval", device.id, exc_info=True)
-    state.last_poll = datetime.now().replace(microsecond=0).isoformat(sep=" ")
+    # Naive IST (the web compares in IST); containers run in UTC.
+    state.last_poll = datetime.now(ZoneInfo(TIMEZONE_NAME)).replace(tzinfo=None, microsecond=0).isoformat(sep=" ")
     if frappe is not None and ready:
         frappe.maybe_run()
     if status_path is not None:

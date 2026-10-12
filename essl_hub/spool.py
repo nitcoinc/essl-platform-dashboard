@@ -15,6 +15,9 @@ import sqlite3
 import threading
 from dataclasses import dataclass
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from .config import TIMEZONE_NAME
 
 MAX_ATTEMPTS = 20
 
@@ -53,7 +56,8 @@ class SpoolEntry:
 
 
 def _now() -> str:
-    return datetime.now().replace(microsecond=0).isoformat(sep=" ")
+    # Naive IST like every status time; containers run in UTC.
+    return datetime.now(ZoneInfo(TIMEZONE_NAME)).replace(tzinfo=None, microsecond=0).isoformat(sep=" ")
 
 
 class Spool:
