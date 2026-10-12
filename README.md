@@ -69,10 +69,23 @@ Then open your public hostname, go to `/setup`, enter the token, and import the 
 
 | Command | What it does |
 | --- | --- |
-| `./deploy/install.sh` | Full install or update. Safe to re-run; it only fills empty values. |
+| `./deploy/install.sh` | Full install **or update** (pulls the latest code first). Safe to re-run; it only fills empty values. |
 | `./deploy/install.sh --check` | All checks and the build, starts nothing. Good before a change window. |
 | `./deploy/install.sh --yes` | Never prompts; fails on missing values (scripted hosts). |
 | `./deploy/install.sh --skip-devices` | Skips the device test (e.g. away from the office LAN). |
+| `./deploy/install.sh --no-pull` | Installs the code already checked out (no `git pull`). |
+| `./deploy/install.sh --skip-backup` | Skips the pre-update R2 snapshot. |
+
+### Updating
+
+Run the same command: `./deploy/install.sh`. On an existing install it:
+
+1. Fast-forwards to the latest `main`, then re-runs the new installer. It refuses to pull over local edits to tracked files.
+2. Backs up `.env` to `.env.bak.<time>` (keeps the last 5) and adds any settings the new release introduced, with their defaults.
+3. Uploads a fresh database snapshot to R2 before the schema can change (the nightly export, run once now). If that fails it asks before continuing.
+4. Builds, restarts only changed containers, waits for the web app, and prunes old images. If the web app does not come up, it prints the `git checkout <previous>` command to roll back and exits non-zero.
+
+A lock file stops two runs overlapping. The very first time you move to this installer from an older checkout, run `git pull` once by hand.
 
 ## Prerequisites
 
@@ -198,6 +211,17 @@ Pick one:
 
 The web port binds to `127.0.0.1` only, and compose sets `ESSL_BEHIND_TUNNEL=1`, so per-IP sign-in limits use `CF-Connecting-IP`. Never expose the port beyond loopback while that flag is set; behind a different proxy, set `ESSL_BEHIND_TUNNEL=0`.
 
+#### LAN access (optional)
+
+To also open the dashboard at `http://<server-ip>:8080` inside the office, set in `.env`:
+
+```
+ESSL_WEB_BIND=0.0.0.0
+ESSL_FORCE_HTTPS_COOKIES=false
+```
+
+then `docker compose up -d web`. Trade-offs: sign-in cookies are no longer HTTPS-only (also through the tunnel), and anyone on the LAN can send a fake `CF-Connecting-IP` to dodge per-IP sign-in limits. Keep the host firewall closed to 8080 from outside the office.
+
 ### 2. R2 bucket (nightly export)
 
 You need four values. There is **no URL to copy**: the app builds the endpoint `https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com` itself.
@@ -270,7 +294,7 @@ docker compose run --rm --no-deps collector python diagnose.py   # device test a
 
 Open `https://attendance.yourcompany.com`.
 
-**Updating:** `git pull && ./deploy/install.sh`.
+**Updating:** `./deploy/install.sh` (it pulls, backs up and restarts; see [Updating](#updating)).
 
 ## First administrator
 
@@ -546,7 +570,7 @@ All settings live in `.env`; `.env.example` documents each one. The daily target
 | `R2_ACCOUNT_ID`, `R2_BUCKET` | required | nightly-export |
 | `R2_EXPORT_ACCESS_KEY_ID`, `R2_EXPORT_SECRET_ACCESS_KEY` | required, scoped to the one bucket | nightly-export |
 | `ESSL_EXPORT_HOUR` | `2` (IST) | nightly-export |
-| `ESSL_WEB_PORT` | `8080` | web, published on `127.0.0.1` |
+| `ESSL_WEB_PORT` / `ESSL_WEB_BIND` | `8080` / `127.0.0.1` | web host port; bind `0.0.0.0` for LAN access |
 | `TUNNEL_TOKEN`, `COMPOSE_PROFILES` | optional; token + `tunnel` turns on the bundled cloudflared | cloudflared |
 | `ESSL_COLLECTOR_INTERVAL_SECONDS` | `60` | collector, Devices page |
 | `ESSL_HEARTBEAT_WRITE_SECONDS` | `300` | collector, Devices staleness warning |

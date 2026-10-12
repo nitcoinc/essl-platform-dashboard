@@ -12,3 +12,6 @@ data/*.db-*
 .env
 .env.*
 !.env.example
+
+# Installer
+.install.lock

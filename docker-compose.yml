@@ -73,10 +73,11 @@ services:
     volumes:
       - essl-data:/data
     command: ["gunicorn", "-w", "1", "--threads", "4", "-b", "0.0.0.0:8000", "essl_hub.web:create_app()"]
-    # Host loopback only, for a cloudflared (or proxy) already running on the
+    # Loopback by default, for a cloudflared (or proxy) already running on the
     # host: point its public hostname at http://localhost:${ESSL_WEB_PORT}.
+    # ESSL_WEB_BIND=0.0.0.0 also opens it on the LAN (see README "LAN access").
     ports:
-      - "127.0.0.1:${ESSL_WEB_PORT:-8080}:8000"
+      - "${ESSL_WEB_BIND:-127.0.0.1}:${ESSL_WEB_PORT:-8080}:8000"
 
   nightly-export:
     build: .

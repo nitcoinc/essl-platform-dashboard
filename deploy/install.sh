@@ -1,23 +1,28 @@
 #!/usr/bin/env bash
-# One-command install of the single-host stack (docker-compose.yml).
+# One command to install AND update the single-host stack (docker-compose.yml).
 #
-#   ./deploy/install.sh            # set up .env (asks for anything missing), check, build, start
+#   ./deploy/install.sh            # pull latest code, set up .env, back up, build, start
 #   ./deploy/install.sh --check    # same checks and build, but do not start anything
 #   ./deploy/install.sh --yes      # never prompt; fail on missing values (CI, scripted hosts)
 #   ./deploy/install.sh --skip-devices   # skip the device connection test
+#   ./deploy/install.sh --no-pull        # use the code as it is (no git pull)
+#   ./deploy/install.sh --skip-backup    # no pre-update snapshot to R2
 #
 # Safe to re-run: it only fills empty values and restarts changed containers.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-CHECK_ONLY=0 ASSUME_YES=0 SKIP_DEVICES=0
+CHECK_ONLY=0 ASSUME_YES=0 SKIP_DEVICES=0 NO_PULL=0 SKIP_BACKUP=0
 for arg in "$@"; do
   case "$arg" in
     --check) CHECK_ONLY=1 ;;
     --yes|-y) ASSUME_YES=1 ;;
     --skip-devices) SKIP_DEVICES=1 ;;
-    -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --no-pull) NO_PULL=1 ;;
+    --skip-backup) SKIP_BACKUP=1 ;;
+    PREV_COMMIT=*) ;;
+    -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "install: unknown option $arg (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -28,6 +33,15 @@ ok()   { echo "  ${G}ok${N}    $*"; }
 warn() { echo "  ${Y}warn${N}  $*"; }
 die()  { echo "  ${R}error${N} $*" >&2; exit 1; }
 interactive() { [ "$ASSUME_YES" = 0 ] && [ -t 0 ]; }
+confirm() { # confirm "question": yes in --yes mode, else ask (default no)
+  interactive || return 0
+  local a; read -rp "  $1 [y/N]: " a; [[ "$a" =~ ^[Yy] ]]
+}
+trap 'echo "  ${R}error${N} install stopped at line $LINENO: $BASH_COMMAND" >&2' ERR
+
+# One run at a time (a cron update and a manual run must not overlap).
+exec 9>.install.lock
+command -v flock >/dev/null 2>&1 && { flock -n 9 || die "another install.sh is running"; }
 
 # --- 1. Prerequisites -------------------------------------------------------
 step "Checking prerequisites"
@@ -39,6 +53,35 @@ ok "Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null), compose
 arch="$(uname -m)"
 [ "$arch" = "x86_64" ] || die "This host is $arch; the libsql client only ships x86_64 Linux wheels. Use an x86_64 host."
 ok "x86_64 host"
+
+# --- 1b. Code update ---------------------------------------------------------
+PREV_COMMIT=""
+if [ "$NO_PULL" = 0 ] && [ -d .git ] && command -v git >/dev/null 2>&1; then
+  step "Updating code"
+  PREV_COMMIT="$(git rev-parse --short HEAD)"
+  if ! git diff --quiet || ! git diff --cached --quiet; then
+    warn "local edits to tracked files; not pulling (commit or stash them, or use --no-pull)"
+    git status --short --untracked-files=no | sed 's/^/          /'
+  elif ! git fetch --quiet origin 2>/dev/null; then
+    warn "cannot reach the git remote; installing the code already here"
+  else
+    upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+    if [ -z "$upstream" ]; then
+      warn "branch has no upstream; not pulling"
+    elif [ "$(git rev-parse HEAD)" = "$(git rev-parse "$upstream")" ]; then
+      ok "already up to date ($PREV_COMMIT)"
+    else
+      echo "  incoming:"; git log --oneline "HEAD..$upstream" | sed 's/^/          /'
+      git merge --ff-only --quiet "$upstream" || die "cannot fast-forward to $upstream (local commits?); resolve it with git, then re-run"
+      ok "updated $PREV_COMMIT -> $(git rev-parse --short HEAD)"
+      # The script itself may have changed: run the new one.
+      exec 9>&-
+      exec "$0" --no-pull "$@" PREV_COMMIT="$PREV_COMMIT"
+    fi
+  fi
+fi
+for arg in "$@"; do case "$arg" in PREV_COMMIT=*) PREV_COMMIT="${arg#PREV_COMMIT=}" ;; esac; done
+[ -n "$PREV_COMMIT" ] || PREV_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || true)"
 
 # --- 2. .env ----------------------------------------------------------------
 env_value() { # value of KEY in .env, empty if unset
@@ -69,6 +112,18 @@ if [ ! -f .env ]; then
   created=1
 fi
 chmod 600 .env
+if [ "$created" = 0 ]; then
+  # Keep a copy before touching it, and add settings new releases introduced.
+  (umask 077 && cp .env ".env.bak.$(date +%Y%m%d-%H%M%S)")
+  ls -1t .env.bak.* 2>/dev/null | tail -n +6 | xargs -r rm -f   # keep the last 5
+  added=()
+  while IFS= read -r line; do
+    key="${line%%=*}"
+    grep -q "^$key=" .env || { printf '%s\n' "$line" >> .env; added+=("$key"); }
+  done < <(grep -E '^[A-Z][A-Z0-9_]*=' .env.example)
+  if [ "${#added[@]}" -gt 0 ]; then ok "added new settings with defaults: ${added[*]}"; fi
+  ok ".env backed up"
+fi
 
 ask_default() { # ask KEY "question": Enter keeps the current value
   local answer current
@@ -143,6 +198,19 @@ if [ -z "$(env_value ESSL_SETUP_TOKEN)" ] && [ -z "$(env_value ESSL_BOOTSTRAP_AD
   ok "generated a one-time ESSL_SETUP_TOKEN for the first administrator"
 fi
 
+# --- 2b. Pre-update snapshot -------------------------------------------------
+# An update can migrate the schema. Before that, push a fresh export to R2 with
+# the image that is running now (same as the nightly one, outside the schedule).
+if [ "$CHECK_ONLY" = 0 ] && [ "$SKIP_BACKUP" = 0 ] && [ -n "$(docker compose ps -q web 2>/dev/null)" ]; then
+  step "Snapshot before update (R2)"
+  if docker compose run --rm --no-deps nightly-export python -m essl_hub.nightly_export --once; then
+    ok "snapshot uploaded to R2 nightly/"
+  else
+    warn "snapshot failed (see above). Turso point-in-time recovery still covers you."
+    confirm "Continue the update without a fresh snapshot?" || die "stopped; fix R2 or re-run with --skip-backup"
+  fi
+fi
+
 # --- 3. Build ---------------------------------------------------------------
 step "Building images (first run takes a few minutes)"
 docker compose build --quiet
@@ -186,8 +254,17 @@ for _ in $(seq 1 60); do
   printf '.'; sleep 2
 done
 echo
-[ "$healthy" = 1 ] && ok "web app is up" || warn "web app did not answer within 2 minutes: docker compose logs web"
 docker compose ps --format 'table {{.Service}}\t{{.Status}}'
+if [ "$healthy" = 1 ]; then
+  ok "web app is up"
+  docker image prune -f >/dev/null 2>&1 || true
+else
+  warn "web app did not answer within 2 minutes: docker compose logs web"
+  if [ -n "$PREV_COMMIT" ] && [ "$PREV_COMMIT" != "$(git rev-parse --short HEAD 2>/dev/null)" ]; then
+    warn "to go back to the previous version: git checkout $PREV_COMMIT && ./deploy/install.sh --no-pull"
+  fi
+  exit 1
+fi
 
 # --- 6. Next steps ----------------------------------------------------------
 step "Done"
