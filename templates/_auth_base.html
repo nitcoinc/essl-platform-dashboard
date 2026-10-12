@@ -1,0 +1,22 @@
+{% import "_ui.html" as ui %}
+<!doctype html>
+<html lang="en" data-theme="{{ theme }}">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="{{ 'light dark' if theme == 'system' else theme }}">
+    <link rel="preload" href="{{ url_for('static', filename='fonts/InterVariable-latin.woff2') }}" as="font" type="font/woff2" crossorigin>
+    <title>{% block title %}{% endblock %} - eSSL Attendance Hub</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    {% if turnstile_site_key %}<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>{% endif %}
+  </head>
+  <body>
+    {% include "_icons.html" %}
+    <main class="auth-wrap">
+      <div class="auth-card">
+        <div class="brand auth-brand"><span class="brand-mark">{{ ui.icon('scan-line') }}</span><span class="brand-name">Attendance Hub</span></div>
+        {% block card %}{% endblock %}
+      </div>
+    </main>
+  </body>
+</html>

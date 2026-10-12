@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% import "_ui.html" as ui %}
+{% from "_status_chip.html" import status_chip %}
+{% set other = subject.id != employee.id %}
+{% set emp = subject.id if other else None %}
+{% set week_target = target_minutes * days|length %}
+{% block title %}{{ subject.name if other else 'My week' }} - eSSL Attendance Hub{% endblock %}
+{% block content %}
+<header class="topbar">
+  <div>
+    {% if other %}<a class="back-link" href="{{ url_for('team.team_view') }}">{{ ui.icon('arrow-left') }}<span>{{ 'Everyone' if employee.role in ('hr', 'admin') else 'Team' }}</span></a>
+    <p class="subject-name">{{ subject.name }}</p>{% endif %}
+    <h1>{{ 'This week' if offset == 0 else ('Last week' if offset == -1 else 'Week of ' ~ days[0].date.strftime('%d %B')) }}</h1>
+    <p>{{ days[0].date.strftime('%a %d %b') }} to {{ days[-1].date.strftime('%a %d %b %Y') }}</p>
+  </div>
+  <nav class="topbar-actions pager" aria-label="Week">
+    <a class="button button-secondary button-icon" href="{{ url_for('me.week_view', employee=emp, offset=offset - 1) }}" aria-label="Previous week" title="Previous week">{{ ui.icon('chevron-left') }}</a>
+    {% if offset != 0 %}<a class="button button-secondary" href="{{ url_for('me.week_view', employee=emp) }}">This week</a>{% endif %}
+    {% if offset < 0 %}<a class="button button-secondary button-icon" href="{{ url_for('me.week_view', employee=emp, offset=offset + 1) }}" aria-label="Next week" title="Next week">{{ ui.icon('chevron-right') }}</a>{% endif %}
+  </nav>
+</header>
+
+<section class="week-summary" aria-labelledby="week-total-label">
+  <p class="figure-label" id="week-total-label">Week total, effective</p>
+  <p class="figure">
+    <span class="figure-value">{{ ui.hours(week_total_minutes) }}</span>
+    <span class="figure-of">of {{ ui.hours(week_target) }}</span>
+  </p>
+</section>
+
+<section class="day-section" aria-labelledby="chart-heading">
+  <div class="section-head">
+    <h2 id="chart-heading">By day</h2>
+    <ul class="chart-legend">
+      <li><span class="legend-swatch legend-met" aria-hidden="true"></span>Target met</li>
+      <li><span class="legend-swatch legend-short" aria-hidden="true"></span>Short</li>
+      <li><span class="legend-swatch legend-incomplete" aria-hidden="true"></span>Incomplete</li>
+      <li><span class="legend-target" aria-hidden="true"></span>Daily target {{ ui.hours(target_minutes) }}</li>
+    </ul>
+  </div>
+  <div class="chart-frame">{{ chart }}</div>
+  <h2 id="days-heading" class="visually-hidden">Days</h2>
+  <div class="table-scroll week-table">
+    <table class="hours-table">
+      <thead>
+        <tr>
+          <th scope="col">Day</th>
+          <th scope="col" class="num">First entry</th>
+          <th scope="col" class="num">Last exit</th>
+          <th scope="col" class="num">Gross</th>
+          <th scope="col" class="num">Effective</th>
+          <th scope="col">Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in days %}
+        {% set r = row.result %}
+        <tr class="{{ 'is-today' if row.date == today }}">
+          <td data-label="Day">{% if r is not none %}<a class="day-link" href="{{ url_for('me.day_view', employee=emp, date=row.date.isoformat()) }}">{{ row.date.strftime('%a %d %b') }}</a>{% else %}<span class="muted">{{ row.date.strftime('%a %d %b') }}</span>{% endif %}</td>
+          {% if r is none %}
+          <td data-label="First entry" class="num"><span class="muted">-</span></td>
+          <td data-label="Last exit" class="num"><span class="muted">-</span></td>
+          <td data-label="Gross" class="num"><span class="muted">-</span></td>
+          <td data-label="Effective" class="num"><span class="muted">-</span></td>
+          <td data-label="Status"><span class="status-chip status-empty">Not yet</span></td>
+          {% else %}
+          <td data-label="First entry" class="num">{% if r.segments %}{{ r.segments[0].start.strftime('%H:%M') }}{% else %}<span class="muted">-</span>{% endif %}</td>
+          <td data-label="Last exit" class="num">{% if r.status == 'open' %}<span class="muted">Inside</span>{% elif r.segments and r.segments[-1].end %}{{ r.segments[-1].end.strftime('%H:%M') }}{% else %}<span class="muted">-</span>{% endif %}</td>
+          <td data-label="Gross" class="num">{% if r.gross_minutes is not none %}{{ ui.hours(r.gross_minutes) }}{% else %}<span class="muted">-</span>{% endif %}</td>
+          <td data-label="Effective" class="num">{{ ui.hours(r.effective_minutes) }}</td>
+          <td data-label="Status">{% set short_by = target_minutes - r.effective_minutes %}{{ status_chip(r.status, 'Short by %dh %02dm'|format(short_by // 60, short_by % 60)) }}</td>
+          {% endif %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="footnote">Hours come only from the door devices. Nobody can add or edit a punch by hand.</p>
+</section>
+{% endblock %}

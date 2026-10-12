@@ -1,0 +1,25 @@
+{# The People results region. On an htmx search the count is swapped out of band
+   so the persistent aria-live element announces it. #}
+{% import "_ui.html" as ui %}
+{% set count_label = rows|length ~ (' person' if rows|length == 1 else ' people') %}
+{% if oob %}<p id="people-count" class="people-count" aria-live="polite" hx-swap-oob="true">{{ count_label }}</p>{% endif %}
+{% if rows %}
+<div class="table-scroll">
+  <table class="table hours-table people-table">
+    <caption class="visually-hidden">People, with manager, role and today's status</caption>
+    <thead><tr>
+      <th scope="col">Name</th><th scope="col" class="num">Device ID</th><th scope="col">Manager</th>
+      <th scope="col">Role</th><th scope="col">Today</th><th scope="col"><span class="visually-hidden">Actions</span></th>
+    </tr></thead>
+    <tbody>
+      {% for row in rows %}{% include "_person_row.html" %}{% endfor %}
+    </tbody>
+  </table>
+</div>
+{% elif query %}
+{{ ui.empty_state('No one matches "' ~ query ~ '"', 'Search by part of a name or work email.', 'search') }}
+{% else %}
+{% call ui.empty_state('No one on the roster yet', 'Import a roster file or add people one at a time.', 'users') %}
+{{ ui.button('Import roster', 'primary', href=url_for('people.people_import'), icon_name='upload') }}
+{% endcall %}
+{% endif %}

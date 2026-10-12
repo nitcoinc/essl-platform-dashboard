@@ -1,0 +1,123 @@
+{% import "_ui.html" as ui %}
+{%- set role = employee.role -%}
+{#- Navigation by role (plan): endpoint, label, icon, roles. Entries whose page
+    does not exist yet are skipped by has_endpoint(). -#}
+{%- set nav = [
+  ('me.day_view', 'Today', 'clock', ('employee', 'manager', 'hr', 'admin')),
+  ('me.week_view', 'Week', 'calendar-days', ('employee', 'manager', 'hr', 'admin')),
+  ('team.team_view', 'Everyone' if role in ('hr', 'admin') else 'Team', 'users', ('manager', 'hr', 'admin')),
+  ('people.people_view', 'People', 'user-round-cog', ('hr', 'admin')),
+  ('admin.devices_view', 'Devices', 'server', ('admin',)),
+  ('admin.settings_view', 'Settings', 'settings', ('admin',)),
+] -%}
+{%- macro nav_links() -%}
+<ul class="nav-list">
+  {%- for endpoint, label, icon_name, roles in nav if role in roles and has_endpoint(endpoint) %}
+  <li><a class="nav-item" href="{{ url_for(endpoint) }}"{% if request.endpoint == endpoint or (endpoint == 'people.people_view' and request.endpoint == 'people.id_issues_view') %} aria-current="page"{% endif %}>{{ ui.icon(icon_name) }}<span>{{ label }}</span>{% if endpoint == 'people.people_view' and nav_issue_count %}<span class="nav-count" title="{{ nav_issue_count }} ID {{ 'issue' if nav_issue_count == 1 else 'issues' }} to check" aria-label="{{ nav_issue_count }} ID issues to check">{{ nav_issue_count }}</span>{% endif %}</a></li>
+  {%- endfor %}
+</ul>
+{%- endmacro -%}
+{%- set role_label = {"hr": "HR"}.get(role, role|capitalize) -%}
+{%- set initials = employee.name.split()|map('first')|join|upper|truncate(2, True, '') -%}
+{%- macro signout_form(cls='button button-secondary signout-button') -%}
+<form method="post" action="{{ url_for('auth.signout') }}" class="signout-form">
+  <input type="hidden" name="csrf" value="{{ g.csrf_token or '' }}">
+  <button class="{{ cls }}" type="submit">{{ ui.icon('log-out') }}<span>Sign out</span></button>
+</form>
+{%- endmacro -%}
+{%- macro theme_switch() -%}
+<form method="post" action="{{ url_for('auth.set_theme') }}" class="theme-switch" data-theme-form>
+  <input type="hidden" name="csrf" value="{{ g.csrf_token or '' }}">
+  <input type="hidden" name="next" value="{{ request.full_path if request.query_string else request.path }}">
+  <div class="segmented" role="group" aria-label="Theme">
+    {%- for value, label, icon_name in (('light', 'Light', 'sun'), ('dark', 'Dark', 'moon'), ('system', 'System', 'monitor')) %}
+    <button type="submit" name="theme" value="{{ value }}" class="segment" aria-pressed="{{ 'true' if theme == value else 'false' }}" title="{{ label }} theme">{{ ui.icon(icon_name) }}<span class="visually-hidden">{{ label }}</span></button>
+    {%- endfor %}
+  </div>
+</form>
+{%- endmacro -%}
+{%- macro sync_badge() -%}
+{%- if sync_health is defined and sync_health -%}
+{%- set tone_icon = {'ok': 'check', 'warn': 'triangle-alert', 'bad': 'circle-alert'}.get(sync_health.tone, 'server') -%}
+<a class="sync-badge tone-{{ sync_health.tone }}" href="{{ url_for('admin.health_view') }}" title="{{ sync_health.title }}" aria-label="Turso sync health: {{ sync_health.label }}. {{ sync_health.title }}"><span class="chip-dot" aria-hidden="true"></span>{{ ui.icon(tone_icon) }}<span>{{ sync_health.label }}</span></a>
+{%- endif -%}
+{%- endmacro -%}
+{%- macro shell_tools() -%}{{ sync_badge() }}{{ theme_switch() }}{%- endmacro -%}
+{%- macro account() -%}
+<div class="sidebar-foot">
+  <div class="who-row">
+    <span class="avatar" aria-hidden="true">{{ initials }}</span>
+    <div class="who">
+      <span class="who-name">{{ employee.name }}</span>
+      <span class="who-role">{{ role_label }}</span>
+    </div>
+  </div>
+  {{ signout_form() }}
+</div>
+{%- endmacro -%}
+<!doctype html>
+<html lang="en" data-theme="{{ theme }}">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="{{ 'light dark' if theme == 'system' else theme }}">
+    <meta name="csrf-token" content="{{ g.csrf_token or '' }}">
+    <title>{% block title %}eSSL Attendance Hub{% endblock %}</title>
+    <link rel="preload" href="{{ url_for('static', filename='fonts/InterVariable-latin.woff2') }}" as="font" type="font/woff2" crossorigin>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <script src="{{ url_for('static', filename='vendor/htmx.min.js') }}" defer></script>
+  </head>
+  <body hx-headers='{"X-CSRF-Token": "{{ g.csrf_token or '' }}"}'>
+    {% include "_icons.html" %}
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="sidebar-inner">
+        <a class="brand" href="{{ url_for('auth.index') }}">
+          <span class="brand-mark">{{ ui.icon('scan-line') }}</span>
+          <span class="brand-name">Attendance Hub</span>
+        </a>
+        <nav aria-label="Main">{{ nav_links() }}</nav>
+        {{ account() }}
+        </div>
+      </aside>
+      <header class="mobile-bar">
+        <details class="mobile-menu">
+          <summary class="mobile-bar-row">
+            <span class="brand"><span class="brand-mark">{{ ui.icon('scan-line') }}</span><span class="brand-name">Attendance Hub</span></span>
+            <span class="button button-tertiary button-icon menu-toggle" role="presentation">
+              {{ ui.icon('menu', 'icon-20 menu-open-icon') }}{{ ui.icon('x', 'icon-20 menu-close-icon') }}
+              <span class="visually-hidden">Menu</span>
+            </span>
+          </summary>
+          <div class="mobile-menu-panel">
+            <nav aria-label="Main (mobile)">{{ nav_links() }}</nav>
+            <div class="mobile-tools">{{ shell_tools() }}</div>
+            {{ account() }}
+          </div>
+        </details>
+      </header>
+      <main class="main-content" id="main-content" tabindex="-1">
+        <div class="shell-bar">{{ shell_tools() }}</div>
+        {% block content %}{% endblock %}
+      </main>
+    </div>
+    <script>
+      // Progressive enhancement: switch theme without a reload. Without JS the
+      // form posts and the server redirects back with the cookie set.
+      document.addEventListener("submit", function (event) {
+        var form = event.target.closest("[data-theme-form]");
+        if (!form || !event.submitter || !window.fetch) return;
+        event.preventDefault();
+        var choice = event.submitter.value;
+        var body = new FormData(form);
+        body.set("theme", choice);
+        document.documentElement.setAttribute("data-theme", choice);
+        document.querySelectorAll("[data-theme-form] .segment").forEach(function (b) {
+          b.setAttribute("aria-pressed", String(b.value === choice));
+        });
+        fetch(form.action, { method: "POST", body: body, credentials: "same-origin", redirect: "manual" });
+      });
+    </script>
+  </body>
+</html>

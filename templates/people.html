@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% import "_ui.html" as ui %}
+{% block title %}People - eSSL Attendance Hub{% endblock %}
+{% block content %}
+<header class="topbar">
+  <div>
+    <h1>People</h1>
+    <p>Everyone on the roster. Set who reports to whom and what each person can see.</p>
+  </div>
+  <div class="topbar-actions">
+    {{ ui.button('Import roster', href=url_for('people.people_import'), icon_name='upload') }}
+    {{ ui.button('Add person', 'primary', href=url_for('people.person_new'), icon_name='plus') }}
+  </div>
+</header>
+{% include "_people_tabs.html" %}
+
+<form class="people-search" method="get" action="{{ url_for('people.people_view') }}" role="search">
+  <label class="visually-hidden" for="people-q">Search people</label>
+  <div class="search-field">
+    {{ ui.icon('search') }}
+    <input id="people-q" type="search" name="q" value="{{ query }}" placeholder="Search by name or email" autocomplete="off"
+      hx-get="{{ url_for('people.people_view') }}" hx-trigger="input changed delay:250ms, search" hx-target="#people-results" hx-push-url="true">
+  </div>
+  {{ ui.button('Search', type='submit') }}
+</form>
+{% set count_label = rows|length ~ (' person' if rows|length == 1 else ' people') %}
+<p id="people-count" class="people-count" aria-live="polite">{{ count_label }}</p>
+
+<div id="people-results">
+  {% include "_people_results.html" %}
+</div>
+{% endblock %}

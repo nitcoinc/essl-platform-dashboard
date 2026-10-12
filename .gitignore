@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.packages/
+.uv-cache/
+.test-data/
+data/*.db
+data/*.db-*
+
+# Secrets. .env.example is the checked-in template; keep it un-ignored.
+.env
+.env.*
+!.env.example

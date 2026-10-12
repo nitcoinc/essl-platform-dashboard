@@ -1,0 +1,119 @@
+{% extends "base.html" %}
+{% import "_ui.html" as ui %}
+{% block title %}ID issues - eSSL Attendance Hub{% endblock %}
+{% block content %}
+<header class="topbar">
+  <div>
+    <h1>People</h1>
+    <p>Hours only count when the ID on the door device matches a person on the roster. Fix mismatches here.</p>
+  </div>
+</header>
+{% include "_people_tabs.html" %}
+
+{% if linked %}
+<div class="notice notice-ok" role="status">{{ ui.icon('check') }}<p><strong>Linked {{ linked }} to {{ linked_name }}.</strong> {% if linked_punches %}{{ linked_punches }} past {{ 'punch' if linked_punches == 1 else 'punches' }} now count for them.{% endif %}</p></div>
+{% endif %}
+{% if error %}
+<div class="notice notice-bad" role="alert">{{ ui.icon('circle-alert') }}<p>{{ error }}</p></div>
+{% endif %}
+
+{% set labels = {'unknown': 'Not on roster', 'placeholder': 'No device ID', 'never': 'Never punched', 'name': 'Name differs', 'shared': 'Shared card'} %}
+{% set help = {
+  'unknown': ('Someone punches with this ID but nobody on the roster has it, so their hours are lost.', 'Add them as a new person, or link the ID to someone already on the roster.'),
+  'placeholder': ('This person has no door ID yet, so none of their punches can match.', 'Set the ID they were enrolled with on the device.'),
+  'never': ('Nobody has punched with this person\'s ID.', 'Check the ID matches the device; pick the right one if it is listed.'),
+  'name': ('The device and the roster use different names for the same ID.', 'If it is the same person, mark it so. Otherwise fix the ID.'),
+} %}
+{% set to_fix = counts.unknown + counts.placeholder + counts.never + counts.name %}
+
+{% if to_fix %}
+<section class="issue-guide" aria-label="What to fix">
+  <h2>{{ to_fix }} {{ 'thing' if to_fix == 1 else 'things' }} to check</h2>
+  <ul>
+    {% for kind in ('unknown', 'placeholder', 'never', 'name') if counts[kind] %}
+    <li>{{ ui.chip(labels[kind], 'bad' if kind == 'unknown' else 'warn') }} <strong>{{ counts[kind] }}</strong> · {{ help[kind][0] }} <span class="muted">{{ help[kind][1] }}</span></li>
+    {% endfor %}
+  </ul>
+  <p class="footnote">This list updates by itself: once the roster is right (here, on the person form or by import), the row disappears and past punches count.</p>
+</section>
+{% endif %}
+
+{% macro link_form(device_user_id, employee_id, label, cls='button-secondary') -%}
+<form method="post" action="{{ url_for('people.id_issues_link') }}" class="inline-form">
+  <input type="hidden" name="csrf" value="{{ csrf_token }}">
+  <input type="hidden" name="device_user_id" value="{{ device_user_id }}">
+  <input type="hidden" name="employee_id" value="{{ employee_id }}">
+  <button class="button {{ cls }} button-sm" type="submit">{{ label }}</button>
+</form>
+{%- endmacro %}
+
+{% if issues %}
+<datalist id="unknown-ids">
+  {% for i in issues if i.kind == 'unknown' %}<option value="{{ i.device_user_id }}">{{ i.device_name }}</option>{% endfor %}
+</datalist>
+{% call ui.table([('Issue', 'left'), ('Device ID', 'left'), ('Who', 'left'), ('Punches', 'num'), ('Last seen', 'left'), ('Fix', 'left')], caption='ID issues') %}
+  {% for issue in issues %}
+  {% set matches = suggestions.get(issue.key, []) %}
+  <tr class="issue-row issue-{{ issue.severity }}">
+    <td data-label="Issue">
+      {{ ui.chip(labels[issue.kind], issue.severity if issue.severity != 'info' else 'neutral') }}
+      <p class="issue-detail">{{ issue.detail }}</p>
+    </td>
+    <td data-label="Device ID" class="issue-id">{{ issue.device_user_id }}</td>
+    <td data-label="Who">
+      {% if issue.employee_name %}<span class="issue-who">{{ issue.employee_name }}</span>{% endif %}
+      {% if issue.device_name %}<span class="issue-device-name">On device: {{ issue.device_name }}{% if issue.sites %} · {{ issue.sites|replace(',', ', ') }}{% endif %}</span>{% endif %}
+    </td>
+    <td data-label="Punches" class="num">{{ issue.punch_count or '' }}</td>
+    <td data-label="Last seen">{% if issue.last_seen %}<time datetime="{{ issue.last_seen.isoformat() }}">{{ issue.last_seen.strftime('%d %b %Y') }}</time>{% else %}<span class="muted">-</span>{% endif %}</td>
+    <td data-label="Fix" class="row-actions"><div class="issue-actions">
+      {% if issue.kind == 'unknown' %}
+        {% for m in matches %}{{ link_form(issue.device_user_id, m.employee_id, 'Link to ' ~ m.employee_name, 'button-primary') }}{% endfor %}
+        <a class="button {{ 'button-secondary' if matches else 'button-primary' }} button-sm" href="{{ url_for('people.person_new', device_user_id=issue.device_user_id, name=issue.device_name) }}">Add as new person</a>
+        {% if link_targets %}
+        <form method="post" action="{{ url_for('people.id_issues_link') }}" class="issue-link-form">
+          <input type="hidden" name="csrf" value="{{ csrf_token }}">
+          <input type="hidden" name="device_user_id" value="{{ issue.device_user_id }}">
+          <label class="visually-hidden" for="link-{{ loop.index }}">Link {{ issue.device_user_id }} to</label>
+          <select id="link-{{ loop.index }}" name="employee_id" required>
+            <option value="">Link to someone on the roster…</option>
+            {% for t in link_targets %}<option value="{{ t.employee_id }}">{{ t.employee_name }} ({{ t.device_user_id }})</option>{% endfor %}
+          </select>
+          <button class="button button-tertiary button-sm" type="submit">Link</button>
+        </form>
+        {% endif %}
+      {% elif issue.kind in ('placeholder', 'never') %}
+        {% for m in matches %}{{ link_form(m.device_user_id, issue.employee_id, 'Use ' ~ m.device_user_id ~ ' (' ~ m.device_name ~ ')', 'button-primary') }}{% endfor %}
+        <form method="post" action="{{ url_for('people.id_issues_link') }}" class="issue-link-form">
+          <input type="hidden" name="csrf" value="{{ csrf_token }}">
+          <input type="hidden" name="employee_id" value="{{ issue.employee_id }}">
+          <label class="visually-hidden" for="set-{{ loop.index }}">New device ID for {{ issue.employee_name }}</label>
+          <input id="set-{{ loop.index }}" name="device_user_id" list="unknown-ids" placeholder="Device ID, e.g. NP0231" required autocomplete="off">
+          <button class="button button-tertiary button-sm" type="submit">Set ID</button>
+        </form>
+      {% elif issue.kind == 'name' %}
+        <form method="post" action="{{ url_for('people.id_issues_dismiss') }}" class="inline-form">
+          <input type="hidden" name="csrf" value="{{ csrf_token }}">
+          <input type="hidden" name="key" value="{{ issue.key }}">
+          <button class="button button-secondary button-sm" type="submit">Same person</button>
+        </form>
+        <a class="button button-tertiary button-sm" href="{{ url_for('people.person_edit', employee_id=issue.employee_id) }}">Fix ID</a>
+      {% else %}
+        <span class="muted">Nothing to do</span>
+      {% endif %}
+    </div></td>
+  </tr>
+  {% endfor %}
+{% endcall %}
+{% else %}
+{{ ui.empty_state('No ID issues', 'Every device ID with punches is on the roster, and every roster entry has punched.', 'check') }}
+{% endif %}
+
+{% if dismissed_count %}
+<form method="post" action="{{ url_for('people.id_issues_dismiss') }}" class="issue-restore">
+  <input type="hidden" name="csrf" value="{{ csrf_token }}">
+  <input type="hidden" name="restore" value="1">
+  <p class="footnote">{{ dismissed_count }} name {{ 'difference' if dismissed_count == 1 else 'differences' }} marked as the same person. <button class="link-button" type="submit">Show them again</button></p>
+</form>
+{% endif %}
+{% endblock %}

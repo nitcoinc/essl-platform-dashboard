@@ -1,0 +1,107 @@
+name: CI
+
+# One image serves all app services: collector, web and nightly-export in docker-compose.yml
+# build the same context and differ only in their command and environment.
+# So this workflow builds, smoke-tests and publishes a single image.
+#
+# Published tags (GHCR):
+#   main         latest build of main
+#   sha-<short>  every build, so a collector-first upgrade can pin an exact one
+#   v1.2.3       from a v* tag
+# Pull requests build and smoke-test the image but never push.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test suite (local libsql)
+    runs-on: ubuntu-latest
+    # Local mode only (KTD2): no Turso URL or tokens, no secrets. The U8
+    # libsql contract test's Turso group skips without TURSO_TEST_*.
+    env:
+      TURSO_DATABASE_URL: ""
+      TURSO_AUTH_TOKEN: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+      - name: Run tests
+        # pipefail matters: without it bash returns tee's exit status and a
+        # failing suite would not fail the job.
+        run: |
+          set -o pipefail
+          python -m pytest tests -q -rs | tee /tmp/pytest.txt
+      # The storage tests prove the schema, the sentinel filters and the
+      # lockout counters; a silent skip would pass while proving nothing.
+      - name: Fail if tests/test_db.py was skipped
+        run: |
+          if grep -q "SKIPPED.*test_db.py" /tmp/pytest.txt; then
+            echo "::error::tests/test_db.py was skipped"
+            exit 1
+          fi
+          if ! grep -q "test_db.py" <(python -m pytest tests/test_db.py --collect-only -q); then
+            echo "::error::tests/test_db.py collected no tests"
+            exit 1
+          fi
+
+  build:
+    name: Build and publish image
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GHCR rejects uppercase repository names, so normalise instead of
+      # assuming the repository slug is already lowercase.
+      - name: Build, smoke-test and push
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          PRIMARY="$IMAGE:sha-${GITHUB_SHA::7}"
+          TAGS="$PRIMARY"
+
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            TAGS="$TAGS $IMAGE:$GITHUB_REF_NAME"
+          fi
+          if [ "$GITHUB_REF_NAME" = "main" ]; then
+            TAGS="$TAGS $IMAGE:main"
+          fi
+
+          BUILD_ARGS=""
+          for tag in $TAGS; do BUILD_ARGS="$BUILD_ARGS -t $tag"; done
+          echo "Tags: $TAGS"
+          docker build $BUILD_ARGS .
+
+          # Smoke-test the exact artifact. The image ships no default command
+          # (compose supplies one), so assert the imports both entrypoints need
+          # rather than starting a server.
+          docker run --rm --entrypoint python "$PRIMARY" -c \
+            "import openpyxl, essl_hub.web, essl_hub.collector_main, essl_hub.nightly_export, essl_hub.roster, libsql; print('image imports OK')"
+
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            for tag in $TAGS; do docker push "$tag"; done
+          else
+            echo "Not a push event; skipping push."
+          fi

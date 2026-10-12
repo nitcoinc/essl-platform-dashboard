@@ -1,0 +1,15 @@
+.git
+.venv
+.packages
+.uv-cache
+.ruff_cache
+.test-data
+.test-tmp
+__pycache__
+*.pyc
+data
+docs
+tests
+*.db
+.env
+.env.*

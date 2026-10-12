@@ -1,0 +1,42 @@
+{# The Team results region. On an htmx search the count is swapped out of band
+   so the persistent aria-live element announces it. #}
+{% import "_ui.html" as ui %}
+{% from "_status_chip.html" import status_chip %}
+{% set count_label = rows|length ~ (' person' if rows|length == 1 else ' people') %}
+{% if oob %}<p id="team-count" class="people-count" aria-live="polite" hx-swap-oob="true">{{ count_label }}</p>{% endif %}
+{% if rows %}
+<div class="table-scroll">
+  <table class="table hours-table team-table">
+    <caption class="visually-hidden">{{ title }}, with today's hours and status</caption>
+    <thead><tr>
+      <th scope="col" class="select-cell"><span class="visually-hidden">Include in export</span></th>
+      <th scope="col">Name</th><th scope="col">Manager</th>
+      <th scope="col" class="num">First entry</th><th scope="col" class="num">Last exit</th>
+      <th scope="col" class="num">Effective</th><th scope="col">Today</th>
+      <th scope="col"><span class="visually-hidden">Actions</span></th>
+    </tr></thead>
+    <tbody>
+      {% for row in rows %}
+      {% set p = row.person %}{% set r = row.result %}
+      <tr>
+        <td class="select-cell"><input type="checkbox" name="employee" value="{{ p.id }}" form="export-form" aria-label="Include {{ p.name }} in export"{{ ' checked' if p.id in selected_ids }}></td>
+        <td class="person-cell">
+          <a class="person-name" href="{{ url_for('me.day_view', employee=p.id) }}">{{ p.name }}</a>
+          <span class="person-email">{{ p.email }}</span>
+        </td>
+        <td data-label="Manager">{% if row.manager_name %}{{ row.manager_name }}{% else %}<span class="muted">-</span>{% endif %}</td>
+        <td data-label="First entry" class="num">{% if r.segments %}{{ r.segments[0].start.strftime('%H:%M') }}{% else %}<span class="muted">-</span>{% endif %}</td>
+        <td data-label="Last exit" class="num">{% if r.status == 'open' %}Inside{% elif r.segments and r.segments[-1].end %}{{ r.segments[-1].end.strftime('%H:%M') }}{% else %}<span class="muted">-</span>{% endif %}</td>
+        <td data-label="Effective" class="num">{{ ui.hours(r.effective_minutes) }}</td>
+        <td data-label="Today">{{ status_chip(r.status) }}</td>
+        <td class="row-actions">{{ ui.button('Week', 'tertiary', href=url_for('me.week_view', employee=p.id), size='sm', attrs='aria-label="Week for ' ~ p.name|e ~ '"') }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% elif query %}
+{{ ui.empty_state('No one matches "' ~ query ~ '"', 'Search by part of a name or work email.', 'search') }}
+{% else %}
+{{ ui.empty_state('No one to show yet', 'People appear here once they report to you on the People page.' if employee.role == 'manager' else 'Add people on the People page.', 'users') }}
+{% endif %}

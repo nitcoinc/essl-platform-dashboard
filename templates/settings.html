@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% import "_ui.html" as ui %}
+{% block title %}Settings - eSSL Attendance Hub{% endblock %}
+{% block content %}
+<header class="topbar">
+  <div>
+    <h1>Settings</h1>
+    <p>The daily target and the keys your HRMS uses to read hours.</p>
+  </div>
+</header>
+
+<section class="admin-section" aria-labelledby="target-heading">
+  <h2 id="target-heading">Daily target</h2>
+  <p class="section-intro">Effective hours a person needs each day. Changing it re-scores every past day too, because hours are always recalculated from the punches.</p>
+  <form method="post" action="{{ url_for('admin.settings_set_target') }}" class="target-form">
+    <input type="hidden" name="csrf" value="{{ csrf_token }}">
+    <div class="field">
+      <label for="target-hours">Hours</label>
+      <input id="target-hours" type="number" name="hours" min="0" max="24" value="{{ target_minutes // 60 }}" inputmode="numeric">
+    </div>
+    <div class="field">
+      <label for="target-minutes">Minutes</label>
+      <input id="target-minutes" type="number" name="minutes" min="0" max="59" value="{{ target_minutes % 60 }}" inputmode="numeric">
+    </div>
+    {{ ui.button('Save target', 'primary', type='submit') }}
+  </form>
+  {% if target_saved %}<p class="device-note" role="status">{{ ui.icon('check') }}<span>Target saved: {{ ui.hours(target_minutes) }} a day.</span></p>{% endif %}
+</section>
+
+<section class="admin-section" aria-labelledby="keys-heading">
+  <h2 id="keys-heading">HRMS API keys</h2>
+  <p class="section-intro">Read-only access to <code>/api/v1/hours</code>. Two keys can be active at once, so you can rotate without downtime.</p>
+  {% if key_error %}{{ ui.inline_error(key_error) }}{% endif %}
+  {% if new_api_key %}
+  <div class="key-reveal">
+    <strong role="status">Copy this key now. It is shown only once.</strong>
+    <code>{{ new_api_key }}</code>
+  </div>
+  {% endif %}
+  {% if api_keys %}
+  {% call ui.table([('Label', 'left'), ('Key', 'left'), ('Created', 'left'), ('Last used', 'left'), ('', 'left')], caption='API keys') %}
+    {% for key in api_keys %}
+    <tr>
+      <td data-label="Label">{{ key.label }}{% if key.revoked_at %} {{ ui.chip('Revoked') }}{% endif %}</td>
+      <td data-label="Key"><code>{{ key.prefix }}…</code></td>
+      <td data-label="Created">{{ key.created_at.strftime('%d %b %Y') if key.created_at.strftime is defined else key.created_at }}</td>
+      <td data-label="Last used">{% if key.last_used_at %}{{ key.last_used_at.strftime('%d %b %Y, %H:%M') if key.last_used_at.strftime is defined else key.last_used_at }}{% else %}<span class="muted">Never</span>{% endif %}</td>
+      <td class="row-actions">
+        {% if not key.revoked_at %}
+        <form method="post" action="{{ url_for('admin.settings_revoke_key', prefix=key.prefix) }}">
+          <input type="hidden" name="csrf" value="{{ csrf_token }}">
+          {{ ui.button('Revoke', 'danger', type='submit', size='sm', attrs='aria-label="Revoke ' ~ key.label|e ~ '"') }}
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  {% endcall %}
+  {% else %}
+  {{ ui.empty_state('No API keys yet', 'Create one when your HRMS is ready to read hours.', 'key-round') }}
+  {% endif %}
+  <form method="post" action="{{ url_for('admin.settings_create_key') }}" class="key-form">
+    <input type="hidden" name="csrf" value="{{ csrf_token }}">
+    <div class="field">
+      <label for="key-label">New key label</label>
+      <input id="key-label" type="text" name="label" placeholder="HRMS production" autocomplete="off">
+    </div>
+    {{ ui.button('Create key', 'secondary', type='submit', icon_name='plus') }}
+  </form>
+</section>
+{% endblock %}

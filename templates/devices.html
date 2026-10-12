@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% import "_ui.html" as ui %}
+{% block title %}Devices - eSSL Attendance Hub{% endblock %}
+{% macro when(value) -%}
+{% if value %}<time datetime="{{ value.isoformat() }}">{{ value.strftime('%d %b, %H:%M') }}</time>{% else %}<span class="muted">Never</span>{% endif %}
+{%- endmacro %}
+{% block content %}
+<header class="topbar">
+  <div>
+    <h1>Devices</h1>
+    <p>The door devices the collector reads from. {% if can_edit %}Connection changes apply on the next poll, with no restart.{% else %}Only an admin can change a connection.{% endif %}</p>
+  </div>
+</header>
+
+<div class="device-list">
+  {% for row in devices %}
+  {% set device = row.device %}
+  {% set errored = device_error_id == device.id %}
+  <section class="device" aria-labelledby="device-{{ device.id }}-name">
+    <div class="device-head">
+      <div>
+        <h2 id="device-{{ device.id }}-name">{{ device.site }}</h2>
+        <p class="device-model">{{ device.model }}{% if device.serial_number %} <span aria-hidden="true">&middot;</span> {{ device.serial_number }}{% endif %}</p>
+      </div>
+      <div class="device-chips">
+        {% if row.stale %}{{ ui.chip('Not checked recently', 'warn') }}
+        {% elif device.status == 'connected' %}{{ ui.chip('Connected', 'ok') }}
+        {% elif device.status == 'error' %}{{ ui.chip('Error', 'bad') }}
+        {% elif device.status == 'syncing' %}{{ ui.chip('Checking', 'info') }}
+        {% else %}{{ ui.chip('Not checked yet') }}{% endif %}
+        {% if row.pending %}{{ ui.chip('Change pending', 'info') }}
+        {% elif device.connection_updated_at %}{{ ui.chip('Change applied', 'neutral') }}{% endif %}
+      </div>
+    </div>
+
+    {% if saved == device.id %}<p class="device-note" role="status">{{ ui.icon('check') }}<span>Saved. The collector applies it within {{ collector_interval_seconds }} seconds.</span></p>{% endif %}
+    {% if row.stale %}
+    <p class="device-warning" role="status">{{ ui.icon('triangle-alert') }}<span>Last checked {{ row.checked_ago }}. The collector writes at least every {{ stale_minutes // 2 }} minutes, so it may have stopped. Check the collector container on the office host.</span></p>
+    {% endif %}
+    {% if device.last_error %}<p class="inline-error">{{ ui.icon('circle-alert') }}<span>{{ device.last_error }}</span></p>{% endif %}
+
+    <dl class="device-facts">
+      <div><dt>Address</dt><dd class="num">{{ device.ip }}:{{ device.port }}</dd></div>
+      <div><dt>Last checked</dt><dd>{{ when(device.last_attempt) }}{% if row.checked_ago %} <span class="muted">({{ row.checked_ago }})</span>{% endif %}</dd></div>
+      <div><dt>Last success</dt><dd>{{ when(device.last_success) }}</dd></div>
+      <div><dt>Punches stored</dt><dd class="num">{{ '{:,}'.format(device.stored_punches or 0) }}</dd></div>
+      {% if device.connection_updated_at %}<div><dt>Connection changed</dt><dd>{{ when(device.connection_updated_at) }}</dd></div>{% endif %}
+    </dl>
+
+    {% if can_edit %}
+    <details class="device-edit"{% if errored %} open{% endif %}>
+      <summary>Edit connection</summary>
+      <form method="post" action="{{ url_for('admin.devices_update', device_id=device.id) }}" class="device-edit-form">
+        <input type="hidden" name="csrf" value="{{ csrf_token }}">
+        {% if errored %}{{ ui.inline_error(device_error) }}{% endif %}
+        {% set d = device.id %}
+        <div class="device-edit-row">
+          <div class="field">
+            <label for="{{ d }}-ip">IP address</label>
+            <input id="{{ d }}-ip" name="ip" type="text" inputmode="decimal" spellcheck="false" required value="{{ device_form.ip if errored else device.ip }}">
+          </div>
+          <div class="field field-port">
+            <label for="{{ d }}-port">Port</label>
+            <input id="{{ d }}-port" name="port" type="text" inputmode="numeric" required value="{{ device_form.port if errored else device.port }}">
+          </div>
+        </div>
+        <div class="field">
+          <label for="{{ d }}-pw">Comm password</label>
+          <input id="{{ d }}-pw" name="comm_password" type="password" autocomplete="new-password" aria-describedby="{{ d }}-pw-hint" value="{{ device_form.comm_password if errored else '' }}">
+          <p class="field-hint" id="{{ d }}-pw-hint">Leave blank to keep the current password.</p>
+        </div>
+        <label class="check-label">
+          <input type="checkbox" name="clear_comm_password" value="1"{% if errored and device_form.clear_comm_password %} checked{% endif %}>
+          Clear the stored password and use the server's default
+        </label>
+        <div>{{ ui.button('Save connection', 'primary', type='submit') }}</div>
+      </form>
+    </details>
+    {% endif %}
+  </section>
+  {% endfor %}
+</div>
+
+{% if issue_count %}
+<div class="notice">{{ ui.icon('circle-alert') }}<p><strong>{{ issue_count }} device ID {{ 'issue' if issue_count == 1 else 'issues' }} to check.</strong> <a href="{{ url_for('people.id_issues_view') }}">Review ID issues</a></p></div>
+{% endif %}
+{% endblock %}

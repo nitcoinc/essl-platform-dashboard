@@ -1,0 +1,10 @@
+{% extends "_auth_base.html" %}
+{% block title %}Temporarily offline{% endblock %}
+{% block card %}
+<div class="auth-title">
+  <h1>Temporarily offline</h1>
+  <p>The hub cannot reach its database right now, so changes can't be saved.</p>
+</div>
+<p class="auth-note">Viewing attendance still works from the local copy. Try your change again in a few minutes.</p>
+<p class="auth-note"><a href="/">Back to the dashboard</a></p>
+{% endblock %}

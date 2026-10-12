@@ -1,0 +1,46 @@
+{# One People row. Rendered in the table and returned alone by htmx after Save.
+   Access flags (role_locked, identity_locked, role_options) come from the view. #}
+{% import "_ui.html" as ui %}
+{% from "_status_chip.html" import status_chip %}
+{% set p = row.person %}
+{% set error = row_error[1] if row_error and row_error[0] == p.id else None %}
+{% set err_id = 'assign-error-' ~ p.id %}
+<tr id="person-{{ p.id }}"{% if error %} class="has-error"{% endif %}>
+  <td class="person-cell">
+    <form id="assign-{{ p.id }}" method="post" action="{{ url_for('people.people_assign', employee_id=p.id) }}" hidden>
+      <input type="hidden" name="csrf" value="{{ csrf_token }}">
+    </form>
+    <a class="person-name" href="{{ url_for('people.person_edit', employee_id=p.id) }}">{{ p.name }}</a>
+    <span class="person-email">{{ p.email }}</span>
+  </td>
+  <td data-label="Device ID" class="num">{{ p.device_user_id }}{% if row.identity_locked %} <span class="lock" title="Only an admin can change this">{{ ui.icon('lock') }}<span class="visually-hidden">locked</span></span>{% endif %}</td>
+  <td data-label="Manager">
+    <label class="visually-hidden" for="manager-{{ p.id }}">Manager for {{ p.name }}</label>
+    <select id="manager-{{ p.id }}" name="manager_id" form="assign-{{ p.id }}"{% if error %} aria-describedby="{{ err_id }}" aria-invalid="true"{% endif %}>
+      <option value=""{{ ' selected' if not p.manager_id }}>No manager</option>
+      {% for m in everyone if m.id != p.id %}
+      <option value="{{ m.id }}"{{ ' selected' if p.manager_id == m.id }}>{{ m.name }}</option>
+      {% endfor %}
+    </select>
+  </td>
+  <td data-label="Role">
+    {% if row.role_locked %}
+    <span class="locked-value">{{ role_labels[p.role] }} <span class="lock">{{ ui.icon('lock') }}<span>{{ 'You' if p.id == employee.id else 'Admin only' }}</span></span></span>
+    {% else %}
+    <label class="visually-hidden" for="role-{{ p.id }}">Role for {{ p.name }}</label>
+    <select id="role-{{ p.id }}" name="role" form="assign-{{ p.id }}"{% if error %} aria-describedby="{{ err_id }}" aria-invalid="true"{% endif %}>
+      {% for option in row.role_options %}
+      <option value="{{ option }}"{{ ' selected' if p.role == option }}>{{ role_labels[option] }}</option>
+      {% endfor %}
+    </select>
+    {% endif %}
+  </td>
+  <td data-label="Today">{{ status_chip(row.status) }}</td>
+  <td class="row-actions">
+    <a class="button button-tertiary button-sm" href="{{ url_for('people.person_edit', employee_id=p.id) }}" aria-label="Edit name, email and device ID for {{ p.name }}">Edit</a>
+    <button id="save-{{ p.id }}" class="button button-secondary button-sm" type="submit" form="assign-{{ p.id }}"
+      hx-post="{{ url_for('people.people_assign', employee_id=p.id) }}" hx-include="closest tr" hx-target="closest tr" hx-swap="outerHTML"
+      aria-label="Save manager and role for {{ p.name }}"{% if error %} aria-describedby="{{ err_id }}"{% endif %}{% if focus_save %} autofocus{% endif %}>Save</button>
+    {% if error %}{{ ui.inline_error(error, err_id) }}{% endif %}
+  </td>
+</tr>

@@ -1,0 +1,17 @@
+{% extends "_auth_base.html" %}
+{% block title %}First-time setup{% endblock %}
+{% block card %}
+<div class="auth-title">
+  <h1>First-time setup</h1>
+  <p>Create the first administrator. This page closes once one exists.</p>
+</div>
+{% if error %}<div class="auth-error" role="alert">{{ ui.icon('circle-alert') }}<span>{{ error }}</span></div>{% endif %}
+<form method="post" action="{{ url_for('auth.setup_submit') }}">
+  {{ ui.field('setup_token', 'Setup token', '', type='password', required=True, hint='The value of ESSL_SETUP_TOKEN on the server.', attrs='autocomplete="off" autofocus') }}
+  {{ ui.field('name', 'Name', name or '', required=True, attrs='autocomplete="name"') }}
+  {{ ui.field('email', 'Work email', email or '', type='email', required=True, attrs='autocomplete="email" spellcheck="false"') }}
+  {{ ui.field('device_user_id', 'Device user ID', device_user_id or '', hint='Optional. Your badge number, if you also scan in at a door.', attrs='inputmode="numeric"') }}
+  {% if turnstile_site_key %}<div class="cf-turnstile auth-turnstile" data-sitekey="{{ turnstile_site_key }}" data-theme="auto"></div>{% endif %}
+  {{ ui.button('Create administrator', 'primary', type='submit') }}
+</form>
+{% endblock %}

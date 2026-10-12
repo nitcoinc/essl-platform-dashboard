@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% import "_ui.html" as ui %}
+{% block title %}{{ title }} - eSSL Attendance Hub{% endblock %}
+{% block content %}
+<header class="topbar">
+  <div>
+    <h1>{{ title }}</h1>
+    <p>{{ today.strftime('%A %d %B') }}. Incomplete days and people with no punches are listed first.</p>
+  </div>
+  <div class="topbar-actions">
+    <a class="button button-secondary" href="#export">{{ ui.icon('download') }}<span>Export</span></a>
+  </div>
+</header>
+
+<form class="people-search" method="get" action="{{ url_for('team.team_view') }}" role="search">
+  <label class="visually-hidden" for="team-q">Search {{ title|lower }}</label>
+  <div class="search-field">
+    {{ ui.icon('search') }}
+    <input id="team-q" type="search" name="q" value="{{ query }}" placeholder="Search by name or email" autocomplete="off"
+      hx-get="{{ url_for('team.team_view') }}" hx-trigger="input changed delay:250ms, search" hx-target="#team-results" hx-push-url="true">
+  </div>
+  {{ ui.button('Search', type='submit') }}
+</form>
+{% set count_label = rows|length ~ (' person' if rows|length == 1 else ' people') %}
+<p id="team-count" class="people-count" aria-live="polite">{{ count_label }}</p>
+
+<div id="team-results">
+  {% include "_team_results.html" %}
+</div>
+
+{% if unmapped %}
+<div class="notice">{{ ui.icon('circle-alert') }}<p><strong>{{ unmapped|length }} device {{ 'ID has' if unmapped|length == 1 else 'IDs have' }} punches but no one on the roster</strong> ({{ unmapped|map(attribute='device_user_id')|join(', ') }}). Add {{ 'that person' if unmapped|length == 1 else 'those people' }} on the People page so their hours count.</p></div>
+{% endif %}
+
+<section class="export-panel" id="export" aria-labelledby="export-heading">
+  <h2 id="export-heading">Export hours</h2>
+  <p class="export-intro">One row per person per day, with gross and effective minutes and the day's status. Up to 93 days at a time.</p>
+  <form id="export-form" class="export-form" method="get" action="{{ url_for('team.export_xlsx') }}">
+    <div class="export-range">
+      {{ ui.field('from', 'From', export_from, type='date', required=True, attrs='max="' ~ today.isoformat() ~ '"') }}
+      {{ ui.field('to', 'To', export_to, type='date', required=True, attrs='max="' ~ today.isoformat() ~ '"') }}
+    </div>
+    <div class="export-presets" role="group" aria-label="Date presets">
+      {% for key, label in (('this_week', 'This week'), ('this_month', 'This month'), ('last_month', 'Last month')) %}
+      {% set p = presets[key] %}
+      <a class="button button-tertiary button-sm" href="{{ url_for('team.team_view', q=query or None, **{'from': p[0].isoformat(), 'to': p[1].isoformat()}) }}#export"
+        {%- if export_from == p[0].isoformat() and export_to == p[1].isoformat() %} aria-current="true"{% endif %}>{{ label }}</a>
+      {% endfor %}
+    </div>
+    <fieldset class="export-scope">
+      <legend class="field-label">People</legend>
+      <label><input type="radio" name="scope" value="everyone"{{ ' checked' if export_scope == 'everyone' }}> Everyone you can see</label>
+      <label><input type="radio" name="scope" value="selected"{{ ' checked' if export_scope == 'selected' }}> Only people ticked in the table</label>
+    </fieldset>
+    {% if export_error %}{{ ui.inline_error(export_error, 'export-error') }}{% endif %}
+    <div class="form-actions">
+      {{ ui.button('Download Excel', 'primary', type='submit', icon_name='download') }}
+      {{ ui.button('CSV', 'secondary', type='submit', attrs='formaction="' ~ url_for('team.export_csv') ~ '"') }}
+    </div>
+  </form>
+</section>
+{% endblock %}

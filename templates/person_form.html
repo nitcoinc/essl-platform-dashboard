@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% import "_ui.html" as ui %}
+{% block title %}{{ 'Edit ' ~ target.name if target else 'Add person' }} - eSSL Attendance Hub{% endblock %}
+{% block content %}
+<header class="topbar">
+  <div>
+    <a class="back-link" href="{{ url_for('people.people_view') }}">{{ ui.icon('arrow-left') }}<span>People</span></a>
+    <h1>{{ 'Edit ' ~ target.name if target else 'Add person' }}</h1>
+    <p>{{ 'Changes apply as soon as you save.' if target else 'They can sign in with their work email once added.' }}</p>
+  </div>
+</header>
+
+{% if errors.form %}<div class="form-error">{{ ui.inline_error(errors.form, 'form-error') }}</div>{% endif %}
+
+<form class="person-form" method="post" action="{{ url_for('people.person_update', employee_id=target.id) if target else url_for('people.person_create') }}" novalidate>
+  <input type="hidden" name="csrf" value="{{ csrf_token }}">
+  {{ ui.field('name', 'Full name', values.name, error=errors.name, required=True, attrs='autocomplete="off"') }}
+  {% if identity_locked %}
+  <div class="field">
+    <span class="field-label" id="f-email-label">Work email</span>
+    <p class="locked-value" aria-labelledby="f-email-label">{{ values.email }} <span class="lock">{{ ui.icon('lock') }}<span>Admin only</span></span></p>
+    <input type="hidden" name="email" value="{{ values.email }}">
+  </div>
+  <div class="field">
+    <span class="field-label" id="f-device-label">Device user ID</span>
+    <p class="locked-value" aria-labelledby="f-device-label">{{ values.device_user_id }} <span class="lock">{{ ui.icon('lock') }}<span>Admin only</span></span></p>
+    <input type="hidden" name="device_user_id" value="{{ values.device_user_id }}">
+  </div>
+  {% else %}
+  {{ ui.field('email', 'Work email', values.email, type='email', error=errors.email, required=True, hint='The address they sign in with.', attrs='autocomplete="off"') }}
+  {{ ui.field('device_user_id', 'Device user ID', values.device_user_id, error=errors.device_user_id, required=True, hint='The user ID enrolled on the attendance device, for example 118 or NP0009.', attrs='autocomplete="off" autocapitalize="characters"') }}
+  {% endif %}
+
+  <div class="field">
+    <label for="f-manager_id">Manager</label>
+    <select id="f-manager_id" name="manager_id"{% if errors.manager_id %} aria-invalid="true" aria-describedby="f-manager_id-error"{% endif %}>
+      <option value="">No manager</option>
+      {% for m in managers %}
+      <option value="{{ m.id }}"{{ ' selected' if values.manager_id == m.id|string }}>{{ m.name }}</option>
+      {% endfor %}
+    </select>
+    {% if errors.manager_id %}{{ ui.inline_error(errors.manager_id, 'f-manager_id-error') }}{% endif %}
+  </div>
+
+  <div class="field">
+    {% if role_locked %}
+    <span class="field-label" id="f-role-label">Role</span>
+    <p class="locked-value" aria-labelledby="f-role-label">{{ role_labels[target.role] }} <span class="lock">{{ ui.icon('lock') }}<span>{{ 'Your own role' if target.id == employee.id else 'Admin only' }}</span></span></p>
+    <input type="hidden" name="role" value="{{ target.role }}">
+    {% else %}
+    <label for="f-role">Role</label>
+    <select id="f-role" name="role" aria-describedby="f-role-hint{% if errors.role %} f-role-error{% endif %}"{% if errors.role %} aria-invalid="true"{% endif %}>
+      {% for option in role_options %}
+      <option value="{{ option }}"{{ ' selected' if values.role == option }}>{{ role_labels[option] }}</option>
+      {% endfor %}
+    </select>
+    <p class="field-hint" id="f-role-hint">Managers see their team. HR and admins see everyone.</p>
+    {% if errors.role %}{{ ui.inline_error(errors.role, 'f-role-error') }}{% endif %}
+    {% endif %}
+  </div>
+
+  <div class="form-actions">
+    {{ ui.button('Save changes' if target else 'Add person', 'primary', type='submit') }}
+    {{ ui.button('Cancel', 'tertiary', href=url_for('people.people_view')) }}
+  </div>
+</form>
+{% endblock %}

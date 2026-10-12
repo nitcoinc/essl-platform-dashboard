@@ -1,0 +1,13 @@
+{# The one renderer for the status -> chip mapping.
+
+   hr.html and admin.html carried byte-identical copies of this five-branch
+   ladder, and week.html carried a third that differed only in its short label.
+   Callers that need different wording pass it in (week shows "Short by 1h 30m"). #}
+{% macro status_chip(status, short_label='Short') -%}
+{% if status == 'met' %}<span class="status-chip status-met">Met</span>
+{% elif status == 'short' %}<span class="status-chip status-short">{{ short_label }}</span>
+{% elif status == 'incomplete' %}<span class="status-chip status-incomplete">Incomplete - no exit recorded</span>
+{% elif status == 'open' %}<span class="status-chip status-open">Running</span>
+{% else %}<span class="status-chip status-empty">No punches</span>
+{% endif %}
+{%- endmacro %}

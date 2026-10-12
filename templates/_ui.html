@@ -1,0 +1,61 @@
+{# UI macros. Import with: {% import "_ui.html" as ui %}. Styles live in static/styles.css; rules in DESIGN.md. #}
+
+{% macro icon(name, cls='') -%}
+<svg class="icon {{ cls }}" aria-hidden="true" focusable="false"><use href="#i-{{ name }}"></use></svg>
+{%- endmacro %}
+
+{# variant: primary | secondary | tertiary | danger. Renders <a> when href is given. #}
+{% macro button(label, variant='secondary', href=None, type='button', icon_name=None, size=None, attrs='') -%}
+{% set cls = 'button button-' ~ variant ~ (' button-sm' if size == 'sm' else '') %}
+{% if href %}<a class="{{ cls }}" href="{{ href }}" {{ attrs|safe }}>{% else %}<button class="{{ cls }}" type="{{ type }}" {{ attrs|safe }}>{% endif %}
+{%- if icon_name %}{{ icon(icon_name) }}{% endif %}<span>{{ label }}</span>
+{%- if href %}</a>{% else %}</button>{% endif %}
+{%- endmacro %}
+
+{# tone: ok | warn | bad | info | neutral. Label text is required: color never stands alone. #}
+{% macro chip(label, tone='neutral') -%}
+<span class="chip chip-{{ tone }}">{{ label }}</span>
+{%- endmacro %}
+
+{# Hours always read as "7h 42m". #}
+{% macro hours(minutes) -%}
+{% if minutes is none %}<span class="muted">-</span>{% else %}<span class="num">{{ minutes // 60 }}h {{ '%02d'|format(minutes % 60) }}m</span>{% endif %}
+{%- endmacro %}
+
+{# columns: list of (label, align) where align is 'left' or 'num'. Body comes from caller(). #}
+{% macro table(columns, caption=None) -%}
+<div class="table-scroll">
+  <table class="table hours-table">
+    {% if caption %}<caption class="visually-hidden">{{ caption }}</caption>{% endif %}
+    <thead><tr>{% for label, align in columns %}<th scope="col"{% if align == 'num' %} class="num"{% endif %}>{{ label }}</th>{% endfor %}</tr></thead>
+    <tbody>{{ caller() }}</tbody>
+  </table>
+</div>
+{%- endmacro %}
+
+{% macro field(name, label, value='', type='text', hint=None, error=None, required=False, attrs='') -%}
+{% set fid = 'f-' ~ name %}
+<div class="field">
+  <label for="{{ fid }}">{{ label }}</label>
+  <input id="{{ fid }}" name="{{ name }}" type="{{ type }}" value="{{ value }}"
+    {%- if required %} required{% endif %}
+    {%- if hint or error %} aria-describedby="{% if hint %}{{ fid }}-hint {% endif %}{% if error %}{{ fid }}-error{% endif %}"{% endif %}
+    {%- if error %} aria-invalid="true"{% endif %} {{ attrs|safe }}>
+  {% if hint %}<p class="field-hint" id="{{ fid }}-hint">{{ hint }}</p>{% endif %}
+  {% if error %}{{ inline_error(error, fid ~ '-error') }}{% endif %}
+</div>
+{%- endmacro %}
+
+{% macro inline_error(message, id=None) -%}
+<p class="inline-error" role="alert"{% if id %} id="{{ id }}"{% endif %}>{{ icon('circle-alert') }}<span>{{ message }}</span></p>
+{%- endmacro %}
+
+{# One sentence on what is missing, one on what to do. Optional action from caller(). #}
+{% macro empty_state(title, body=None, icon_name='inbox') -%}
+<div class="empty-state">
+  {{ icon(icon_name) }}
+  <h2>{{ title }}</h2>
+  {% if body %}<p>{{ body }}</p>{% endif %}
+  {% if caller is defined %}{{ caller() }}{% endif %}
+</div>
+{%- endmacro %}

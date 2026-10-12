@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% import "_ui.html" as ui %}
+{% block title %}Import roster - eSSL Attendance Hub{% endblock %}
+{% block content %}
+<header class="topbar">
+  <div>
+    {% if has_endpoint('people.people_view') %}<a class="back-link" href="{{ url_for('people.people_view') }}">{{ ui.icon('arrow-left') }}<span>People</span></a>{% endif %}
+    <h1>Import roster</h1>
+    <p>Add or update everyone at once from a spreadsheet. Rows are matched on device user ID, so uploading the same file again changes nothing.</p>
+  </div>
+  <div class="topbar-actions">
+    {{ ui.button('CSV template', href=url_for('people.people_import_template_csv'), icon_name='download') }}
+    {{ ui.button('Excel template', href=url_for('people.people_import_template_xlsx'), icon_name='download') }}
+  </div>
+</header>
+
+{% if summary is not none %}
+<section class="admin-section import-result" aria-labelledby="result-heading">
+  <h2 id="result-heading">Upload result</h2>
+  <p class="import-summary" role="status">
+    <span><strong>{{ summary.added }}</strong> added</span>
+    <span><strong>{{ summary.updated }}</strong> updated</span>
+    <span><strong>{{ summary.warnings }}</strong> with warnings</span>
+    <span><strong>{{ summary.rejected }}</strong> rejected</span>
+  </p>
+  {% if issues %}
+  {% call ui.table([('Row', 'num'), ('Name', 'left'), ('Result', 'left'), ('Reason', 'left')], caption='Rows that need attention') %}
+    {% for o in issues %}
+    {% if o.result == 'rejected' %}
+    <tr>
+      <td data-label="Row" class="num">{{ o.row_number }}</td>
+      <td data-label="Name">{{ o.name or '-' }}</td>
+      <td data-label="Result">{{ ui.chip('Rejected', 'bad') }}</td>
+      <td data-label="Reason" class="reason">{{ o.reason }}</td>
+    </tr>
+    {% endif %}
+    {% for warning in o.warnings %}
+    <tr>
+      <td data-label="Row" class="num">{{ o.row_number }}</td>
+      <td data-label="Name">{{ o.name }}</td>
+      <td data-label="Result">{{ ui.chip('Warning', 'warn') }}</td>
+      <td data-label="Reason" class="reason">{{ warning }}</td>
+    </tr>
+    {% endfor %}
+    {% endfor %}
+  {% endcall %}
+  <p class="import-download"><a href="data:text/csv;charset=utf-8,{{ issues_csv|urlencode }}" download="roster-issues.csv">{{ ui.icon('download') }}<span>Download issues (CSV)</span></a></p>
+  {% else %}
+  <p class="muted">Every row applied cleanly.</p>
+  {% endif %}
+</section>
+{% endif %}
+
+<section class="admin-section" aria-labelledby="upload-heading">
+  <h2 id="upload-heading">Upload a file</h2>
+  <form method="post" action="{{ url_for('people.people_import_upload') }}" enctype="multipart/form-data" class="import-form">
+    <input type="hidden" name="csrf" value="{{ csrf_token }}">
+    <div class="field">
+      <label for="f-roster">Roster file</label>
+      <input id="f-roster" type="file" name="roster" accept=".csv,.xlsx" required
+        aria-describedby="f-roster-hint{% if error %} f-roster-error{% endif %}"{% if error %} aria-invalid="true"{% endif %}>
+      <p class="field-hint" id="f-roster-hint">A .csv or .xlsx file up to {{ max_upload_mb }} MB, with a header row in the first line.</p>
+      {% if error %}{{ ui.inline_error(error, 'f-roster-error') }}{% endif %}
+    </div>
+    {{ ui.button('Upload roster', 'primary', type='submit', icon_name='upload') }}
+  </form>
+</section>
+
+<section class="admin-section" aria-labelledby="columns-heading">
+  <h2 id="columns-heading">Columns</h2>
+  <dl class="column-rules">
+    <div><dt>name</dt><dd>Required. Full name as it should appear in the hub.</dd></div>
+    <div><dt>work email</dt><dd>Required. The address the person signs in with.</dd></div>
+    <div><dt>device user id</dt><dd>Required. The user ID enrolled on the attendance device.</dd></div>
+    <div><dt>manager email</dt><dd>Optional. Work email of the person they report to. A blank cell removes the manager; leaving the column out keeps everyone's current manager.</dd></div>
+    <div><dt>role</dt><dd>Optional. <code>employee</code>, <code>manager</code> or <code>hr</code>. A blank cell keeps the current role. Admins keep their role; admin is granted on the People page.</dd></div>
+  </dl>
+</section>
+{% endblock %}

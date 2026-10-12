@@ -1,0 +1,115 @@
+# Single-host stack: the database lives in Turso (libSQL); each app service
+# keeps its own embedded replica file on the essl-data volume (KTD1) and syncs
+# it on its own loop (KTD4). Users reach the web app through a Cloudflare
+# Tunnel. All settings come from .env (see .env.example); deploy/install.sh
+# sets it up.
+#
+# Tokens: collector and web use the read-write TURSO_AUTH_TOKEN; the nightly
+# export uses the read-only TURSO_EXPORT_AUTH_TOKEN (KTD14).
+
+x-app-env: &app-env
+  TURSO_DATABASE_URL: ${TURSO_DATABASE_URL:?set TURSO_DATABASE_URL in .env}
+  ESSL_COLLECTOR_INTERVAL_SECONDS: ${ESSL_COLLECTOR_INTERVAL_SECONDS:-60}
+  ESSL_HEARTBEAT_WRITE_SECONDS: ${ESSL_HEARTBEAT_WRITE_SECONDS:-300}
+
+services:
+  collector:
+    build: .
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      ESSL_DB_PATH: /data/collector-replica.db
+      ESSL_SPOOL_PATH: /data/collector-spool.db
+      TURSO_AUTH_TOKEN: ${TURSO_AUTH_TOKEN:?set TURSO_AUTH_TOKEN in .env}
+      TURSO_SYNC_SECONDS: ${TURSO_COLLECTOR_SYNC_SECONDS:-300}
+      ESSL_X990_IP: ${ESSL_X990_IP:-192.168.1.201}
+      ESSL_X990_PORT: ${ESSL_X990_PORT:-4370}
+      ESSL_X990_PASSWORD: ${ESSL_X990_PASSWORD:-0}
+      ESSL_C3_IP: ${ESSL_C3_IP:-192.168.1.202}
+      ESSL_C3_PORT: ${ESSL_C3_PORT:-4370}
+      ESSL_C3_PASSWORD: ${ESSL_C3_PASSWORD:-}
+      ESSL_C3_MODE: ${ESSL_C3_MODE:-auto}
+      ESSL_C3_HISTORY_HOURS: ${ESSL_C3_HISTORY_HOURS:-6}
+      ESSL_C3_RTLOG_BATCH: ${ESSL_C3_RTLOG_BATCH:-250}
+      ESSL_C3_ID_FORMAT: ${ESSL_C3_ID_FORMAT:-}
+      ESSL_C3_UNLINKED_PINS: ${ESSL_C3_UNLINKED_PINS:-1,2}
+      # Frappe HR push (all three set = enabled). See README "Frappe HR integration".
+      FRAPPE_URL: ${FRAPPE_URL:-}
+      FRAPPE_API_KEY: ${FRAPPE_API_KEY:-}
+      FRAPPE_API_SECRET: ${FRAPPE_API_SECRET:-}
+      FRAPPE_SYNC_INTERVAL_SECONDS: ${FRAPPE_SYNC_INTERVAL_SECONDS:-60}
+      FRAPPE_SYNC_BATCH_SIZE: ${FRAPPE_SYNC_BATCH_SIZE:-200}
+      FRAPPE_EMPLOYEE_FIELDNAME: ${FRAPPE_EMPLOYEE_FIELDNAME:-attendance_device_id}
+      FRAPPE_SHIFT_TYPES: ${FRAPPE_SHIFT_TYPES:-}
+      FRAPPE_SYNC_SINCE: ${FRAPPE_SYNC_SINCE:-}
+    volumes:
+      - essl-data:/data
+    command: ["python", "-m", "essl_hub.collector_main"]
+
+  web:
+    build: .
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      ESSL_DB_PATH: /data/web-replica.db
+      TURSO_AUTH_TOKEN: ${TURSO_AUTH_TOKEN:?set TURSO_AUTH_TOKEN in .env}
+      TURSO_SYNC_SECONDS: ${TURSO_WEB_SYNC_SECONDS:-60}
+      # Trust CF-Connecting-IP: only cloudflared can reach this container.
+      ESSL_BEHIND_TUNNEL: "1"
+      ESSL_FORCE_HTTPS_COOKIES: ${ESSL_FORCE_HTTPS_COOKIES:-true}
+      ESSL_MAX_UPLOAD_MB: ${ESSL_MAX_UPLOAD_MB:-5}
+      ESSL_SETUP_TOKEN: ${ESSL_SETUP_TOKEN:-}
+      ESSL_BOOTSTRAP_ADMIN_EMAIL: ${ESSL_BOOTSTRAP_ADMIN_EMAIL:-}
+      ESSL_MAIL_PROVIDER: ${ESSL_MAIL_PROVIDER:-}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
+      CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
+      CLOUDFLARE_FROM_ADDRESS: ${CLOUDFLARE_FROM_ADDRESS:-}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      RESEND_FROM_ADDRESS: ${RESEND_FROM_ADDRESS:-}
+      # Cloudflare Turnstile bot check on /signin and /setup (both set = on).
+      TURNSTILE_SITE_KEY: ${TURNSTILE_SITE_KEY:-}
+      TURNSTILE_SECRET_KEY: ${TURNSTILE_SECRET_KEY:-}
+    volumes:
+      - essl-data:/data
+    command: ["gunicorn", "-w", "1", "--threads", "4", "-b", "0.0.0.0:8000", "essl_hub.web:create_app()"]
+    # Not published: users reach it through cloudflared. For local access on
+    # the host only, uncomment (and unset ESSL_FORCE_HTTPS_COOKIES for plain http):
+    # ports:
+    #   - "127.0.0.1:8000:8000"
+
+  nightly-export:
+    build: .
+    restart: unless-stopped
+    environment:
+      ESSL_DB_PATH: /data/export-replica.db
+      ESSL_EXPORT_HOUR: ${ESSL_EXPORT_HOUR:-2}
+      TURSO_DATABASE_URL: ${TURSO_DATABASE_URL:?set TURSO_DATABASE_URL in .env}
+      # Read-only token (turso db tokens create --read-only), KTD14.
+      TURSO_EXPORT_AUTH_TOKEN: ${TURSO_EXPORT_AUTH_TOKEN:?set TURSO_EXPORT_AUTH_TOKEN in .env}
+      # R2 token scoped to this one bucket (Object Read & Write; R2 has no write-only), KTD15.
+      R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:?set R2_ACCOUNT_ID in .env}
+      R2_BUCKET: ${R2_BUCKET:?set R2_BUCKET in .env}
+      R2_EXPORT_ACCESS_KEY_ID: ${R2_EXPORT_ACCESS_KEY_ID:?set R2_EXPORT_ACCESS_KEY_ID in .env}
+      R2_EXPORT_SECRET_ACCESS_KEY: ${R2_EXPORT_SECRET_ACCESS_KEY:?set R2_EXPORT_SECRET_ACCESS_KEY in .env}
+    volumes:
+      - essl-data:/data
+    command: ["python", "-m", "essl_hub.nightly_export"]
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.9.0
+    restart: unless-stopped
+    # Route the tunnel's public hostname to http://web:8000 in the Cloudflare dashboard.
+    command: ["tunnel", "--no-autoupdate", "--metrics", "0.0.0.0:2000", "run"]
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN in .env}
+    healthcheck:
+      test: ["CMD", "cloudflared", "tunnel", "--metrics", "127.0.0.1:2000", "ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      - web
+
+volumes:
+  essl-data:

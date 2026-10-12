@@ -1,0 +1,106 @@
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+from flask import Flask, Response, g, render_template, request
+
+from . import access, auth, config, turnstile
+from .config import DEVICES
+from .db import Database, OfflineError
+from .routes import BLUEPRINTS
+from .routes import people as people_routes
+from .routes.common import SESSION_COOKIE, _theme, current_sync_health
+
+_logger = logging.getLogger(__name__)
+WEB_SYNC_SECONDS = 60
+
+
+def _prepare_database(database: Database) -> None:
+    """Boot steps that need the primary; each is skipped with a log line when
+    Turso is unreachable so reads from the replica still serve (KTD8, KTD11)."""
+    # The web app is the schema owner (KTD8): pull first so the migration
+    # check sees the primary's user_version, then migrate and seed.
+    database.sync()
+    try:
+        database.initialize(DEVICES)
+    except OfflineError as exc:
+        _logger.warning("Turso unreachable; schema migration and seeding skipped: %s", exc)
+    # Web process only: the collector never grants roles or reads the bootstrap
+    # address, so it stays independent of dashboard configuration (R10, R14).
+    try:
+        database.ensure_bootstrap_admin(config.bootstrap_admin_email())
+    except OfflineError as exc:
+        _logger.warning("Turso unreachable; bootstrap admin check skipped: %s", exc)
+    # Started inside the worker, never a forking master (KTD3, KTD4).
+    if database.replica:
+        database.start_sync_loop(config.turso_sync_seconds(WEB_SYNC_SECONDS))
+
+
+def create_app(database: Database | None = None) -> Flask:
+    root = Path(__file__).resolve().parent.parent
+    app = Flask(
+        __name__,
+        template_folder=str(root / "templates"),
+        static_folder=str(root / "static"),
+    )
+    max_upload_mb = config.max_upload_mb()
+    app.config["MAX_CONTENT_LENGTH"] = max_upload_mb * 1024 * 1024
+    database = database or Database()
+    _prepare_database(database)
+    app.extensions["essl_database"] = database
+    app.extensions["essl_setup_token"] = config.setup_token()
+    app.extensions["essl_max_upload_mb"] = max_upload_mb
+    app.extensions["essl_turnstile"] = turnstile.config_from_env()
+
+    @app.context_processor
+    def turnstile_widget() -> dict:
+        cfg = app.extensions["essl_turnstile"]
+        return {"turnstile_site_key": cfg.site_key if cfg else None}
+
+    @app.context_processor
+    def nav_helpers() -> dict:
+        # The shell links only to pages that exist, so a role's sidebar grows
+        # as its pages land without template edits.
+        return {"has_endpoint": lambda name: name in app.view_functions, "theme": _theme()}
+
+    @app.context_processor
+    def id_issue_badge() -> dict:
+        # HR and admin see how many ID issues wait on the People nav entry.
+        employee = g.get("employee")
+        if not employee or employee["role"] not in access.EDITOR_ROLES:
+            return {}
+        return {"nav_issue_count": people_routes.issue_count()}
+
+    @app.context_processor
+    def sync_health_indicator() -> dict:
+        # Admin only (R4); status files are re-read per page, which is cheap.
+        employee = g.get("employee")
+        if not employee or employee["role"] != "admin":
+            return {}
+        return {"sync_health": current_sync_health(database)[0]}
+
+    @app.errorhandler(OfflineError)
+    def offline(exc: OfflineError) -> tuple[str, int]:
+        # A write that cannot reach the primary is an outage, not a bug (KTD11).
+        _logger.warning("Write refused while offline: %s", exc)
+        return render_template("offline.html"), 503
+
+    @app.after_request
+    def security_headers(response: Response) -> Response:
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.before_request
+    def load_employee() -> None:
+        token = request.cookies.get(SESSION_COOKIE)
+        session = auth.resolve_session(database, token)
+        g.employee = session["employee"] if session else None
+        g.csrf_token = session["csrf_token"] if session else None
+
+    for blueprint in BLUEPRINTS:
+        app.register_blueprint(blueprint)
+    return app
