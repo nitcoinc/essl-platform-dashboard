@@ -34,7 +34,7 @@
 
 <section class="export-panel" id="export" aria-labelledby="export-heading">
   <h2 id="export-heading">Export hours</h2>
-  <p class="export-intro">One row per person per day, with gross and effective minutes and the day's status. Up to 93 days at a time.</p>
+  <p class="export-intro">Excel has three sheets: Daily Detail (first in, last out, gross, break and effective time per person per work day), Monthly Matrix and Person Summary. CSV is Daily Detail only. Work days start at {{ day_start_label }}. Up to 93 days at a time.</p>
   <form id="export-form" class="export-form" method="get" action="{{ url_for('team.export_xlsx') }}">
     <div class="export-range">
       {{ ui.field('from', 'From', export_from, type='date', required=True, attrs='max="' ~ today.isoformat() ~ '"') }}

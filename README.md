@@ -512,6 +512,18 @@ Set a **usage alert** in the Turso dashboard well below your plan's limits, and 
 
 Asking for someone you may not see returns 404, the same as an id that does not exist. `/admin` redirects to **Devices**; `/devices/ids` redirects to **People → ID issues**.
 
+## Attendance export
+
+**Team / Everyone → Export hours** downloads up to 93 days for the people you can see (everyone, or only those ticked). Every sheet starts with the range and the work-day window (e.g. 06:00 to 06:00 next day, IST), and the whole export comes from one punch query.
+
+Excel (`/export.xlsx`) has three sheets:
+
+- **Daily Detail**: one row per person per work day. Emp ID, Name, Manager, Site(s), Date, Weekday, First In, Last Out, Punches, Gross, Break, Effective, Effective (h), Status, Shortfall vs target, Remarks. First In and Last Out are full datetimes shown `hh:mm:ss` (a night shift's Last Out falls on the next calendar date); durations are exact-second `[h]:mm:ss` values. Header and Emp ID/Name are frozen, autofilter is on. Status is Met, Short, Review (paired time counts, Remarks names the unmatched swipe), Missing exit / Missing entry / Incomplete, Open, Absent or Weekend off. Last Out, durations and Shortfall stay blank where they would be invented (incomplete; Shortfall also for open and absent days).
+- **Monthly Matrix**: people × work days, each cell a code plus effective `H:MM`: P present, A absent, WO weekend off (Sat/Sun), R review, I incomplete, O open, blank before the person was added. Weekends are shaded. Totals: Present, Absent, Review, Incomplete, Total effective, Days below target.
+- **Person Summary**: days present, average first in and average effective (complete days only), days below target, incomplete and review days, expected hours (weekdays × daily target) and actual hours.
+
+CSV (`/export.csv`) is Daily Detail only: UTF-8 with a BOM so Excel opens it on double-click, `HH:MM` times and durations, plus the decimal Effective (h) column. Text that a spreadsheet would run as a formula is prefixed with `'` in every sheet and the CSV.
+
 ## Roster columns
 
 Upload `.csv` (UTF-8) or `.xlsx` on **People → Import roster**. Download the template there. The first row is the header; column names are case-insensitive. Rows are matched on device user ID, so uploading the same file twice changes nothing. Up to 5,000 rows and `ESSL_MAX_UPLOAD_MB` (default 5 MB).

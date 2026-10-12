@@ -202,6 +202,7 @@ class FakeDatabase:
                 "device_user_id": p["device_user_id"],
                 "event_timestamp": p["event_timestamp"],
                 "trusted_direction": p.get("trusted_direction"),
+                "site": p.get("site"),
             }
             for p in rows
         ]
@@ -878,7 +879,8 @@ class HoursRenderingTest(unittest.TestCase):
         self.assertTrue(response.headers["Location"].endswith("/export.csv?from=2026-10-01&to=2026-10-02"))
         response = self.client.get(response.headers["Location"])
         self.assertEqual(response.status_code, 200)
-        self.assertIn("gross_minutes", response.text)
+        self.assertTrue(response.text.startswith("\ufeffEmp ID,Name,"))
+        self.assertIn("Effective (h)", response.text)
 
 
 class AdminViewTest(unittest.TestCase):
@@ -2399,7 +2401,7 @@ class RolesAndVisibilityTest(unittest.TestCase):
 
         response = self.client.get(url)
         self.assertEqual(response.status_code, 200, response.text[:200])
-        return sorted({row["name"] for row in csv_module.DictReader(io.StringIO(response.text))})
+        return sorted({row["Name"] for row in csv_module.DictReader(io.StringIO(response.text.lstrip("\ufeff")))})
 
     def test_manager_export_is_scoped_to_their_subtree(self) -> None:
         a, b, c, d = self._team()
@@ -2416,12 +2418,18 @@ class RolesAndVisibilityTest(unittest.TestCase):
         self.assertEqual(self._csv_names(f"/export.csv?{query}"), ["P40", "P41", "P42", "P43", "P44"])
         import csv as csv_module
 
-        csv_rows = list(csv_module.reader(io.StringIO(self.client.get(f"/export.csv?{query}").text)))
+        csv_rows = list(csv_module.reader(io.StringIO(self.client.get(f"/export.csv?{query}").text.lstrip("\ufeff"))))
         response = self.client.get(f"/export.xlsx?{query}")
         self.assertEqual(response.status_code, 200)
-        sheet = openpyxl.load_workbook(io.BytesIO(response.data)).active
-        xlsx_rows = [["" if v is None else str(v) for v in row] for row in sheet.iter_rows(values_only=True)]
-        self.assertEqual(xlsx_rows, csv_rows)
+        workbook = openpyxl.load_workbook(io.BytesIO(response.data))
+        self.assertEqual(workbook.sheetnames, ["Daily Detail", "Monthly Matrix", "Person Summary"])
+        daily = list(workbook["Daily Detail"].iter_rows(min_row=3, values_only=True))
+        self.assertEqual([list(r) for r in daily[:1]], [csv_rows[0]])
+        self.assertEqual([r[1] for r in daily[1:]], [r[1] for r in csv_rows[1:]])
+        self.assertEqual(len(daily), 1 + 5 * 3)
+        self.assertIn("work day runs 06:00", workbook["Daily Detail"]["A1"].value)
+        matrix = list(workbook["Monthly Matrix"].iter_rows(min_row=4, values_only=True))
+        self.assertEqual(sorted(r[1] for r in matrix), ["P40", "P41", "P42", "P43", "P44"])
 
     def test_selected_scope_without_people_and_bad_ranges_are_400_inline(self) -> None:
         a, *_ = self._team()

@@ -35,85 +35,181 @@ class ExportTest(unittest.TestCase):
             "door": "1", "reader": "", "raw_direction_byte": 0, "trusted_direction": direction, "raw": {},
         }
 
-    def _rows(self, people, start, end):
-        return export.export_rows(
-            self.database, people, start, end, manager_names={}, target_minutes=480,
-            today=date(2026, 10, 10), now=None,
+    def _report(self, people, start, end, **kwargs):
+        options = dict(manager_names={}, target_minutes=480, today=date(2026, 10, 10), now=None)
+        options.update(kwargs)
+        return export.build_report(self.database, people, start, end, **options)
+
+    def _at(self, days=0, hours=0, minutes=0, seconds=0) -> datetime:
+        return datetime.combine(self.day, datetime.min.time()) + timedelta(
+            days=days, hours=hours, minutes=minutes, seconds=seconds
         )
 
-    def test_incomplete_day_exports_as_incomplete_with_zero_minutes(self) -> None:
-        people = self._people(1)
-        at = datetime.combine(self.day, datetime.min.time()) + timedelta(hours=9)
-        self.database.insert_punches([self._punch("100", at, "entry", 1)])
-        (row,) = self._rows(people, self.day, self.day)
-        self.assertEqual(row[export.HEADER.index("status")], "incomplete")
-        self.assertEqual(row[export.HEADER.index("effective_minutes")], 0)
+    def _book(self, report):
+        return openpyxl.load_workbook(io.BytesIO(export.to_xlsx(report)))
 
-    def test_formula_text_is_prefixed_in_csv_and_xlsx(self) -> None:
+    @staticmethod
+    def _col(name: str) -> int:
+        return export.DAILY_HEADER.index(name)
+
+    def test_overnight_shift_is_one_row_with_next_day_last_out(self) -> None:
+        people = self._people(1)
+        self.database.insert_punches([
+            self._punch("100", self._at(hours=22, minutes=10), "entry", 1),
+            self._punch("100", self._at(days=1, hours=3, minutes=40), "exit", 2),
+        ])
+        first, second = self._report(people, self.day, self.day + timedelta(days=1)).rows
+        self.assertEqual(first.day, self.day)
+        self.assertEqual(first.last_out, self._at(days=1, hours=3, minutes=40))
+        self.assertEqual(first.effective, timedelta(hours=5, minutes=30))
+        self.assertEqual((first.status, first.code, first.punches), ("Short", "P", 2))
+        self.assertEqual(first.shortfall, timedelta(hours=2, minutes=30))
+        self.assertEqual(second.punches, 0)
+
+    def test_flagged_day_counts_paired_time_and_shows_review(self) -> None:
+        people = self._people(1)
+        self.database.insert_punches([
+            self._punch("100", self._at(hours=9), "entry", 1),
+            self._punch("100", self._at(hours=10), "entry", 2),
+            self._punch("100", self._at(hours=18), "exit", 3),
+        ])
+        report = self._report(people, self.day, self.day)
+        (row,) = report.rows
+        self.assertEqual((row.status, row.code, row.punches), ("Review", "R", 3))
+        self.assertEqual(row.effective, timedelta(hours=8))
+        self.assertEqual(row.first_in, self._at(hours=9))
+        sheet = self._book(report)["Daily Detail"]
+        self.assertEqual(sheet.cell(row=4, column=self._col("Remarks") + 1).value, "No exit after 09:00")
+        self.assertEqual(self._book(report)["Monthly Matrix"].cell(row=4, column=3).value, "R 8:00")
+
+    def test_incomplete_day_blanks_numbers_and_says_missing_exit(self) -> None:
+        people = self._people(1)
+        self.database.insert_punches([self._punch("100", self._at(hours=9), "entry", 1)])
+        report = self._report(people, self.day, self.day)
+        (row,) = report.rows
+        self.assertEqual((row.status, row.code), ("Missing exit", "I"))
+        self.assertEqual(row.first_in, self._at(hours=9))
+        self.assertIsNone(row.last_out)
+        self.assertIsNone(row.effective)
+        self.assertIsNone(row.shortfall)
+        values = [c.value for c in self._book(report)["Daily Detail"][4]]
+        for name in ("Last Out", "Gross", "Break", "Effective", "Effective (h)", "Shortfall vs target"):
+            self.assertIsNone(values[self._col(name)], name)
+        self.assertEqual(self._book(report)["Monthly Matrix"].cell(row=4, column=3).value, "I")
+
+    def test_open_today_has_no_shortfall(self) -> None:
+        people = self._people(1)
+        self.database.insert_punches([self._punch("100", self._at(hours=9), "entry", 1)])
+        (row,) = self._report(people, self.day, self.day, today=self.day, now=self._at(hours=11)).rows
+        self.assertEqual((row.status, row.code), ("Open", "O"))
+        self.assertEqual(row.effective, timedelta(hours=2))
+        self.assertIsNone(row.shortfall)
+        self.assertIsNone(row.last_out)
+
+    def test_absent_weekend_and_before_created_codes(self) -> None:
+        (person,) = self._people(1)
+        person["created_at"] = datetime(2026, 9, 3, 12, 0)
+        report = self._report([person], self.day, date(2026, 9, 7))  # Tue..Mon
+        self.assertEqual([r.code for r in report.rows], ["", "", "A", "A", "WO", "WO", "A"])
+        self.assertEqual(report.rows[4].status, "Weekend off")
+        matrix = self._book(report)["Monthly Matrix"]
+        self.assertEqual([c.value for c in matrix[4]][2:9], [None, None, "A", "A", "WO", "WO", "A"])
+        absent = 3 + len(report.days) + export.MATRIX_TOTALS.index("Absent")
+        self.assertEqual(matrix.cell(row=4, column=absent).value, 3)
+        self.assertEqual(matrix.cell(row=3, column=7).fill.fgColor.rgb[-6:], "EEEEEE")  # Sat shaded
+        summary = self._book(report)["Person Summary"]
+        expected = export.SUMMARY_HEADER.index("Expected hours") + 1
+        self.assertEqual(summary.cell(row=4, column=expected).value, 24)  # 3 weekdays x 8h
+
+    def test_xlsx_cell_types_keep_seconds(self) -> None:
+        people = self._people(1)
+        self.database.insert_punches([
+            self._punch("100", self._at(hours=22, minutes=10), "entry", 1),
+            self._punch("100", self._at(days=1, hours=3, minutes=40, seconds=15), "exit", 2),
+        ])
+        book = self._book(self._report(people, self.day, self.day))
+        self.assertEqual(book.sheetnames, ["Daily Detail", "Monthly Matrix", "Person Summary"])
+        sheet = book["Daily Detail"]
+        self.assertIn("2026-09-01 to 2026-09-01", sheet["A1"].value)
+        self.assertIn("06:00 to 06:00", sheet["A1"].value)
+        self.assertEqual([c.value for c in sheet[3]], list(export.DAILY_HEADER))
+        self.assertEqual(sheet.freeze_panes, "C4")
+        self.assertEqual(sheet.auto_filter.ref, "A3:P4")
+        first_in = sheet.cell(row=4, column=self._col("First In") + 1)
+        self.assertEqual(first_in.value, self._at(hours=22, minutes=10))
+        self.assertEqual(first_in.number_format, "hh:mm:ss")
+        last_out = sheet.cell(row=4, column=self._col("Last Out") + 1)
+        self.assertEqual(last_out.value, self._at(days=1, hours=3, minutes=40, seconds=15))
+        effective = sheet.cell(row=4, column=self._col("Effective") + 1)
+        self.assertEqual(effective.number_format, "[h]:mm:ss")
+        self.assertEqual(effective.value, timedelta(hours=5, minutes=30, seconds=15))
+        self.assertEqual(sheet.cell(row=4, column=self._col("Effective (h)") + 1).value, 5.5)
+        summary = book["Person Summary"]
+        self.assertEqual(summary.cell(row=4, column=5).value.strftime("%H:%M"), "22:10")
+
+    def test_summary_average_first_in_crosses_midnight(self) -> None:
+        people = self._people(1)
+        self.database.insert_punches([
+            self._punch("100", self._at(hours=23, minutes=50), "entry", 1),
+            self._punch("100", self._at(days=1, hours=4), "exit", 2),
+            self._punch("100", self._at(days=2, hours=0, minutes=10), "entry", 3),
+            self._punch("100", self._at(days=2, hours=4), "exit", 4),
+        ])
+        summary = self._book(self._report(people, self.day, self.day + timedelta(days=1)))["Person Summary"]
+        values = [c.value for c in summary[4]]
+        self.assertEqual(values[4].strftime("%H:%M"), "00:00")
+        self.assertEqual(values[3], 2)  # days present
+
+    def test_csv_is_daily_detail_with_bom_and_hh_mm(self) -> None:
+        people = self._people(1)
+        self.database.insert_punches([
+            self._punch("100", self._at(hours=22, minutes=10, seconds=5), "entry", 1),
+            self._punch("100", self._at(days=1, hours=3, minutes=40, seconds=50), "exit", 2),
+        ])
+        text = export.to_csv(self._report(people, self.day, self.day))
+        self.assertTrue(text.startswith("\ufeff"))
+        rows = list(csv.reader(io.StringIO(text[1:])))
+        self.assertEqual(rows[0], list(export.DAILY_HEADER))
+        self.assertEqual(len(rows), 2)
+        row = dict(zip(rows[0], rows[1]))
+        self.assertEqual((row["First In"], row["Last Out"]), ("22:10", "03:40"))
+        self.assertEqual(row["Effective"], "5:30")
+        self.assertEqual(row["Effective (h)"], "5.51")
+        self.assertEqual(row["Date"], "2026-09-01")
+
+    def test_formula_text_is_prefixed_in_csv_and_every_sheet(self) -> None:
         self.database.upsert_employee(device_user_id="7", name='=HYPERLINK("x")', email="h@x.com")
-        rows = self._rows(self.database.employees(), self.day, self.day)
-        parsed = list(csv.DictReader(io.StringIO(export.to_csv(rows))))
-        self.assertEqual(parsed[0]["name"], '\'=HYPERLINK("x")')
-        sheet = openpyxl.load_workbook(io.BytesIO(export.to_xlsx(rows))).active
-        cell = sheet.cell(row=2, column=2)
-        self.assertEqual(cell.value, '\'=HYPERLINK("x")')
-        self.assertEqual(cell.data_type, "s")
+        report = self._report(self.database.employees(), self.day, self.day)
+        parsed = list(csv.DictReader(io.StringIO(export.to_csv(report)[1:])))
+        self.assertEqual(parsed[0]["Name"], '\'=HYPERLINK("x")')
+        book = self._book(report)
+        for sheet in book.worksheets:
+            cell = sheet.cell(row=4, column=2)
+            self.assertEqual(cell.value, '\'=HYPERLINK("x")', sheet.title)
+            self.assertEqual(cell.data_type, "s")
         for prefix in ("+", "-", "@", "\t", "\r"):
             self.assertEqual(export.safe_text(prefix + "a"), "'" + prefix + "a")
         self.assertEqual(export.safe_text("plain"), "plain")
 
-    def test_xlsx_has_headers_frozen_pane_and_numeric_minutes(self) -> None:
-        people = self._people(1)
-        start = datetime.combine(self.day, datetime.min.time())
-        self.database.insert_punches([
-            self._punch("100", start + timedelta(hours=9), "entry", 1),
-            self._punch("100", start + timedelta(hours=17, minutes=30), "exit", 2),
-        ])
-        workbook = openpyxl.load_workbook(io.BytesIO(export.to_xlsx(self._rows(people, self.day, self.day))))
-        sheet = workbook.active
-        self.assertEqual([c.value for c in sheet[1]], list(export.HEADER))
-        self.assertEqual(sheet.freeze_panes, "A2")
-        self.assertEqual(sheet.cell(row=2, column=6).value, 510)
-        self.assertEqual(sheet.cell(row=2, column=6).data_type, "n")
-        self.assertEqual(sheet.cell(row=2, column=7).data_type, "n")
-
-    def test_night_shift_punch_after_midnight_lands_in_previous_work_day(self) -> None:
-        people = self._people(1)
-        start = datetime.combine(self.day, datetime.min.time())
-        self.database.insert_punches([
-            self._punch("100", start + timedelta(hours=22, minutes=10), "entry", 1),
-            self._punch("100", start + timedelta(days=1, hours=3, minutes=40), "exit", 2),
-        ])
-        first, second = self._rows(people, self.day, self.day + timedelta(days=1))
-        self.assertEqual(first[0], self.day.isoformat())
-        self.assertEqual(first[export.HEADER.index("effective_minutes")], 330)
-        self.assertEqual(first[export.HEADER.index("status")], "short")
-        self.assertEqual(second[export.HEADER.index("status")], "empty")
-
     def test_range_query_reaches_into_the_next_morning(self) -> None:
         people = self._people(1)
-        start = datetime.combine(self.day, datetime.min.time())
         self.database.insert_punches([
-            self._punch("100", start + timedelta(hours=22), "entry", 1),
-            self._punch("100", start + timedelta(days=1, hours=5, minutes=59), "exit", 2),
-            self._punch("100", start + timedelta(hours=5), "entry", 3),  # previous work day
+            self._punch("100", self._at(hours=22), "entry", 1),
+            self._punch("100", self._at(days=1, hours=5, minutes=59), "exit", 2),
+            self._punch("100", self._at(hours=5), "entry", 3),  # previous work day
         ])
-        (row,) = self._rows(people, self.day, self.day)
-        self.assertEqual(row[export.HEADER.index("effective_minutes")], 479)
+        (row,) = self._report(people, self.day, self.day).rows
+        self.assertEqual(row.effective, timedelta(hours=7, minutes=59))
 
     def test_day_start_hour_zero_restores_calendar_days(self) -> None:
         people = self._people(1)
-        start = datetime.combine(self.day, datetime.min.time())
         self.database.insert_punches([
-            self._punch("100", start + timedelta(hours=22, minutes=10), "entry", 1),
-            self._punch("100", start + timedelta(days=1, hours=3, minutes=40), "exit", 2),
+            self._punch("100", self._at(hours=22, minutes=10), "entry", 1),
+            self._punch("100", self._at(days=1, hours=3, minutes=40), "exit", 2),
         ])
-        first, second = export.export_rows(
-            self.database, people, self.day, self.day + timedelta(days=1), manager_names={},
-            target_minutes=480, today=date(2026, 10, 10), now=None, day_start_hour=0,
-        )
-        self.assertEqual(first[export.HEADER.index("status")], "incomplete")
-        self.assertEqual(second[export.HEADER.index("status")], "incomplete")
+        report = self._report(people, self.day, self.day + timedelta(days=1), day_start_hour=0)
+        self.assertEqual([r.code for r in report.rows], ["I", "I"])
+        self.assertIn("00:00 to 00:00", report.note)
 
     def test_range_validation(self) -> None:
         today = date(2026, 10, 10)
@@ -123,7 +219,7 @@ class ExportTest(unittest.TestCase):
             with self.assertRaises(export.RangeError):
                 export.parse_range(*bad, today)
 
-    def test_query_count_is_constant_for_100_people_by_31_days(self) -> None:
+    def test_query_count_is_constant_for_10_vs_100_people(self) -> None:
         statements: list[str] = []
         original = db_module.Database._open
 
@@ -137,16 +233,17 @@ class ExportTest(unittest.TestCase):
         def run(people, days) -> int:
             statements.clear()
             with mock.patch.object(db_module.Database, "_open", counting_open):
-                rows = self._rows(people, self.day, self.day + timedelta(days=days - 1))
-            self.assertEqual(len(rows), len(people) * days)
+                report = self._report(people, self.day, self.day + timedelta(days=days - 1))
+                export.to_xlsx(report)
+                export.to_csv(report)
+            self.assertEqual(len(report.rows), len(people) * days)
             return len(statements)
 
         everyone = self._people(100)
-        start = datetime.combine(self.day, datetime.min.time())
         self.database.insert_punches(
-            [self._punch(p["device_user_id"], start + timedelta(days=d, hours=9), "entry", d) for p in everyone for d in range(31)]
+            [self._punch(p["device_user_id"], self._at(days=d, hours=9), "entry", d) for p in everyone for d in range(31)]
         )
-        small = run(everyone[:2], 1)
+        small = run(everyone[:10], 31)
         large = run(everyone, 31)
         self.assertEqual(small, large)
         self.assertLessEqual(large, 1)

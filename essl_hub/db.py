@@ -983,7 +983,7 @@ class Database:
         with self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT device_user_id, event_timestamp, trusted_direction
+                SELECT device_user_id, event_timestamp, trusted_direction, site
                 FROM punches
                 WHERE device_user_id IN (SELECT value FROM json_each(?))
                   AND event_timestamp >= ? AND event_timestamp < ?

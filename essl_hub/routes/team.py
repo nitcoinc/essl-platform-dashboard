@@ -11,6 +11,7 @@ from .common import (
     TEAM_ROLES,
     XLSX_MIMETYPE,
     _day_start_hour,
+    _day_start_label,
     _htmx_partial,
     _int_list,
     _login_required,
@@ -74,7 +75,8 @@ def _export_defaults(today: date) -> dict:
 def _render_team(export_error: str | None = None, status: int = 200):
     query = (request.args.get("q") or "").strip()
     everyone_label = g.employee["role"] in access.EVERYONE_ROLES
-    today = _today()
+    day_start_hour = _day_start_hour(database)
+    today = _today(day_start_hour)
     presets = _export_defaults(today)
     context = {
         "employee": g.employee,
@@ -89,6 +91,7 @@ def _render_team(export_error: str | None = None, status: int = 200):
         "export_scope": "selected" if request.args.get("scope") == "selected" else "everyone",
         "selected_ids": set(_int_list(request.args.getlist("employee"))),
         "export_error": export_error,
+        "day_start_label": _day_start_label(day_start_hour),
         "export_open": export_error is not None or "from" in request.args,
     }
     partial = _htmx_partial()
@@ -130,7 +133,7 @@ def _export(kind: str):
     everyone = database.employees()
     names = {person["id"]: person["name"] for person in everyone}
     people = [person for person in everyone if person["id"] in wanted]
-    rows = export.export_rows(
+    report = export.build_report(
         database, people, start, end,
         manager_names=names, target_minutes=_target_minutes(database),
         today=today, now=_now_naive(), day_start_hour=day_start_hour,
@@ -138,8 +141,8 @@ def _export(kind: str):
     filename = f"attendance-{start.isoformat()}-to-{end.isoformat()}.{kind}"
     headers = {"Content-Disposition": f"attachment; filename={filename}"}
     if kind == "csv":
-        return Response(export.to_csv(rows), mimetype="text/csv", headers=headers)
-    return Response(export.to_xlsx(rows), mimetype=XLSX_MIMETYPE, headers=headers)
+        return Response(export.to_csv(report), mimetype="text/csv", headers=headers)
+    return Response(export.to_xlsx(report), mimetype=XLSX_MIMETYPE, headers=headers)
 
 
 @bp.get("/export.csv")
