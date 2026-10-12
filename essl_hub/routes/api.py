@@ -47,10 +47,13 @@ def api_hours() -> tuple[Response, int] | Response:
     target_minutes = _target_minutes(database)
 
     now = _now_naive()
+    day_start_hour = _day_start_hour(database)
     rows = []
     for employee in database.employees():
         for day in _date_range(start, end):
-            result = _day_for_employee(database, employee, day, target_minutes, now=now)
+            result = _day_for_employee(
+                database, employee, day, target_minutes, now=now, day_start_hour=day_start_hour
+            )
             rows.append(
                 {
                     "date": day.isoformat(),
@@ -77,7 +80,7 @@ def api_hours() -> tuple[Response, int] | Response:
             "total": total,
             "pages": max(1, (total + per_page - 1) // per_page),
             # Work days run from this local time to the same time next day (R6).
-            "day_start": _day_start_label(_day_start_hour(database)),
+            "day_start": _day_start_label(day_start_hour),
         }
     )
 

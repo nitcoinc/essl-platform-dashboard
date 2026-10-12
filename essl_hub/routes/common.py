@@ -249,11 +249,19 @@ def _date_range(start: date, end: date):
 
 
 def _day_for_employee(
-    database: Database, employee: dict, day: date, target_minutes: int, now: datetime | None = None
+    database: Database,
+    employee: dict,
+    day: date,
+    target_minutes: int,
+    now: datetime | None = None,
+    *,
+    day_start_hour: int | None = None,
 ) -> DayResult:
     """Score one work day. Pass ``now`` to share one instant across a request,
-    so every figure on a page is measured from the same second (R17/U11)."""
-    day_start_hour = _day_start_hour(database)
+    so every figure on a page is measured from the same second (R17/U11).
+    Loop callers pass ``day_start_hour`` so the setting is read once."""
+    if day_start_hour is None:
+        day_start_hour = _day_start_hour(database)
     start, end = work_day_window(day, day_start_hour)
     rows = database.punches_for_employee_range(employee["device_user_id"], start, end)
     punches = [

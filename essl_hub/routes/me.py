@@ -62,7 +62,7 @@ def week_view() -> str:
         if day > today:
             days.append({"date": day, "result": None})
             continue
-        result = _day_for_employee(database, subject, day, target_minutes)
+        result = _day_for_employee(database, subject, day, target_minutes, day_start_hour=day_start_hour)
         week_total += result.effective_minutes
         days.append({"date": day, "result": result})
     chart = charts.render_week_bars(
@@ -104,7 +104,9 @@ def day_view():
         response = make_response("", 200)
         response.headers["HX-Refresh"] = "true"
         return _vary_htmx(response)
-    result = _day_for_employee(database, subject, day, target_minutes, now=request_now)
+    result = _day_for_employee(
+        database, subject, day, target_minutes, now=request_now, day_start_hour=day_start_hour
+    )
     is_today = day == today
     now = request_now if is_today else None
     stretch_seconds = 0
@@ -120,7 +122,8 @@ def day_view():
         if not result.segments:
             # Rollover while inside: say where the open stretch went.
             previous = _day_for_employee(
-                database, subject, day - timedelta(days=1), target_minutes, now=request_now
+                database, subject, day - timedelta(days=1), target_minutes, now=request_now,
+                day_start_hour=day_start_hour,
             )
             if previous.segments and previous.segments[-1].end is None:
                 previous_entry = previous.segments[-1].start

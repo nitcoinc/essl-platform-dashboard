@@ -1853,6 +1853,25 @@ class ApiHoursTest(unittest.TestCase):
         self.assertEqual(ravi["2026-09-01"]["effective_minutes"], 330)
         self.assertEqual(ravi["2026-09-02"]["status"], "empty")
 
+    def test_hours_reads_day_start_setting_once_per_request(self) -> None:
+        key = self._create_key()
+        self.client.post("/signout")
+        original = self.database.setting
+        calls = []
+
+        def counting(name, *args, **kwargs):
+            calls.append(name)
+            return original(name, *args, **kwargs)
+
+        with patch.object(self.database, "setting", side_effect=counting):
+            response = self.client.get(
+                "/api/v1/hours?from=2026-09-01&to=2026-09-07",
+                headers={"Authorization": f"Bearer {key}"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertGreater(len(response.get_json()["results"]), 7)
+        self.assertEqual(calls.count("day_start_hour"), 1)
+
     def test_hours_response_carries_anomalies(self) -> None:
         key = self._create_key()
         self.client.post("/signout")

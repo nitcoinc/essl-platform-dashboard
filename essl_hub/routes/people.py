@@ -130,7 +130,10 @@ def _render_row(target_id: int, *, edit: bool, row_error: tuple[int, str] | None
         abort(404)
     everyone = database.employees()
     names = {p["id"]: p["name"] for p in everyone}
-    result = _day_for_employee(database, person, _today(), _target_minutes(database))
+    day_start_hour = _day_start_hour(database)
+    result = _day_for_employee(
+        database, person, _today(day_start_hour), _target_minutes(database), day_start_hour=day_start_hour
+    )
     return render_template(
         "_person_row.html",
         row=_person_row(person, names, result),

@@ -194,8 +194,9 @@ def _day_row(
     person: dict, day: date, result: DayResult, sites: tuple[str, ...], punches: list[Punch], target_seconds: int
 ) -> DayRow:
     closed_ends = [s.end for s in result.segments if s.end is not None]
-    # First swipe of the work day, even one later superseded by another entry.
-    first_in = min((p.timestamp for p in punches), default=None)
+    # Start of the first paired or open entry segment, mirroring Last Out (end
+    # of the last paired segment); a stray swipe before it is not First In.
+    first_in = min((s.start for s in result.segments), default=None)
     last_out = max(closed_ends, default=None)
     gross = brk = effective = shortfall = None
     weekend = day.weekday() >= 5
@@ -219,7 +220,11 @@ def _day_row(
         else:
             shortfall = timedelta(seconds=max(0, target_seconds - result.effective_seconds))
             if result.anomalies:
-                code, status = "R", "Review"
+                # Gross spans first to last pair, so an unmatched mid-day swipe
+                # would read as break: leave both blank, keep paired Effective.
+                gross = brk = None
+                code = "R"
+                status = ("Met" if result.status == "met" else "Short") + " · review"
             else:
                 code, status = "P", "Met" if result.status == "met" else "Short"
     return DayRow(

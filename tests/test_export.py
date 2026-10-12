@@ -75,12 +75,49 @@ class ExportTest(unittest.TestCase):
         ])
         report = self._report(people, self.day, self.day)
         (row,) = report.rows
-        self.assertEqual((row.status, row.code, row.punches), ("Review", "R", 3))
+        self.assertEqual((row.status, row.code, row.punches), ("Met · review", "R", 3))
         self.assertEqual(row.effective, timedelta(hours=8))
-        self.assertEqual(row.first_in, self._at(hours=9))
+        # First In is the first paired segment's start, not the stray 09:00.
+        self.assertEqual(row.first_in, self._at(hours=10))
+        self.assertIsNone(row.gross)
+        self.assertIsNone(row.brk)
+        self.assertEqual(row.shortfall, timedelta(0))
         sheet = self._book(report)["Daily Detail"]
         self.assertEqual(sheet.cell(row=4, column=self._col("Remarks") + 1).value, "No exit after 09:00")
         self.assertEqual(self._book(report)["Monthly Matrix"].cell(row=4, column=3).value, "R 8:00")
+
+    def test_mid_day_unmatched_swipe_does_not_become_break(self) -> None:
+        people = self._people(1)
+        self.database.insert_punches([
+            self._punch("100", self._at(hours=9), "entry", 1),
+            self._punch("100", self._at(hours=12), "exit", 2),
+            self._punch("100", self._at(hours=13), "exit", 3),
+            self._punch("100", self._at(hours=14), "entry", 4),
+            self._punch("100", self._at(hours=17), "exit", 5),
+        ])
+        report = self._report(people, self.day, self.day)
+        (row,) = report.rows
+        self.assertEqual((row.status, row.code), ("Short · review", "R"))
+        self.assertEqual(row.effective, timedelta(hours=6))
+        self.assertEqual(row.shortfall, timedelta(hours=2))
+        self.assertEqual(row.first_in, self._at(hours=9))
+        values = [c.value for c in self._book(report)["Daily Detail"][4]]
+        self.assertIsNone(values[self._col("Gross")])
+        self.assertIsNone(values[self._col("Break")])
+        self.assertEqual(values[self._col("Status")], "Short · review")
+        self.assertIn("13:00", values[self._col("Remarks")])
+        self.assertEqual(self._book(report)["Monthly Matrix"].cell(row=4, column=3).value, "R 6:00")
+        summary = [c.value for c in self._book(report)["Person Summary"][4]]
+        self.assertEqual(summary[export.SUMMARY_HEADER.index("Review days")], 1)
+        self.assertEqual(summary[export.SUMMARY_HEADER.index("Days below target")], 1)
+        self.assertEqual(summary[export.SUMMARY_HEADER.index("Actual hours")], 6.0)
+
+    def test_first_in_blank_without_entry_segment(self) -> None:
+        people = self._people(1)
+        self.database.insert_punches([self._punch("100", self._at(hours=18), "exit", 1)])
+        (row,) = self._report(people, self.day, self.day).rows
+        self.assertEqual(row.code, "I")
+        self.assertIsNone(row.first_in)
 
     def test_incomplete_day_blanks_numbers_and_says_missing_exit(self) -> None:
         people = self._people(1)
