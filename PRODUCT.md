@@ -44,7 +44,7 @@ One Docker Compose stack on an office Linux host with routes to `192.168.1.201` 
 
 - Live network evidence on 2026-09-10: the X990 host answered ping and exposed HTTP on port 80, while TCP 4370 did not accept a connection; the C3-400 accepted TCP connections on port 4370 and, live-tested, correctly reported direction bytes matching the KTD4 alternation model.
 - Ten real employees' captured punches confirmed clean in/out alternation, including short breaks of 5-10 minutes — the evidence that effective-hours accounting is possible at all.
-- No brand assets were supplied. Sample data used anywhere in the UI is clearly labelled as sample.
+- NITCO brand assets (wordmark, N mark, wave art) were supplied and are used on the sign-in pages and as the favicon. Sample data used anywhere in the UI is clearly labelled as sample.
 
 ## Product Principles
 

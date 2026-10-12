@@ -60,6 +60,7 @@ Markup helpers are Jinja macros in `templates/_ui.html`; icons are a Lucide spri
 - **Tables** (`ui.table`, `.hours-table`): one bordered container, sticky muted header, 1px row dividers, numeric columns `.num` right-aligned with tabular numerals. Under 768px rows stack into label/value pairs.
 - **Fields** (`ui.field`): label above input, hint below, `aria-invalid` plus `ui.inline_error` on failure. Errors say what went wrong and how to fix it.
 - **Empty state** (`ui.empty_state`): icon, one line on what is missing, one on what to do, optional action.
+- **Quick-view drawer** (`dialog#quick-view` in `base.html`, `static/quick-view.js`): a right-side sheet (full width under 768px) opened by plain clicks on a person's name on Everyone and People; modified clicks and no-JS fall through to the full page. Sticky header with name and Close, identity facts, today's `_day_live` region, footer actions pinned at the bottom. Neutral `--shadow-card`, slide-in of 150ms or less, none under reduced motion. Esc, Close and backdrop close it; focus returns to the name.
 - **Hours** (`ui.hours`): always `7h 42m`.
 
 ## Shell
@@ -68,7 +69,7 @@ Sidebar (232px) with brand, role-aware navigation and the signed-in person (init
 
 ## Rules (anti-slop)
 
-- No gradients, glows, glass, blur or colored shadows. (The one exception is the legend's hatch swatch, a repeating stripe that mirrors the chart's incomplete pattern.)
+- No gradients, glows, glass, blur or colored shadows. (Exceptions: the legend's hatch swatch, a repeating stripe that mirrors the chart's incomplete pattern; and the brand surface below.)
 - No cards inside cards. A section is a heading plus content, separated by space or a 1px rule.
 - No emoji, no unicode glyphs as icons. Icons are Lucide, 16px, 1.75 stroke.
 - No metric tiles unless a decision hangs on the number.
@@ -76,3 +77,7 @@ Sidebar (232px) with brand, role-aware navigation and the signed-in person (init
 - Plain copy in the product's own words. Incomplete days say "Incomplete", never a guessed number.
 - Motion is 150ms or less, for state feedback only, and is removed under `prefers-reduced-motion`.
 - Focus is always visible: 2px accent outline, 2px offset.
+
+## Brand surface
+
+The sign-in, code, setup and offline pages (`_auth_base.html`) carry the NITCO brand: a wave-art panel (`static/brand/wave.*`) with the white wordmark and "Attendance Hub", beside a form column that uses the normal tokens. Here only, the supplied gradient art, a fixed navy darkening overlay for text legibility, and the brand's own navy and red are allowed; they are brand values, not app tokens, and never appear inside the app shell. The favicon set lives in `static/brand/`.
