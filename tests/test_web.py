@@ -95,6 +95,8 @@ class FakeDatabase:
                 "records_seen": 0,
                 "comm_password": None,
                 "connection_updated_at": None,
+                "created_at": None,
+                "retired_at": None,
             }
         self.settings.setdefault("daily_target_minutes", "480")
 
@@ -134,6 +136,27 @@ class FakeDatabase:
         device["port"] = port
         device["comm_password"] = comm_password
         device["connection_updated_at"] = _ist_now()
+
+    def add_device(self, *, device_id, site, model, ip, port, protocol, comm_password) -> None:
+        self._check_online()
+        if device_id in self.devices_by_id:
+            raise ValueError("duplicate device id")
+        now = _ist_now()
+        self.devices_by_id[device_id] = {
+            "id": device_id, "site": site, "model": model, "ip": ip, "port": port,
+            "protocol": protocol, "status": "never_synced", "transport": None,
+            "serial_number": None, "firmware": None, "last_attempt": None,
+            "last_success": None, "last_error": None, "records_seen": 0,
+            "comm_password": comm_password, "connection_updated_at": now,
+            "created_at": now, "retired_at": None,
+        }
+
+    def set_device_retired(self, device_id: str, retired: bool) -> None:
+        self._check_online()
+        self.devices_by_id[device_id]["retired_at"] = _ist_now() if retired else None
+
+    def devices_at_address(self, ip: str, port: int) -> list[dict]:
+        return [d for d in self.devices_by_id.values() if d["ip"] == ip and d["port"] == port]
 
     # punches --------------------------------------------------------------
 
@@ -1216,6 +1239,132 @@ class AdminDeviceEditTest(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 302)
         self.assertIn("/signin", response.headers["Location"])
+
+
+class AdminDeviceLifecycleTest(AdminDeviceEditTest):
+    """Covers R7, R8, R9: adding, retiring and re-enabling devices."""
+
+    def _add(self, **data):
+        data.setdefault("csrf", self._csrf())
+        data.setdefault("site", "Kondapur")
+        data.setdefault("family", "c3-400")
+        data.setdefault("port", "4370")
+        return self.client.post("/devices/add", data=data)
+
+    def test_admin_adds_a_c3_at_a_new_ip_and_it_shows_pending(self) -> None:
+        response = self._add(ip="192.168.1.210")
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("added=kondapur-c3-400", response.headers["Location"])
+        device = self.database.device_by_id("kondapur-c3-400")
+        self.assertEqual(
+            (device["site"], device["model"], device["protocol"], device["ip"], device["port"]),
+            ("Kondapur", "C3-400", "c3-pullsdk", "192.168.1.210", 4370),
+        )
+        self.assertIsNone(device["retired_at"])
+        page = self.client.get("/devices?added=kondapur-c3-400").text
+        self.assertIn("Pending", page)
+        self.assertIn("about 6 minutes", page)
+
+    def test_duplicate_active_address_is_rejected_inline(self) -> None:
+        before = set(self.database.devices_by_id)
+        response = self._add(ip="192.168.1.201", site="Uppal Annex")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("192.168.1.201:4370 is already used by Uppal X990", response.text)
+        self.assertIn('value="Uppal Annex"', response.text)
+        self.assertEqual(set(self.database.devices_by_id), before)
+
+    def test_edit_onto_another_active_address_is_rejected(self) -> None:
+        response = self._post("uppal-x990", ip="192.168.1.202", port="4370", comm_password="")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("already used by Gachibowli C3-400", response.text)
+        self.assertEqual(self.database.device_by_id("uppal-x990")["ip"], "192.168.1.201")
+
+    def test_address_of_a_retired_device_offers_reenable(self) -> None:
+        self.database.set_device_retired("gachibowli-c3-400", True)
+        before = set(self.database.devices_by_id)
+        response = self._add(ip="192.168.1.202")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("retired device Gachibowli C3-400", response.text)
+        self.assertIn("/devices/gachibowli-c3-400/enable", response.text)
+        self.assertEqual(set(self.database.devices_by_id), before)
+
+    def test_invalid_inputs_give_inline_errors(self) -> None:
+        cases = [
+            ({"ip": "999.1.1.1"}, "is not a valid IP address"),
+            ({"ip": "192.168.1.210", "port": "0"}, "Port must be a whole number"),
+            ({"ip": "192.168.1.210", "family": "x990", "site": "Miyapur",
+              "comm_password": "abc"}, "comm password for Miyapur must be a number"),
+            ({"ip": "192.168.1.210", "site": " "}, "Site name is required"),
+            ({"ip": "192.168.1.210", "family": "bogus"}, "Choose a device family"),
+        ]
+        before = set(self.database.devices_by_id)
+        for data, message in cases:
+            with self.subTest(message=message):
+                response = self._add(**data)
+                self.assertEqual(response.status_code, 200)
+                self.assertIn(message, response.text)
+        self.assertEqual(set(self.database.devices_by_id), before)
+
+    def test_retire_then_reenable_keeps_punches(self) -> None:
+        self.database.punches.append({"fingerprint": "f1", "device_id": "uppal-x990"})
+        response = self.client.post("/devices/uppal-x990/retire", data={"csrf": self._csrf()})
+        self.assertEqual(response.status_code, 302)
+        self.assertIsNotNone(self.database.device_by_id("uppal-x990")["retired_at"])
+        page = self.client.get("/devices").text
+        self.assertIn("Retired (1)", page)
+        self.assertIn("Re-enable", page)
+        response = self.client.post("/devices/uppal-x990/enable", data={"csrf": self._csrf()})
+        self.assertEqual(response.status_code, 302)
+        self.assertIsNone(self.database.device_by_id("uppal-x990")["retired_at"])
+        self.assertEqual(len(self.database.punches), 1)
+
+    def test_reenable_refused_when_address_now_taken(self) -> None:
+        self.database.set_device_retired("gachibowli-c3-400", True)
+        self._add(ip="192.168.1.202", site="Gachibowli New")
+        # The retired match blocks the add; move the new device in by edit instead.
+        self._add(ip="192.168.1.220", site="Gachibowli New")
+        self._post("gachibowli-new-c3-400", ip="192.168.1.202", port="4370", comm_password="")
+        response = self.client.post("/devices/gachibowli-c3-400/enable", data={"csrf": self._csrf()})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("already used by Gachibowli New", response.text)
+        self.assertIsNotNone(self.database.device_by_id("gachibowli-c3-400")["retired_at"])
+
+    def test_slug_collision_gets_a_suffix(self) -> None:
+        self._add(ip="192.168.1.230", site="Uppal", family="x990")
+        self.assertIsNotNone(self.database.device_by_id("uppal-x990-2"))
+        self._add(ip="192.168.1.231", site="Uppal", family="x990")
+        self.assertIsNotNone(self.database.device_by_id("uppal-x990-3"))
+
+    def test_missing_csrf_is_refused_for_add_and_retire(self) -> None:
+        before = set(self.database.devices_by_id)
+        self.assertEqual(
+            self.client.post("/devices/add", data={"site": "X", "family": "x990",
+                                                   "ip": "10.0.0.1", "port": "4370"}).status_code,
+            400,
+        )
+        self.assertEqual(self.client.post("/devices/uppal-x990/retire").status_code, 400)
+        self.assertEqual(set(self.database.devices_by_id), before)
+        self.assertIsNone(self.database.device_by_id("uppal-x990")["retired_at"])
+
+    def test_hr_cannot_add_or_retire(self) -> None:
+        self.client.post("/signout")
+        self.database.upsert_employee(device_user_id="900", name="Priya HR", email="priya@example.com")
+        priya = self.database.employee_by_email("priya@example.com")
+        self.database.set_employee_role(priya["id"], "hr")
+        from essl_hub import mail as mail_module
+
+        captured = {}
+        original = mail_module.send_login_code
+        mail_module.send_login_code = lambda e, c: captured.update(code=c)
+        self.addCleanup(lambda: setattr(mail_module, "send_login_code", original))
+        self.client.post("/signin", data={"email": "priya@example.com"})
+        self.client.post("/signin/verify", data={"code": captured["code"]})
+        response = self.client.post("/devices/add", data={
+            "csrf": "x", "site": "X", "family": "x990", "ip": "10.0.0.1", "port": "4370"})
+        self.assertEqual(response.status_code, 403)
+        response = self.client.post("/devices/uppal-x990/retire", data={"csrf": "x"})
+        self.assertEqual(response.status_code, 403)
+        self.assertIsNone(self.database.device_by_id("uppal-x990")["retired_at"])
 
 
 class AdminRosterUploadTest(unittest.TestCase):

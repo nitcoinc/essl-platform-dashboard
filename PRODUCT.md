@@ -13,7 +13,7 @@ Four roles:
 - **employee** checks their own punches, effective hours and progress against the daily target. Lands on Today.
 - **manager** does the same, plus sees and exports the hours of everyone who reports to them, directly or indirectly. Lands on Team.
 - **hr** sees and exports everyone, manages people (roster import, add and edit, managers, roles up to hr), and reads device health. Nobody takes backups by hand: Turso keeps point-in-time history and a nightly export lands in R2. Lands on Everyone.
-- **admin** has everything hr has, plus grants admin, edits device connections, and sets the daily target and HRMS API keys.
+- **admin** has everything hr has, plus grants admin, adds, edits, retires and re-enables devices, and sets the daily target and HRMS API keys.
 
 Each person has at most one manager. Nobody can see someone outside their scope; such a request looks exactly like a missing record.
 
@@ -31,12 +31,12 @@ One Docker Compose stack on an office Linux host with routes to `192.168.1.201` 
 
 ## Capabilities and Constraints
 
-- Configured devices: Uppal X990 (`192.168.1.201`) and Gachibowli C3-400 (`192.168.1.202`).
+- Seeded devices: Uppal X990 (`192.168.1.201`) and Gachibowli C3-400 (`192.168.1.202`). The devices table is authoritative: an admin adds devices of either family on the Devices page, and retires or re-enables them. A retired device is not polled and keeps its punches. Two active devices never share an IP:port, and device ids are immutable and never reused.
 - X990 collection supports the standard ZK protocol with TCP and UDP fallback; its communication key is intentionally not assumed. As of 2026-09-10 the device refuses TCP 4370 while its port-80 web interface answers — the signature of ADMS/cloud-push mode — which needs an operator with device or web-console access to confirm; it cannot be diagnosed further from this codebase.
 - C3-400 collection uses the PullSDK protocol on port 4370; its communication password is intentionally not assumed. Its realtime event queue holds only about 30 records in memory and is consumed once read, so the collector must stay running continuously.
 - Punches originate only from these devices. No screen, role, or API creates, edits, or deletes a punch — a broken day is shown as incomplete, not corrected in the app.
 - Hours are always recomputed from stored punches, never stored as a derived value.
-- Device deletion/clearing/reset operations are out of scope and must never be exposed.
+- Device deletion/clearing/reset operations are out of scope and must never be exposed. Retire is the only way to stop polling a device.
 - Communication passwords can be set by an admin on the Devices page; Turso, R2, tunnel and email credentials come only from the server's `.env` (mode 600), never browser fields or source code.
 - Only the nightly export holds an R2 token, scoped to the one export bucket (R2 has no write-only permission; bucket lock protects old exports). It reads Turso with a read-only token.
 

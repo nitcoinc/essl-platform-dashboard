@@ -123,6 +123,7 @@ No Python is needed on the host: the installer and the device test run inside th
 5. [First administrator](#first-administrator)
 6. [Fixing ID issues](#fixing-id-issues)
 7. [Fix the Uppal address](#fix-the-uppal-address)
+   - [Add, retire or re-enable a device](#add-retire-or-re-enable-a-device)
 8. [Cutover from the Postgres stack](#cutover-from-the-postgres-stack)
 9. [Sync health and offline behaviour](#sync-health-and-offline-behaviour)
 10. [Nightly export](#nightly-export)
@@ -328,6 +329,16 @@ The Uppal X990 is at `192.168.1.201`. Older installs stored `192.168.1.200`. `ES
 3. The card shows **Change pending** until the collector's next poll, then **Change applied**. No restart.
 
 Devices is admin-only; HR handles ID problems from **People → ID issues**.
+
+## Add, retire or re-enable a device
+
+The devices table is the source of truth; `.env` IPs only seed the first two rows. On **Devices** (admin):
+
+- **Add device**: site, family (X990 attendance or C3-400 access controller), IP, port and an optional comm password (numeric for the X990). The id is generated from site and family (`kondapur-c3-400`, then `-2`, `-3` on a clash), never changes and is never reused. The card reads **Pending** until the collector picks it up, about 6 minutes (replica sync plus one poll).
+- **Retire device** (asks to confirm): sets `retired_at`. The collector stops polling it, it never trips the stale-collector warning, and its punches stay on every day view. Retired cards collapse under **Retired**.
+- **Re-enable**: clears `retired_at`; polling resumes on the same id.
+
+Two active devices can't share an IP:port. Adding an address that belongs to a retired device offers **Re-enable** instead of a new id, so history stays under one id. There is no delete.
 
 ## Cutover from the Postgres stack
 

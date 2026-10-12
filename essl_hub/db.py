@@ -750,6 +750,43 @@ class Database:
                 (ip, port, comm_password, _now(), device_id),
             )
 
+    def add_device(
+        self,
+        *,
+        device_id: str,
+        site: str,
+        model: str,
+        ip: str,
+        port: int,
+        protocol: str,
+        comm_password: str | None,
+    ) -> None:
+        """Insert an admin-added device. ``connection_updated_at`` is set so the
+        card reads as pending until the collector's first attempt."""
+        now = _now()
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO devices (id, site, model, ip, port, protocol, comm_password, "
+                "created_at, connection_updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (device_id, site, model, ip, port, protocol, comm_password, now, now),
+            )
+
+    def set_device_retired(self, device_id: str, retired: bool) -> None:
+        """Retire (stop polling) or re-enable a device. Punches are untouched."""
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE devices SET retired_at=? WHERE id=?",
+                (_now() if retired else None, device_id),
+            )
+
+    def devices_at_address(self, ip: str, port: int) -> list[dict[str, object]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM devices WHERE ip = ? AND port = ? ORDER BY created_at, id",
+                (ip, port),
+            ).fetchall()
+        return list(rows)
+
     def device_by_id(self, device_id: str) -> dict[str, object] | None:
         with self.connect() as connection:
             row = connection.execute(

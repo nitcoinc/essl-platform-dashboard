@@ -749,3 +749,12 @@ input[type="file"]::file-selector-button {
   .issue-link-form { justify-content: flex-start; }
   .issue-link-form select, .issue-link-form input { max-width: none; }
 }
+
+/* Devices: add form, retire action, retired group */
+.device-actions { display: flex; justify-content: flex-end; }
+.device-add { margin-bottom: var(--s8); }
+.device-add summary, .device-retired > summary { cursor: pointer; width: fit-content; font-weight: 500; border-radius: var(--radius-sm); }
+.device-add select { width: 100%; }
+.device-retired { margin-bottom: var(--s8); }
+.device-retired > summary { margin-bottom: var(--s4); color: var(--text-secondary); }
+.device-retired .device { opacity: 0.85; }

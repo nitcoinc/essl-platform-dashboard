@@ -801,6 +801,28 @@ class DatabaseTest(unittest.TestCase):
         self.assertEqual(rows, {"c3-set": "entry", "x990": None})
 
 
+    def test_add_retire_and_reenable_device(self) -> None:
+        self.database.initialize(self.devices)
+        self.database.add_device(
+            device_id="kondapur-c3-400", site="Kondapur", model="C3-400",
+            ip="192.168.1.210", port=4370, protocol="c3-pullsdk", comm_password=None,
+        )
+        added = self.database.device_by_id("kondapur-c3-400")
+        self.assertIsNotNone(added["created_at"])
+        self.assertIsNotNone(added["connection_updated_at"])
+        self.assertEqual(
+            [d["id"] for d in self.database.devices_at_address("192.168.1.210", 4370)],
+            ["kondapur-c3-400"],
+        )
+        self.database.set_device_retired("kondapur-c3-400", True)
+        self.assertIsNotNone(self.database.device_by_id("kondapur-c3-400")["retired_at"])
+        self.assertNotIn(
+            "kondapur-c3-400", [d["id"] for d in self.database.device_connection_info()]
+        )
+        self.database.set_device_retired("kondapur-c3-400", False)
+        self.assertIsNone(self.database.device_by_id("kondapur-c3-400")["retired_at"])
+
+
 class ReplicaModeTest(unittest.TestCase):
     """Replica-mode branches with the network faked out: no Turso needed."""
 
