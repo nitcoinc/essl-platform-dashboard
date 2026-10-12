@@ -2235,6 +2235,18 @@ class RolesAndVisibilityTest(unittest.TestCase):
         self.assertNotIn(">P41</a>", page.text)
         self.assertIn('id="team-count"', page.text)
 
+    def test_team_history_restore_gets_the_full_page(self) -> None:
+        a, *_ = self._team()
+        self._sign_in(a)
+        restore = self.client.get("/team", headers={"HX-Request": "true", "HX-History-Restore-Request": "true"})
+        self.assertIn("<html", restore.text)
+        self.assertIn('class="sidebar"', restore.text)
+        self.assertNotIn('hx-swap-oob', restore.text)
+        partial = self.client.get("/team", headers={"HX-Request": "true"})
+        self.assertNotIn("<html", partial.text)
+        self.assertIn("HX-Request", restore.headers.get("Vary", ""))
+        self.assertIn("HX-Request", partial.headers.get("Vary", ""))
+
     def test_team_puts_incomplete_and_empty_days_first(self) -> None:
         a, b, c, _ = self._team()
         # The first minutes of today's work day (default start 06:00).
@@ -2508,6 +2520,13 @@ class PeopleManagementTest(unittest.TestCase):
             data["csrf"] = self._csrf()
         return self.client.post(f"/people/{person['id']}/assign", data=data, headers=headers)
 
+    def _edit_row(self, person: dict) -> str:
+        return self.client.get(f"/people/{person['id']}/row?edit=1", headers={"HX-Request": "true"}).text
+
+    def _seed(self, count: int) -> None:
+        for n in range(count):
+            self._person(f"S{n:04d}", f"Seeded Person {n:04d}")
+
     def test_manager_and_employee_get_403(self) -> None:
         manager = self._person("9", "Mona", "manager")
         for person in (manager, self.ravi):
@@ -2539,7 +2558,9 @@ class PeopleManagementTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.database.employee_by_id(self.ravi["id"])["manager_id"], self.sita["id"])
         self.assertTrue(response.text.lstrip().startswith(f'<tr id="person-{self.ravi["id"]}"'))
-        self.assertIn(f'<option value="{self.sita["id"]}" selected>Sita</option>', response.text)
+        # Save swaps the row back to text: the new manager, no select.
+        self.assertIn("Sita", response.text)
+        self.assertNotIn("<select", response.text)
         self.assertIn("autofocus", response.text)
 
     def test_cycle_returns_the_error_fragment_and_leaves_the_database_unchanged(self) -> None:
@@ -2565,12 +2586,14 @@ class PeopleManagementTest(unittest.TestCase):
     def test_hr_sees_no_admin_option_and_admin_rows_are_locked(self) -> None:
         self._sign_in(self.hr)
         page = self.client.get("/people").text
-        self.assertNotIn('<option value="admin"', page)
         admin_row = page.split(f'id="person-{self.admin["id"]}"')[1].split("</tr>")[0]
-        self.assertNotIn('name="role"', admin_row)
         self.assertIn("Admin only", admin_row)
+        self.assertNotIn('<option value="admin"', self._edit_row(self.ravi))
+        locked = self._edit_row(self.admin)
+        self.assertNotIn('name="role"', locked)
+        self.assertIn("Admin only", locked)
         self._sign_in(self.admin)
-        self.assertIn('<option value="admin"', self.client.get("/people").text)
+        self.assertIn('<option value="admin"', self._edit_row(self.ravi))
 
     def test_add_with_duplicate_email_shows_inline_error_and_creates_nothing(self) -> None:
         self._sign_in(self.hr)
@@ -2627,6 +2650,91 @@ class PeopleManagementTest(unittest.TestCase):
         self._sign_in(self.hr)
         self.assertEqual(self.client.get("/people/9999/edit").status_code, 404)
         self.assertEqual(self._assign({"id": 9999}, manager_id="").status_code, 404)
+
+    def test_people_page_with_150_people_has_no_per_row_select_and_stays_small(self) -> None:
+        self._seed(145)
+        self._sign_in(self.hr)
+        response = self.client.get("/people")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("150 people", response.text)
+        self.assertNotIn("<select", response.text)
+        self.assertLess(len(response.data), 250 * 1024)
+        self.assertIn('class="col-person"', response.text)
+
+    def test_row_edit_opens_select_saves_and_cancels(self) -> None:
+        self.database.set_employee_manager(self.ravi["id"], self.sita["id"])
+        self._sign_in(self.hr)
+        edit = self._edit_row(self.ravi)
+        self.assertTrue(edit.lstrip().startswith(f'<tr id="person-{self.ravi["id"]}" class="is-editing"'))
+        self.assertEqual(edit.count("<tr"), 1)
+        self.assertIn(f'<option value="{self.sita["id"]}" selected>Sita</option>', edit)
+        self.assertIn('name="manager_id"', edit)
+        self.assertIn(">Cancel</a>", edit)
+        cancel = self.client.get(f"/people/{self.ravi['id']}/row", headers={"HX-Request": "true"}).text
+        self.assertNotIn("<select", cancel)
+        self.assertIn("Sita", cancel)
+        self.assertEqual(self.database.employee_by_id(self.ravi["id"])["manager_id"], self.sita["id"])
+        saved = self._assign(self.ravi, manager_id=str(self.ram["id"]), role="employee")
+        self.assertNotIn("<select", saved.text)
+        self.assertIn("Ramesh", saved.text)
+        self.assertEqual(self.database.employee_by_id(self.ravi["id"])["manager_id"], self.ram["id"])
+        self.assertEqual(self.client.get("/people/9999/row").status_code, 404)
+
+    def test_row_edit_is_hr_and_admin_only(self) -> None:
+        manager = self._person("9", "Mona", "manager")
+        self._sign_in(manager)
+        self.assertEqual(self.client.get(f"/people/{self.ravi['id']}/row?edit=1").status_code, 403)
+
+    def test_own_row_edit_keeps_role_locked(self) -> None:
+        self._sign_in(self.hr)
+        own = self._edit_row(self.hr)
+        self.assertNotIn('name="role"', own)
+        self.assertIn('name="manager_id"', own)
+
+    def test_history_restore_gets_the_full_page_and_htmx_gets_the_partial(self) -> None:
+        self._sign_in(self.hr)
+        restore = self.client.get(
+            "/people", headers={"HX-Request": "true", "HX-History-Restore-Request": "true"}
+        )
+        self.assertIn("<html", restore.text)
+        self.assertIn('class="sidebar"', restore.text)
+        partial = self.client.get("/people", headers={"HX-Request": "true"})
+        self.assertNotIn("<html", partial.text)
+        self.assertIn('hx-swap-oob="true"', partial.text)
+        for response in (restore, partial):
+            self.assertIn("HX-Request", response.headers.get("Vary", ""))
+        full = self.client.get("/people").text
+        self.assertIn('"historyCacheSize": 0', full)
+        self.assertIn('"refreshOnHistoryMiss": true', full)
+        self.assertNotIn('hx-swap-oob', full)
+
+    def test_people_query_count_does_not_grow_with_roster_size(self) -> None:
+        def counted(names):
+            calls = {"n": 0}
+            for name in names:
+                original = getattr(self.database, name)
+
+                def wrapper(*args, _original=original, **kwargs):
+                    calls["n"] += 1
+                    return _original(*args, **kwargs)
+
+                setattr(self.database, name, wrapper)
+            self.addCleanup(lambda: [self.database.__dict__.pop(n, None) for n in names])
+            return calls
+
+        self._sign_in(self.hr)
+        self.client.get("/people")  # warm the nav issue-count cache
+        names = ("employees", "punches_for_employee_range", "punches_for_device_users_range")
+        calls = counted(names)
+        self.client.get("/people")
+        small = calls["n"]
+        for n in names:
+            self.database.__dict__.pop(n, None)
+        self._seed(60)
+        calls = counted(names)
+        self.client.get("/people")
+        self.assertEqual(calls["n"], small)
+        self.assertLessEqual(small, 3)
 
 
 class ScreensTest(unittest.TestCase):

@@ -4,19 +4,21 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-from flask import Blueprint, Response, g, redirect, render_template, request, url_for
+from flask import Blueprint, Response, g, make_response, redirect, render_template, request, url_for
 
 from .. import access, export
 from .common import (
     TEAM_ROLES,
     XLSX_MIMETYPE,
     _day_start_hour,
+    _htmx_partial,
     _int_list,
     _login_required,
     _now_naive,
     _role_required,
     _target_minutes,
     _today,
+    _vary_htmx,
     _with_query,
     database,
 )
@@ -89,9 +91,9 @@ def _render_team(export_error: str | None = None, status: int = 200):
         "export_error": export_error,
         "export_open": export_error is not None or "from" in request.args,
     }
-    if request.headers.get("HX-Request"):
-        return render_template("_team_results.html", oob=True, **context), status
-    return render_template("team.html", **context), status
+    partial = _htmx_partial()
+    template = "_team_results.html" if partial else "team.html"
+    return _vary_htmx(make_response(render_template(template, oob=partial, **context), status))
 
 
 @bp.get("/team")

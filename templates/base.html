@@ -61,6 +61,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="{{ 'light dark' if theme == 'system' else theme }}">
+    <meta name="htmx-config" content='{"historyCacheSize": 0, "refreshOnHistoryMiss": true}'>
     <meta name="csrf-token" content="{{ g.csrf_token or '' }}">
     <title>{% block title %}eSSL Attendance Hub{% endblock %}</title>
     <link rel="preload" href="{{ url_for('static', filename='fonts/InterVariable-latin.woff2') }}" as="font" type="font/woff2" crossorigin>

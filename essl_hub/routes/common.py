@@ -113,6 +113,22 @@ def _role_required(*roles: str):
     return decorator
 
 
+def _htmx_partial() -> bool:
+    """True when htmx wants a fragment. A history-restore request (back or
+    forward after a cache miss) also carries HX-Request but must get the
+    full page, or the shell is lost."""
+    return bool(request.headers.get("HX-Request")) and not request.headers.get(
+        "HX-History-Restore-Request"
+    )
+
+
+def _vary_htmx(response):
+    """Mark a view that answers HX-Request with a fragment, so no cache
+    hands the fragment to a plain navigation."""
+    response.vary.add("HX-Request")
+    return response
+
+
 def _home_for(employee: dict) -> str:
     """Landing page per role (plan: Navigation by role)."""
     if employee["role"] == "employee":

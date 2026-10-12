@@ -682,9 +682,21 @@ input[type="file"]::file-selector-button {
 .people-search { display: flex; gap: var(--s2); max-width: 520px; }
 .people-search .search-field { flex: 1; }
 .people-count { margin: var(--s4) 0 var(--s2); font-size: var(--text-13); color: var(--text-secondary); font-variant-numeric: tabular-nums; }
-.people-table select { height: 28px; min-height: 28px !important; max-width: 190px; font-size: var(--text-13); }
+/* Fixed layout: column widths never depend on cell content, so the table
+   does not re-flow while rows render or when one row switches to edit. */
+.people-table { table-layout: fixed; min-width: 880px; }
+.people-table .col-person { width: 28%; }
+.people-table .col-device { width: 10%; }
+.people-table .col-manager { width: 20%; }
+.people-table .col-role { width: 13%; }
+.people-table .col-today { width: 15%; }
+.people-table .col-actions { width: 14%; }
+.people-table td { overflow: hidden; text-overflow: ellipsis; }
+.people-table .person-name, .people-table .person-email { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.people-table td.row-actions { overflow: visible; }
+.people-table select { width: 100%; height: 28px; min-height: 28px !important; font-size: var(--text-13); }
 .people-table td.num { color: var(--text-secondary); }
-.person-cell { min-width: 200px; }
+.person-cell { min-width: 0; }
 .person-name { display: block; color: var(--text); font-weight: 500; text-decoration: none; }
 .person-name:hover { text-decoration: underline; }
 .person-email { display: block; font-size: var(--text-13); color: var(--text-secondary); }
@@ -701,6 +713,8 @@ input[type="file"]::file-selector-button {
 .form-error { margin-bottom: var(--s5); padding: var(--s3) var(--s4); background: var(--bad-bg); border-radius: var(--radius); max-width: 560px; }
 @media (max-width: 767.98px) {
   .people-search { max-width: none; }
+  .people-table { table-layout: auto; min-width: 0; }
+  .people-table colgroup { display: none; }
   .people-table select { height: 44px; min-height: 44px !important; max-width: 60%; }
   .person-cell { min-width: 0; flex-direction: column; align-items: flex-start !important; text-align: left !important; }
   .row-actions { flex-direction: column; align-items: stretch !important; }
@@ -735,7 +749,9 @@ input[type="file"]::file-selector-button {
 .auth-turnstile { margin: 4px 0 12px; min-height: 65px; }
 
 /* ---------- People sub-tabs and ID issues ---------- */
-.subtabs { display: flex; gap: var(--s1); margin: calc(-1 * var(--s2)) 0 var(--s5); border-bottom: 1px solid var(--border); }
+/* The sub-tabs carry the rule under the header, so the topbar drops its own. */
+.topbar:has(+ .subtabs) { border-bottom: 0; padding-bottom: var(--s4); margin-bottom: 0; }
+.subtabs { display: flex; gap: var(--s1); margin: 0 0 var(--s5); border-bottom: 1px solid var(--border); }
 .subtab { display: inline-flex; align-items: center; gap: var(--s2); padding: var(--s2) var(--s3); margin-bottom: -1px; font-size: var(--text-14); font-weight: 500; color: var(--text-secondary); text-decoration: none; border-bottom: 2px solid transparent; }
 .subtab:hover { color: var(--text); }
 .subtab[aria-current="page"] { color: var(--text); border-bottom-color: var(--accent); }

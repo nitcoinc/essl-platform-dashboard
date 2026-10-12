@@ -6,12 +6,11 @@ import csv
 import io
 import json
 import time
-from datetime import date
 
 import openpyxl
-from flask import Blueprint, Response, abort, g, redirect, render_template, request, url_for
+from flask import Blueprint, Response, abort, g, make_response, redirect, render_template, request, url_for
 
-from .. import access, id_issues, roster
+from .. import access, export, id_issues, roster
 from ..db import IntegrityError, RuleViolation
 from .common import (
     ROLE_LABELS,
@@ -20,15 +19,19 @@ from .common import (
     ROSTER_TEMPLATE_HEADER,
     XLSX_MIMETYPE,
     _day_for_employee,
+    _day_start_hour,
     _home_for,
+    _htmx_partial,
     _int_or_zero,
     _max_upload_mb,
+    _now_naive,
     _require_csrf,
     _role_required,
     _roster_rows,
     _sentence,
     _target_minutes,
     _today,
+    _vary_htmx,
     database,
 )
 
@@ -62,26 +65,30 @@ def upload_too_large(error):
     )
 # --- People (U7) -------------------------------------------------------
 
-def _people_rows(query: str) -> list[dict]:
-    everyone = database.employees()
+def _people_rows(query: str, everyone: list[dict]) -> list[dict]:
     names = {person["id"]: person["name"] for person in everyone}
-    target_minutes = _target_minutes(database)
-    today = _today()
     lowered = query.lower()
-    rows = []
-    for person in everyone:
-        if lowered and lowered not in person["name"].lower() and lowered not in person["email"].lower():
-            continue
-        rows.append(_person_row(person, names, today, target_minutes))
-    return rows
+    people = [
+        person for person in everyone
+        if not lowered or lowered in person["name"].lower() or lowered in person["email"].lower()
+    ]
+    # Today's status for every row from one punch query, not one per person.
+    day_start_hour = _day_start_hour(database)
+    today = _today(day_start_hour)
+    results = export.day_results(
+        database, people, today, today,
+        target_minutes=_target_minutes(database), today=today, now=_now_naive(),
+        day_start_hour=day_start_hour,
+    )
+    return [_person_row(person, names, results[(person["id"], today)]) for person in people]
 
 
-def _person_row(person: dict, names: dict, today: date, target_minutes: int) -> dict:
+def _person_row(person: dict, names: dict, result) -> dict:
     actor = g.employee
     return {
         "person": person,
         "manager_name": names.get(person.get("manager_id")),
-        "status": _day_for_employee(database, person, today, target_minutes).status,
+        "result": result,
         # Templates never decide access (KTD8): every flag comes from here.
         "role_locked": person["id"] == actor["id"]
         or not access.can_modify_employee(actor, person, "role"),
@@ -95,18 +102,43 @@ def _person_row(person: dict, names: dict, today: date, target_minutes: int) -> 
 
 def _render_people(row_error: tuple[int, str] | None = None, status: int = 200):
     query = (request.args.get("q") or "").strip()
+    everyone = database.employees()
     context = {
         "employee": g.employee,
         "csrf_token": g.csrf_token,
         "query": query,
-        "rows": _people_rows(query),
-        "everyone": database.employees(),
+        "rows": _people_rows(query, everyone),
         "row_error": row_error,
         "role_labels": ROLE_LABELS,
     }
-    if request.headers.get("HX-Request") and not row_error:
-        return render_template("_people_results.html", oob=True, **context), status
-    return render_template("people.html", **context), status
+    if row_error:
+        # The no-JS error page opens the failing row in edit mode.
+        context["edit_id"] = row_error[0]
+        context["everyone"] = everyone
+    partial = _htmx_partial() and not row_error
+    template = "_people_results.html" if partial else "people.html"
+    return _vary_htmx(make_response(render_template(template, oob=partial, **context), status))
+
+
+def _render_row(target_id: int, *, edit: bool, row_error: tuple[int, str] | None = None, focus: bool = False):
+    """One People row, as text or (edit=True) with the manager and role selects."""
+    person = database.employee_by_id(target_id)
+    if person is None:
+        abort(404)
+    everyone = database.employees()
+    names = {p["id"]: p["name"] for p in everyone}
+    result = _day_for_employee(database, person, _today(), _target_minutes(database))
+    return render_template(
+        "_person_row.html",
+        row=_person_row(person, names, result),
+        everyone=everyone if edit else None,
+        edit_id=target_id if edit else None,
+        employee=g.employee,
+        csrf_token=g.csrf_token,
+        row_error=row_error,
+        role_labels=ROLE_LABELS,
+        focus_row=focus,
+    )
 
 
 def _change_assignment(target: dict, *, manager_raw: str | None, role_raw: str | None):
@@ -157,18 +189,11 @@ def _change_assignment(target: dict, *, manager_raw: str | None, role_raw: str |
 def _assignment_response(target_id: int, result):
     if request.headers.get("HX-Request"):
         # htmx swaps only 2xx responses, so the error fragment goes out as
-        # 200 and carries the message in a role="alert" element.
-        person = database.employee_by_id(target_id)
-        names = {p["id"]: p["name"] for p in database.employees()}
-        return render_template(
-            "_person_row.html",
-            row=_person_row(person, names, _today(), _target_minutes(database)),
-            everyone=database.employees(),
-            csrf_token=g.csrf_token,
-            row_error=(target_id, result[0]) if result else None,
-            role_labels=ROLE_LABELS,
-            focus_save=True,
-        )
+        # 200 and carries the message in a role="alert" element. Success
+        # swaps the row back to text; an error keeps it in edit mode.
+        if result:
+            return _render_row(target_id, edit=True, row_error=(target_id, result[0]), focus=True)
+        return _render_row(target_id, edit=False, focus=True)
     if result is None:
         return redirect(url_for("people.people_view", q=request.args.get("q") or None))
     error, status = result
@@ -179,6 +204,14 @@ def _assignment_response(target_id: int, result):
 @_role_required("hr", "admin")
 def people_view():
     return _render_people()
+
+
+@bp.get("/people/<int:employee_id>/row")
+@_role_required("hr", "admin")
+def people_row(employee_id: int):
+    """htmx row swap: ?edit=1 opens the manager and role selects, plain
+    GET (Cancel) returns the text row unchanged."""
+    return _render_row(employee_id, edit=bool(request.args.get("edit")), focus=True)
 
 
 @bp.post("/people/<int:employee_id>/assign")
