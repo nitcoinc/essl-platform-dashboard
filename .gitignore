@@ -15,3 +15,6 @@ data/*.db-*
 
 # Installer
 .install.lock
+
+# Local editor/tool folders
+.orca/
