@@ -94,7 +94,6 @@ REQUIRED=(
   "R2_BUCKET|R2 bucket name, e.g. essl-attendance|"
   "R2_EXPORT_ACCESS_KEY_ID|R2 API token Access Key ID|"
   "R2_EXPORT_SECRET_ACCESS_KEY|R2 API token Secret Access Key|secret"
-  "TUNNEL_TOKEN|Cloudflare Tunnel token|secret"
 )
 missing=()
 for row in "${REQUIRED[@]}"; do
@@ -108,7 +107,15 @@ if [ "${#missing[@]}" -gt 0 ]; then
   echo "        Fill them in .env (README \"Prerequisites\" says where each comes from) and run again." >&2
   exit 1
 fi
-ok "Turso, R2 and Tunnel values present"
+ok "Turso and R2 values present"
+
+# Tunnel: bundled cloudflared only when a token is set; otherwise the host's own.
+if [ -n "$(env_value TUNNEL_TOKEN)" ]; then
+  [ "$(env_value COMPOSE_PROFILES)" = tunnel ] || set_env COMPOSE_PROFILES tunnel
+  ok "bundled Cloudflare Tunnel on (TUNNEL_TOKEN set)"
+else
+  ok "no bundled tunnel; route your host's tunnel to http://localhost:$(env_value ESSL_WEB_PORT | grep . || echo 8080)"
+fi
 
 case "$(env_value TURSO_DATABASE_URL)" in
   libsql://*|https://*) ;;
@@ -184,7 +191,7 @@ docker compose ps --format 'table {{.Service}}\t{{.Status}}'
 
 # --- 6. Next steps ----------------------------------------------------------
 step "Done"
-echo "  Open your Tunnel hostname (e.g. https://attendance.yourcompany.com)."
+echo "  Open your public hostname (e.g. https://attendance.yourcompany.com)."
 if [ -n "$(env_value ESSL_SETUP_TOKEN)" ]; then
   echo "  First administrator: open /setup and enter this token:"
   echo "      ${B}$(env_value ESSL_SETUP_TOKEN)${N}"

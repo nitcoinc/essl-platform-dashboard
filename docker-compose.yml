@@ -54,8 +54,9 @@ services:
       ESSL_DB_PATH: /data/web-replica.db
       TURSO_AUTH_TOKEN: ${TURSO_AUTH_TOKEN:?set TURSO_AUTH_TOKEN in .env}
       TURSO_SYNC_SECONDS: ${TURSO_WEB_SYNC_SECONDS:-60}
-      # Trust CF-Connecting-IP: only cloudflared can reach this container.
-      ESSL_BEHIND_TUNNEL: "1"
+      # Trust CF-Connecting-IP: only a Cloudflare Tunnel (bundled or on the host)
+      # can reach this container. Set 0 if you put a different proxy in front.
+      ESSL_BEHIND_TUNNEL: ${ESSL_BEHIND_TUNNEL:-1}
       ESSL_FORCE_HTTPS_COOKIES: ${ESSL_FORCE_HTTPS_COOKIES:-true}
       ESSL_MAX_UPLOAD_MB: ${ESSL_MAX_UPLOAD_MB:-5}
       ESSL_SETUP_TOKEN: ${ESSL_SETUP_TOKEN:-}
@@ -72,10 +73,10 @@ services:
     volumes:
       - essl-data:/data
     command: ["gunicorn", "-w", "1", "--threads", "4", "-b", "0.0.0.0:8000", "essl_hub.web:create_app()"]
-    # Not published: users reach it through cloudflared. For local access on
-    # the host only, uncomment (and unset ESSL_FORCE_HTTPS_COOKIES for plain http):
-    # ports:
-    #   - "127.0.0.1:8000:8000"
+    # Host loopback only, for a cloudflared (or proxy) already running on the
+    # host: point its public hostname at http://localhost:${ESSL_WEB_PORT}.
+    ports:
+      - "127.0.0.1:${ESSL_WEB_PORT:-8080}:8000"
 
   nightly-export:
     build: .
@@ -95,13 +96,16 @@ services:
       - essl-data:/data
     command: ["python", "-m", "essl_hub.nightly_export"]
 
+  # Optional bundled tunnel. Off unless COMPOSE_PROFILES=tunnel in .env; skip it
+  # when the host already runs cloudflared.
   cloudflared:
     image: cloudflare/cloudflared:2026.9.0
+    profiles: ["tunnel"]
     restart: unless-stopped
     # Route the tunnel's public hostname to http://web:8000 in the Cloudflare dashboard.
     command: ["tunnel", "--no-autoupdate", "--metrics", "0.0.0.0:2000", "run"]
     environment:
-      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN in .env}
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
     healthcheck:
       test: ["CMD", "cloudflared", "tunnel", "--metrics", "127.0.0.1:2000", "ready"]
       interval: 30s

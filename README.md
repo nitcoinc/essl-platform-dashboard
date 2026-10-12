@@ -59,13 +59,13 @@ git clone <this repo> /opt/essl && cd /opt/essl
 The installer walks you through everything:
 
 1. Checks Docker, the compose plugin and the CPU architecture, and says exactly what to run if one is missing.
-2. Creates `.env` (mode 600) and **asks for each missing value**: device IPs and passwords, Turso URL and tokens, R2 keys, Tunnel token, and a mail provider. Secrets are typed hidden.
+2. Creates `.env` (mode 600) and **asks for each missing value**: device IPs and passwords, Turso URL and tokens, R2 keys and a mail provider. A Tunnel token is optional (see [Tunnel](#1-tunnel)). Secrets are typed hidden.
 3. Generates a one-time **setup token** for the first administrator.
 4. Builds the images and checks the data volume.
 5. **Tests both door devices** from inside the container (`Network` and `Protocol` must PASS).
 6. Starts the stack, waits until the web app answers, and prints the setup token and next steps.
 
-Then open your Tunnel hostname, go to `/setup`, enter the token, and import the roster from **People → Import roster**.
+Then open your public hostname, go to `/setup`, enter the token, and import the roster from **People → Import roster**.
 
 | Command | What it does |
 | --- | --- |
@@ -82,7 +82,7 @@ Then open your Tunnel hostname, go to `/setup`, enter the token, and import the 
 | **Docker Engine + compose plugin** | Runs every service | `curl -fsSL https://get.docker.com \| sh` then `sudo usermod -aG docker "$USER" && newgrp docker` |
 | **Turso database** + two tokens | The database (hosted libSQL) | [Turso setup](#turso-setup), done once from a laptop |
 | **Cloudflare account** with your domain on its DNS | Tunnel (no open ports), Turnstile, R2 | [Cloudflare setup](#cloudflare-setup) |
-| **Cloudflare Tunnel token** | The only way in from the internet | [Tunnel](#1-tunnel) |
+| **Cloudflare Tunnel**: one already on the host, or a token for the bundled one | The only way in from the internet | [Tunnel](#1-tunnel) |
 | **R2 bucket** + bucket-scoped API token | Nightly export copy | [R2 bucket](#2-r2-bucket-nightly-export) |
 | **Mail provider**: Resend or Cloudflare Email Sending | Sends sign-in codes | [Sign-in email](#3-sign-in-email) |
 | Device **IP addresses** and **comm passwords** | Pulling punches | Device menu / ZKAccess; `ESSL_X990_IP`, `ESSL_X990_PASSWORD`, `ESSL_C3_IP`, `ESSL_C3_PASSWORD`. Addresses in this README (`192.168.1.201`, `192.168.1.202`) are examples |
@@ -148,9 +148,9 @@ Everything is one `docker-compose.yml` on one x86_64 host that can reach both de
 | Service | Job |
 | --- | --- |
 | `collector` | Polls the devices every `ESSL_COLLECTOR_INTERVAL_SECONDS` and writes punches. Boots and polls without the internet; a punch write that fails goes to the local spool and is replayed in order later. Syncs its replica every `TURSO_COLLECTOR_SYNC_SECONDS`. |
-| `web` | Flask + gunicorn (`-w 1 --threads 4`). The screens and the read-only HRMS API. Owns the schema. Syncs its replica every `TURSO_WEB_SYNC_SECONDS`, so collector punches show up within about a minute. Not published on any host port. |
+| `web` | Flask + gunicorn (`-w 1 --threads 4`). The screens and the read-only HRMS API. Owns the schema. Syncs its replica every `TURSO_WEB_SYNC_SECONDS`, so collector punches show up within about a minute. Published on host loopback only (`127.0.0.1:ESSL_WEB_PORT`, default 8080). |
 | `nightly-export` | Once a night, syncs a read-only replica, strips sessions and login codes, integrity-checks, gzips and puts it to R2 under `nightly/`. |
-| `cloudflared` | Cloudflare Tunnel. The only way in from the internet. |
+| `cloudflared` | *Optional* bundled Cloudflare Tunnel (compose profile `tunnel`). Skip it when the host already runs cloudflared. |
 
 Every process holds one libSQL connection for its life (one replica file per process), so a process always reads its own writes. Status files on the shared volume (`collector-status.json`, `export-status.json`) feed the admin sync-health indicator even when Turso is unreachable. All containers run as UID/GID 10001. Postgres is gone from the runtime, and so are continuous file backups: Turso's point-in-time recovery plus the nightly export replace them.
 
@@ -191,11 +191,12 @@ Do this once, before touching the host. You need a Cloudflare account whose DNS 
 
 ### 1. Tunnel
 
-1. **Zero Trust → Networks → Tunnels → Create a tunnel**, type Cloudflared. Name it `essl-attendance`.
-2. Copy the token from the install command. It goes in `TUNNEL_TOKEN`.
-3. **Public hostname**: e.g. `attendance.yourcompany.com`, service `HTTP`, URL `web:8000`.
+Pick one:
 
-The compose file sets `ESSL_BEHIND_TUNNEL=1`, so per-IP sign-in limits use `CF-Connecting-IP`. Never publish port 8000 while that flag is set.
+- **Host already runs cloudflared** (recommended if you have one): add a public hostname, e.g. `attendance.yourcompany.com`, service `HTTP`, URL `localhost:8080` (`ESSL_WEB_PORT`). Leave `TUNNEL_TOKEN` empty; the bundled container stays off.
+- **Bundled tunnel**: **Zero Trust → Networks → Tunnels → Create a tunnel**, type Cloudflared. Put its token in `TUNNEL_TOKEN` (the installer then sets `COMPOSE_PROFILES=tunnel`). Public hostname URL: `web:8000`.
+
+The web port binds to `127.0.0.1` only, and compose sets `ESSL_BEHIND_TUNNEL=1`, so per-IP sign-in limits use `CF-Connecting-IP`. Never expose the port beyond loopback while that flag is set; behind a different proxy, set `ESSL_BEHIND_TUNNEL=0`.
 
 ### 2. R2 bucket (nightly export)
 
@@ -425,7 +426,7 @@ Do it once before cutover, then quarterly.
 
 1. Run an export now (`--once`, above) and confirm the object under `nightly/` in R2 and an OK row on Sync health.
 2. Restore it with path 2 to `essl-drill`, and do a path 1 restore to `essl-drill-pitr` from an hour ago.
-3. On a scratch host, copy `.env`, point it at `essl-drill` with fresh tokens, set a different `TUNNEL_TOKEN` (or stop `cloudflared`), `docker compose up -d`. Confirm sign-in works and yesterday's hours match production.
+3. On a scratch host, copy `.env`, point it at `essl-drill` with fresh tokens, leave `TUNNEL_TOKEN` empty, `docker compose up -d`. Confirm sign-in works and yesterday's hours match production.
 4. Record the times. Destroy both drill databases and the scratch host. Never point a scratch stack at the production database.
 
 ## Turso plan limits
@@ -545,7 +546,8 @@ All settings live in `.env`; `.env.example` documents each one. The daily target
 | `R2_ACCOUNT_ID`, `R2_BUCKET` | required | nightly-export |
 | `R2_EXPORT_ACCESS_KEY_ID`, `R2_EXPORT_SECRET_ACCESS_KEY` | required, scoped to the one bucket | nightly-export |
 | `ESSL_EXPORT_HOUR` | `2` (IST) | nightly-export |
-| `TUNNEL_TOKEN` | required | cloudflared |
+| `ESSL_WEB_PORT` | `8080` | web, published on `127.0.0.1` |
+| `TUNNEL_TOKEN`, `COMPOSE_PROFILES` | optional; token + `tunnel` turns on the bundled cloudflared | cloudflared |
 | `ESSL_COLLECTOR_INTERVAL_SECONDS` | `60` | collector, Devices page |
 | `ESSL_HEARTBEAT_WRITE_SECONDS` | `300` | collector, Devices staleness warning |
 | `ESSL_X990_IP` / `_PORT` / `_PASSWORD` | `192.168.1.201` / `4370` / `0` | collector (seeds the row once) |
@@ -559,7 +561,7 @@ All settings live in `.env`; `.env.example` documents each one. The daily target
 | `ESSL_FORCE_HTTPS_COOKIES` | `true` | web (`false` only for local http) |
 | `ESSL_MAX_UPLOAD_MB` | `5` | web |
 | `ESSL_SETUP_TOKEN`, `ESSL_BOOTSTRAP_ADMIN_EMAIL` | unset | web, first admin only |
-| `ESSL_BEHIND_TUNNEL` | `1` in compose | web |
+| `ESSL_BEHIND_TUNNEL` | `1` | web (`0` behind a non-Cloudflare proxy) |
 
 ## Development and tests
 
