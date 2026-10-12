@@ -53,7 +53,6 @@ class FakeDatabase:
         self._next_login_code_id = 1
         self.sessions: dict[str, dict] = {}
         self.api_keys_list: list[dict] = []
-        self.branding: dict[str, dict] = {}
         # Local mode by default: no sync loop. `offline` makes every write
         # raise OfflineError the way a degraded replica does (KTD11).
         self.replica = False
@@ -439,24 +438,6 @@ class FakeDatabase:
 
     def set_setting(self, key: str, value: str) -> None:
         self.settings[key] = value
-
-    # branding -------------------------------------------------------------
-
-    def branding_versions(self) -> dict:
-        return {k: a["sha256"] for k, a in self.branding.items()}
-
-    def branding_asset(self, key: str):
-        asset = self.branding.get(key)
-        return dict(asset, key=key) if asset else None
-
-    def set_branding_asset(self, key: str, *, content_type: str, data: bytes, sha256: str) -> None:
-        self._check_online()
-        self.branding[key] = {
-            "content_type": content_type, "data": data, "sha256": sha256}
-
-    def delete_branding_asset(self, key: str) -> None:
-        self._check_online()
-        self.branding.pop(key, None)
 
 
 def _make_app():
@@ -2204,155 +2185,40 @@ class AppShellTest(unittest.TestCase):
 
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
-SVG_BYTES = b'<svg xmlns="http://www.w3.org/2000/svg"></svg>'
 
 
-class BrandingTest(unittest.TestCase):
-    """U6: sign-in logo and background (R10, R11)."""
+class BrandingRemovedTest(unittest.TestCase):
+    """U2: the admin sign-in branding feature is gone; stale settings are ignored."""
 
     setUp = AdminViewTest.setUp
     _csrf = AdminViewTest._csrf
 
-    def _upload(self, key: str, data: bytes, name: str = "logo.png"):
-        return self.client.post(
-            f"/settings/branding/{key}",
-            data={"image": (io.BytesIO(data), name), "csrf": self._csrf()},
-            content_type="multipart/form-data",
-        )
+    def test_settings_page_has_no_branding_section(self) -> None:
+        html = self.client.get("/settings").text
+        self.assertNotIn("Sign-in branding", html)
+        self.assertNotIn("/settings/branding", html)
 
-    def _signin_html(self) -> str:
-        return self.app.test_client().get("/signin").text
-
-    def test_valid_png_logo_is_stored_referenced_and_served(self) -> None:
-        response = self._upload("logo", PNG_BYTES)
-        self.assertEqual(response.status_code, 302)
-        page = self._signin_html()
-        self.assertRegex(page, r'/brand/logo\?v=[0-9a-f]{12}')
-        served = self.app.test_client().get("/brand/logo")
-        self.assertEqual(served.status_code, 200)
-        self.assertEqual(served.mimetype, "image/png")
-        self.assertEqual(served.data, PNG_BYTES)
-        self.assertTrue(served.headers.get("ETag"))
-        self.assertEqual(served.headers["X-Content-Type-Options"], "nosniff")
-
-    def test_jpeg_and_webp_are_sniffed_by_magic_bytes(self) -> None:
-        from essl_hub.routes.admin import sniff_image_type
-
-        self.assertEqual(sniff_image_type(b"\xff\xd8\xff\xe0rest"), "image/jpeg")
-        self.assertEqual(sniff_image_type(b"RIFF\x00\x00\x00\x00WEBPVP8 "), "image/webp")
-        self.assertIsNone(sniff_image_type(SVG_BYTES))
-
-    def test_svg_or_renamed_text_is_rejected_inline(self) -> None:
-        for data, name in ((SVG_BYTES, "logo.svg"), (b"hello world", "logo.png")):
-            response = self._upload("logo", data, name)
-            self.assertEqual(response.status_code, 400, name)
-            self.assertIn("Upload a PNG, JPEG or WebP image", response.text)
-        self.assertEqual(self.database.branding_versions(), {})
-
-    def test_over_per_asset_cap_is_rejected_inline(self) -> None:
-        response = self._upload("logo", PNG_BYTES + b"\x00" * (512 * 1024))
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("larger than 512 KB", response.text)
-
-    def test_over_request_limit_renders_settings_error_not_import_page(self) -> None:
+    def test_branding_routes_are_gone(self) -> None:
         csrf = self._csrf()
-        self.app.config["MAX_CONTENT_LENGTH"] = 1024
-        response = self.client.post(
-            "/settings/branding/background",
-            data={"image": (io.BytesIO(PNG_BYTES + b"\x00" * 4096), "bg.png"), "csrf": csrf},
-            content_type="multipart/form-data",
-        )
-        self.assertEqual(response.status_code, 413)
-        self.assertIn("Sign-in branding", response.text)
-        self.assertIn("Use a smaller image", response.text)
-        self.assertNotIn("Upload roster", response.text)
+        for path in ("/settings/branding/logo", "/settings/branding/logo/reset", "/settings/branding-background"):
+            with self.subTest(path=path):
+                response = self.client.post(
+                    path,
+                    data={"image": (io.BytesIO(PNG_BYTES), "logo.png"), "mode": "color",
+                          "color": "#112233", "csrf": csrf},
+                    content_type="multipart/form-data",
+                )
+                self.assertIn(response.status_code, (404, 405))
+        self.assertEqual(self.client.get("/brand/logo").status_code, 404)
 
-    def test_conditional_get_with_matching_etag_returns_304(self) -> None:
-        self._upload("logo", PNG_BYTES)
-        client = self.app.test_client()
-        etag = client.get("/brand/logo").headers["ETag"]
-        response = client.get("/brand/logo", headers={"If-None-Match": etag})
-        self.assertEqual(response.status_code, 304)
-
-    def test_public_get_works_and_non_admin_upload_is_refused(self) -> None:
-        self._upload("logo", PNG_BYTES)
-        self.assertEqual(self.app.test_client().get("/brand/logo").status_code, 200)
-        self.assertEqual(self.app.test_client().get("/brand/other").status_code, 404)
-        anon = self.app.test_client().post(
-            "/settings/branding/logo", data={"image": (io.BytesIO(PNG_BYTES), "x.png")},
-            content_type="multipart/form-data",
-        )
-        self.assertIn(anon.status_code, (302, 401, 403))
-        before = self.database.branding_versions()
-        csrf = self._csrf()
-        admin = self.database.employee_by_email("admin@example.com")
-        self.database.employees_by_id[admin["id"]]["role"] = "hr"
-        response = self.client.post(
-            "/settings/branding/logo",
-            data={"image": (io.BytesIO(PNG_BYTES + b"x"), "x.png"), "csrf": csrf},
-            content_type="multipart/form-data",
-        )
-        self.assertIn(response.status_code, (403, 404))
-        self.assertEqual(self.database.branding_versions(), before)
-
-    def test_reset_removes_asset_and_signin_falls_back(self) -> None:
-        self._upload("logo", PNG_BYTES)
-        response = self.client.post("/settings/branding/logo/reset", data={"csrf": self._csrf()})
-        self.assertEqual(response.status_code, 302)
-        page = self._signin_html()
-        self.assertNotIn("/brand/logo", page)
-        self.assertIn("brand-name", page)
-        self.assertEqual(self.app.test_client().get("/brand/logo").status_code, 404)
-
-    def test_background_image_upload_and_reset(self) -> None:
-        self._upload("background", PNG_BYTES, "bg.png")
-        page = self._signin_html()
-        self.assertIn("auth-bg-image", page)
-        self.assertRegex(page, r"/brand/background\?v=[0-9a-f]{12}")
-        self.client.post("/settings/branding/background/reset", data={"csrf": self._csrf()})
-        self.assertNotIn("auth-bg", self._signin_html())
-        self.assertEqual(self.database.setting("signin_background"), "default")
-
-    def test_brand_colour_renders_colour_and_card_stays_solid(self) -> None:
-        response = self.client.post(
-            "/settings/branding-background",
-            data={"mode": "color", "color": "#1A7F37", "csrf": self._csrf()},
-        )
-        self.assertEqual(response.status_code, 302)
-        page = self._signin_html()
-        self.assertIn("auth-bg-color", page)
-        self.assertIn("--auth-bg: #1a7f37", page)
-        self.assertIn('class="auth-card"', page)
-        css = (Path(__file__).resolve().parent.parent / "static" / "styles.css").read_text()
-        self.assertRegex(css, r"\.auth-bg-color \.auth-card[^{]*\{[^}]*background: var\(--surface\)")
-
-    def test_bad_colour_or_image_mode_without_upload_is_refused(self) -> None:
-        for data in ({"mode": "color", "color": "red;}"}, {"mode": "image"}, {"mode": "x"}):
-            response = self.client.post(
-                "/settings/branding-background", data={**data, "csrf": self._csrf()})
-            self.assertEqual(response.status_code, 400, data)
-        self.assertIsNone(self.database.setting("signin_background"))
-
-    def test_without_uploads_signin_is_unchanged(self) -> None:
-        page = self._signin_html()
-        self.assertNotIn("\"/brand/", page)
-        self.assertNotIn("auth-bg", page)
-        self.assertIn("brand-name", page)
-
-    def test_offline_signin_renders_stored_assets_and_upload_shows_offline(self) -> None:
-        self._upload("logo", PNG_BYTES)
-        csrf = self._csrf()
-        self.database.offline = True
-        self.assertIn("/brand/logo?v=", self._signin_html())
-        self.assertEqual(self.app.test_client().get("/brand/logo").status_code, 200)
-        with self.assertLogs("essl_hub.web", level="WARNING"):
-            response = self.client.post(
-                "/settings/branding/logo",
-                data={"image": (io.BytesIO(PNG_BYTES), "x.png"), "csrf": csrf},
-                content_type="multipart/form-data",
-            )
-        self.assertEqual(response.status_code, 503)
-        self.assertIn("Temporarily offline", response.text)
+    def test_stale_branding_settings_do_not_affect_signin(self) -> None:
+        self.database.set_setting("signin_background", "image")
+        self.database.set_setting("signin_background_color", "#112233")
+        page = self.app.test_client().get("/signin")
+        self.assertEqual(page.status_code, 200)
+        self.assertNotIn("auth-bg", page.text)
+        self.assertNotIn('"/brand/', page.text)
+        self.assertNotIn("#112233", page.text)
 
 
 class OfflineTest(unittest.TestCase):

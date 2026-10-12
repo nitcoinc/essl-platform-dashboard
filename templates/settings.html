@@ -5,7 +5,7 @@
 <header class="topbar">
   <div>
     <h1>Settings</h1>
-    <p>The daily target, when a work day starts, sign-in branding, and the keys your HRMS uses to read hours.</p>
+    <p>The daily target, when a work day starts, and the keys your HRMS uses to read hours.</p>
   </div>
 </header>
 
@@ -40,59 +40,6 @@
     {{ ui.button('Save start hour', 'primary', type='submit') }}
   </form>
   {% if day_start_saved %}<p class="device-note" role="status">{{ ui.icon('check') }}<span>Work days now start at {{ '%02d' % day_start_hour }}:00.</span></p>{% endif %}
-</section>
-
-<section class="admin-section" aria-labelledby="branding-heading">
-  <h2 id="branding-heading">Sign-in branding</h2>
-  <p class="section-intro">The logo and background on the sign-in, code and setup pages. PNG, JPEG or WebP. The sign-in card always stays solid so its text stays readable.</p>
-  {% if brand_error %}{{ ui.inline_error(brand_error) }}{% endif %}
-  {% if brand_saved %}<p class="device-note" role="status">{{ ui.icon('check') }}<span>{% if brand_saved.endswith('-reset') %}Reset to the default.{% else %}Branding saved.{% endif %}</span></p>{% endif %}
-
-  <h3>Logo</h3>
-  {% if brand_logo %}<div class="brand-preview"><img src="{{ url_for('auth.brand_asset', key='logo') }}" alt="Current sign-in logo"></div>{% endif %}
-  <form method="post" action="{{ url_for('admin.settings_upload_branding', key='logo') }}" enctype="multipart/form-data" class="target-form">
-    <input type="hidden" name="csrf" value="{{ csrf_token }}">
-    <div class="field">
-      <label for="brand-logo">Logo file</label>
-      <input id="brand-logo" type="file" name="image" accept="image/png,image/jpeg,image/webp" required aria-describedby="brand-logo-hint"{% if brand_error_key == 'logo' %} aria-invalid="true"{% endif %}>
-      <p class="field-hint" id="brand-logo-hint">Up to {{ brand_caps_kb.logo }} KB. Shown up to 180 x 48 px.</p>
-    </div>
-    {{ ui.button('Upload logo', 'primary', type='submit', icon_name='upload') }}
-  </form>
-  {% if brand_logo %}
-  <form method="post" action="{{ url_for('admin.settings_reset_branding', key='logo') }}">
-    <input type="hidden" name="csrf" value="{{ csrf_token }}">
-    {{ ui.button('Reset logo to default', 'secondary', type='submit') }}
-  </form>
-  {% endif %}
-
-  <h3>Background</h3>
-  {% if brand_background %}<div class="brand-preview"><img src="{{ url_for('auth.brand_asset', key='background') }}" alt="Current sign-in background"></div>{% endif %}
-  <form method="post" action="{{ url_for('admin.settings_upload_branding', key='background') }}" enctype="multipart/form-data" class="target-form">
-    <input type="hidden" name="csrf" value="{{ csrf_token }}">
-    <div class="field">
-      <label for="brand-background">Background image</label>
-      <input id="brand-background" type="file" name="image" accept="image/png,image/jpeg,image/webp" required aria-describedby="brand-background-hint"{% if brand_error_key == 'background' %} aria-invalid="true"{% endif %}>
-      <p class="field-hint" id="brand-background-hint">Up to {{ brand_caps_kb.background }} KB. Uploading switches the background to this image.</p>
-    </div>
-    {{ ui.button('Upload background', 'primary', type='submit', icon_name='upload') }}
-  </form>
-  {% if brand_background %}
-  <form method="post" action="{{ url_for('admin.settings_reset_branding', key='background') }}">
-    <input type="hidden" name="csrf" value="{{ csrf_token }}">
-    {{ ui.button('Reset background to default', 'secondary', type='submit') }}
-  </form>
-  {% endif %}
-  <form method="post" action="{{ url_for('admin.settings_set_background') }}" class="target-form">
-    <input type="hidden" name="csrf" value="{{ csrf_token }}">
-    <fieldset class="brand-modes">
-      <legend class="field-hint">Show behind the sign-in card</legend>
-      <label><input type="radio" name="mode" value="default"{% if background_mode == 'default' %} checked{% endif %}> Default</label>
-      <label><input type="radio" name="mode" value="color"{% if background_mode == 'color' %} checked{% endif %}> Brand colour <input type="color" name="color" value="{{ background_color }}" aria-label="Brand colour"></label>
-      <label><input type="radio" name="mode" value="image"{% if background_mode == 'image' %} checked{% endif %}{% if not brand_background %} disabled{% endif %}> Uploaded image</label>
-    </fieldset>
-    {{ ui.button('Save background', 'primary', type='submit') }}
-  </form>
 </section>
 
 <section class="admin-section" aria-labelledby="keys-heading">
