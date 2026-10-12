@@ -1105,8 +1105,8 @@ class LiveTodayTest(unittest.TestCase):
         self.assertNotIn("7:42:30", page)
 
 
-class QuickViewTest(unittest.TestCase):
-    """Quick-view drawer fragment: same Today context as /day, same access."""
+class _QuickViewBase(unittest.TestCase):
+    """Shared setup for the quick-view tests: Ravi plus a pinned clock."""
 
     DAY = datetime(2026, 9, 9)
 
@@ -1140,6 +1140,10 @@ class QuickViewTest(unittest.TestCase):
 
     def _quick(self, employee_id: int, query: str = ""):
         return self.client.get(f"/quick/{employee_id}{query}", headers={"HX-Request": "true"})
+
+
+class QuickViewTest(_QuickViewBase):
+    """Quick-view drawer fragment: same Today context as /day, same access."""
 
     def test_hr_gets_fragment_with_name_live_region_and_links(self) -> None:
         self._sign_in(self._person("1", "Hema HR", "hr"))
@@ -1190,6 +1194,34 @@ class QuickViewTest(unittest.TestCase):
         response = self.client.get(f"/quick/{self.ravi['id']}")
         self.assertEqual(response.status_code, 302)
         self.assertTrue(response.headers["Location"].endswith(f"/day?employee={self.ravi['id']}"))
+
+
+class QuickViewDrawerTest(_QuickViewBase):
+    """U6: one drawer in the shell, name links carry data-quick-view."""
+
+    def test_team_and_people_have_one_drawer_and_quick_view_links(self) -> None:
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        rid = self.ravi["id"]
+        team = self.client.get("/team").text
+        self.assertEqual(team.count('<dialog id="quick-view"'), 1)
+        self.assertIn(f'href="/day?employee={rid}" data-quick-view="/quick/{rid}"', team)
+        self.assertNotIn("hx-trigger", team.split('data-quick-view')[1][:200])
+        people = self.client.get("/people").text
+        self.assertEqual(people.count('<dialog id="quick-view"'), 1)
+        self.assertIn(f'href="/people/{rid}/edit" data-quick-view="/quick/{rid}?from=people"', people)
+
+    def test_day_loads_timer_once(self) -> None:
+        self._sign_in(self.ravi)
+        page = self.client.get("/day").text
+        self.assertEqual(page.count("timer.js"), 1)
+        self.assertEqual(page.count("quick-view.js"), 1)
+
+    def test_employee_day_renders_with_unused_drawer(self) -> None:
+        self._sign_in(self.ravi)
+        response = self.client.get(f"/day?employee={self.ravi['id']}")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('<dialog id="quick-view"', response.text)
+        self.assertNotIn("data-quick-view=", response.text)
 
 
 class AdminViewTest(unittest.TestCase):

@@ -853,3 +853,40 @@ input[type="file"]::file-selector-button {
 .device-retired { margin-bottom: var(--s8); }
 .device-retired > summary { margin-bottom: var(--s4); color: var(--text-secondary); }
 .device-retired .device { opacity: 0.85; }
+
+/* ---------- Quick-view drawer (U6) ----------
+   A right-anchored sheet. The dialog has no padding so a click on the dialog
+   itself is a backdrop click; content lives in .qv-panel. */
+.quick-view {
+  position: fixed; inset: 0 0 0 auto; margin: 0; padding: 0; border: 0;
+  width: min(460px, 100vw); max-width: 100vw; height: 100dvh; max-height: 100dvh;
+  background: var(--bg); color: var(--text); box-shadow: var(--shadow-card);
+  border-left: 1px solid var(--border);
+}
+.quick-view[open] { animation: qv-in 150ms var(--ease); }
+.quick-view::backdrop { background: rgba(10, 10, 14, 0.32); }
+@keyframes qv-in { from { transform: translateX(24px); opacity: 0; } to { transform: none; opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .quick-view[open] { animation: none; } }
+.qv-panel { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.qv-head {
+  position: sticky; top: 0; z-index: 1; display: flex; align-items: center; justify-content: space-between; gap: var(--s3);
+  padding: var(--s3) var(--s4) var(--s3) var(--s5); border-bottom: 1px solid var(--border); background: var(--bg);
+}
+.qv-name { margin: 0; font-size: var(--text-16); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qv-name:focus { outline: none; }
+.qv-name:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.qv-scroll { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: var(--s4) var(--s5); display: flex; flex-direction: column; gap: var(--s4); }
+.qv-identity { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s3) var(--s4); margin: 0; font-size: var(--text-13); }
+.qv-identity dt { color: var(--text-secondary); }
+.qv-identity dd { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qv-scroll .day-card { padding: var(--s4); }
+.qv-scroll .day-card-main { flex-direction: column; align-items: center; text-align: center; }
+.qv-scroll .day-facts-quiet { justify-content: center; }
+.qv-foot { display: flex; flex-wrap: wrap; gap: var(--s2); padding: var(--s3) var(--s5); border-top: 1px solid var(--border); background: var(--bg); }
+.qv-message { margin: 0; color: var(--text-secondary); }
+.qv-actions { display: flex; gap: var(--s2); margin: 0; }
+.qv-skel { display: block; border-radius: var(--radius); background: var(--surface-sunken); }
+.qv-skel-title { width: 160px; height: 18px; }
+.qv-skel-line { height: 14px; width: 70%; }
+.qv-skel-card { height: 220px; }
+@media (max-width: 767.98px) { .quick-view { width: 100vw; border-left: 0; } }

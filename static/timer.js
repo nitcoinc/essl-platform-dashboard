@@ -157,8 +157,36 @@
     return t && t.id === "day-live";
   }
 
+  function detached(event) {
+    var t = event.detail && event.detail.target;
+    return !t || !t.isConnected;
+  }
+
+  // (Re)start for whatever #day-live is on the page now: the Day page at
+  // load, or a region that arrived inside another swap (the quick view).
+  function init() {
+    clearTimeout(tickTimer);
+    clearTimeout(pollTimer);
+    failures = 0;
+    inflight = false;
+    before = null;
+    var r = region();
+    if (!r) {
+      return;
+    }
+    offset = anchor(r) - Date.now();
+    tick();
+    schedulePoll();
+  }
+
   document.body.addEventListener("htmx:beforeSwap", function (event) {
     if (!isOurs(event)) {
+      return;
+    }
+    if (detached(event)) {
+      // The region left (drawer closed) while this poll was in flight.
+      event.detail.shouldSwap = false;
+      before = null;
       return;
     }
     var r = region();
@@ -186,8 +214,24 @@
     tick();
   });
 
+  document.body.addEventListener("htmx:afterSwap", function (event) {
+    // Our own outerHTML poll is handled in afterSettle; any other swap that
+    // brought a #day-live in starts the timers afresh for it.
+    if (isOurs(event)) {
+      return;
+    }
+    var t = event.detail && event.detail.target;
+    var r = region();
+    if (r && t && t.contains(r)) {
+      init();
+    }
+  });
+
   document.body.addEventListener("htmx:afterRequest", function (event) {
     if (!isOurs(event)) {
+      return;
+    }
+    if (detached(event)) {
       return;
     }
     inflight = false;
@@ -212,11 +256,5 @@
     schedulePoll();
   });
 
-  var first = region();
-  if (!first) {
-    return;
-  }
-  offset = anchor(first) - Date.now();
-  tick();
-  schedulePoll();
+  init();
 })();

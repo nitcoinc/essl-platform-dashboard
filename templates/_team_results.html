@@ -24,7 +24,7 @@
       <tr>
         <td class="select-cell"><input type="checkbox" name="employee" value="{{ p.id }}" form="export-form" aria-label="Include {{ p.name }} in export"{{ ' checked' if p.id in selected_ids }}></td>
         <td class="person-cell">
-          <a class="person-name" href="{{ url_for('me.day_view', employee=p.id) }}">{{ p.name }}</a>
+          <a class="person-name" href="{{ url_for('me.day_view', employee=p.id) }}" data-quick-view="{{ url_for('me.quick_view', employee_id=p.id) }}">{{ p.name }}</a>
           <span class="person-email">{{ p.email }}</span>
         </td>
         <td data-label="Manager">{% if row.manager_name %}{{ row.manager_name }}{% else %}<span class="muted">-</span>{% endif %}</td>
