@@ -770,6 +770,7 @@ input[type="file"]::file-selector-button {
 .team-table .col-today { width: 15%; }
 .team-table .col-actions { width: 9%; }
 .team-table td { overflow: hidden; text-overflow: ellipsis; }
+.team-table td.select-cell { text-overflow: clip; }
 .team-table td[data-label="Manager"], .team-table .person-name, .team-table .person-email { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .team-table td.row-actions { overflow: visible; }
 @media (max-width: 767.98px) {
