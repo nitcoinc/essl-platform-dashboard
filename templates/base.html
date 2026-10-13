@@ -65,8 +65,11 @@
     <meta name="csrf-token" content="{{ g.csrf_token or '' }}">
     <title>{% block title %}eSSL Attendance Hub{% endblock %}</title>
     <link rel="preload" href="{{ url_for('static', filename='fonts/InterVariable-latin.woff2') }}" as="font" type="font/woff2" crossorigin>
+    {% include "_head_icons.html" %}
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
     <script src="{{ url_for('static', filename='vendor/htmx.min.js') }}" defer></script>
+    <script src="{{ url_for('static', filename='timer.js') }}" defer></script>
+    <script src="{{ url_for('static', filename='quick-view.js') }}" defer></script>
   </head>
   <body hx-headers='{"X-CSRF-Token": "{{ g.csrf_token or '' }}"}'>
     {% include "_icons.html" %}
@@ -105,6 +108,40 @@
         <div id="live-status" class="visually-hidden" role="status" aria-live="polite"></div>
       </main>
     </div>
+    {#- Quick-view drawer (U6): static/quick-view.js opens it on a plain click
+        of a [data-quick-view] link; the link's href is the no-JS fallback. -#}
+    <dialog id="quick-view" class="quick-view" aria-label="Person quick view">
+      <div class="qv-panel" id="quick-view-body"></div>
+    </dialog>
+    <template id="quick-view-loading">
+      <header class="qv-head">
+        <span class="qv-skel qv-skel-title" aria-hidden="true"></span>
+        <button type="button" class="button button-tertiary button-icon" data-qv-close aria-label="Close">{{ ui.icon('x') }}</button>
+      </header>
+      <div class="qv-scroll" aria-hidden="true">
+        <span class="qv-skel qv-skel-line"></span><span class="qv-skel qv-skel-line"></span>
+        <span class="qv-skel qv-skel-card"></span><span class="qv-skel qv-skel-line"></span>
+      </div>
+      <p class="visually-hidden">Loading</p>
+    </template>
+    <template id="quick-view-missing">
+      <header class="qv-head">
+        <h2 class="qv-name">Not available</h2>
+        <button type="button" class="button button-tertiary button-icon" data-qv-close aria-label="Close">{{ ui.icon('x') }}</button>
+      </header>
+      <div class="qv-scroll"><p class="qv-message" role="alert">This person is no longer available. The list may be out of date.</p></div>
+    </template>
+    <template id="quick-view-error">
+      <header class="qv-head">
+        <h2 class="qv-name">Something went wrong</h2>
+        <button type="button" class="button button-tertiary button-icon" data-qv-close aria-label="Close">{{ ui.icon('x') }}</button>
+      </header>
+      <div class="qv-scroll">
+        <p class="qv-message" role="alert">Could not load details.</p>
+        <p class="qv-actions"><button type="button" class="button button-secondary button-sm" data-qv-retry>Retry</button>
+        <a class="button button-tertiary button-sm" data-qv-full href="#">Open full page</a></p>
+      </div>
+    </template>
     <script>
       // Progressive enhancement: switch theme without a reload. Without JS the
       // form posts and the server redirects back with the cookie set.

@@ -8,6 +8,9 @@
 <div class="table-scroll">
   <table class="table hours-table team-table">
     <caption class="visually-hidden">{{ title }}, with today's hours and status</caption>
+    <colgroup>
+      <col class="col-select"><col class="col-person"><col class="col-manager"><col class="col-first"><col class="col-last"><col class="col-effective"><col class="col-today"><col class="col-actions">
+    </colgroup>
     <thead><tr>
       <th scope="col" class="select-cell"><span class="visually-hidden">Include in export</span></th>
       <th scope="col">Name</th><th scope="col">Manager</th>
@@ -21,7 +24,7 @@
       <tr>
         <td class="select-cell"><input type="checkbox" name="employee" value="{{ p.id }}" form="export-form" aria-label="Include {{ p.name }} in export"{{ ' checked' if p.id in selected_ids }}></td>
         <td class="person-cell">
-          <a class="person-name" href="{{ url_for('me.day_view', employee=p.id) }}">{{ p.name }}</a>
+          <a class="person-name" href="{{ url_for('me.day_view', employee=p.id) }}" data-quick-view="{{ url_for('me.quick_view', employee_id=p.id) }}">{{ p.name }}</a>
           <span class="person-email">{{ p.email }}</span>
         </td>
         <td data-label="Manager">{% if row.manager_name %}{{ row.manager_name }}{% else %}<span class="muted">-</span>{% endif %}</td>

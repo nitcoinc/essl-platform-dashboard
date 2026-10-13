@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import secrets
 
-from flask import Blueprint, Response, abort, current_app, g, redirect, render_template, request, url_for
+from flask import Blueprint, Response, abort, current_app, g, redirect, render_template, request, send_from_directory, url_for
 
 from .. import auth, turnstile
 from .common import (
@@ -188,23 +188,17 @@ def set_theme() -> Response:
     return response
 
 
-# --- Sign-in branding images (public, U6) ---------------------------
-
-BRAND_CONTENT_TYPES = frozenset({"image/png", "image/jpeg", "image/webp"})
-BRAND_MAX_AGE = 300
+FAVICON_MAX_AGE = 7 * 24 * 3600
 
 
-@bp.get("/brand/<key>")
-def brand_asset(key: str) -> Response:
-    # Public: the sign-in page shows these before anyone is signed in.
-    asset = database.branding_asset(key) if key in ("logo", "background") else None
-    if asset is None or asset["content_type"] not in BRAND_CONTENT_TYPES:
-        abort(404)
-    response = Response(asset["data"], mimetype=asset["content_type"])
-    response.set_etag(asset["sha256"])
-    # Overrides the global no-store; ?v=<sha> in the page busts it on change.
-    response.headers["Cache-Control"] = f"public, max-age={BRAND_MAX_AGE}"
-    return response.make_conditional(request)
+@bp.get("/favicon.ico")
+def favicon() -> Response:
+    # Public: browsers ask for /favicon.ico before anyone signs in.
+    response = send_from_directory(
+        current_app.static_folder, "brand/favicon.ico", mimetype="image/x-icon", max_age=FAVICON_MAX_AGE
+    )
+    response.headers["Cache-Control"] = f"public, max-age={FAVICON_MAX_AGE}"
+    return response
 
 
 @bp.get("/")

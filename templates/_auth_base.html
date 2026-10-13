@@ -7,23 +7,24 @@
     <meta name="color-scheme" content="{{ 'light dark' if theme == 'system' else theme }}">
     <link rel="preload" href="{{ url_for('static', filename='fonts/InterVariable-latin.woff2') }}" as="font" type="font/woff2" crossorigin>
     <title>{% block title %}{% endblock %} - eSSL Attendance Hub</title>
+    {% include "_head_icons.html" %}
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
     {% if turnstile_site_key %}<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>{% endif %}
   </head>
   <body>
     {% include "_icons.html" %}
-    {% set b = signin_branding() %}
-    {# The background sits behind a solid card, never under text (DESIGN.md). #}
-    <main class="auth-wrap{% if b.mode == 'color' %} auth-bg-color{% elif b.mode == 'image' %} auth-bg-image{% endif %}"
-      {%- if b.mode == 'color' %} style="--auth-bg: {{ b.color }}"{% elif b.mode == 'image' %} style="--auth-bg-image: url('{{ url_for('auth.brand_asset', key='background', v=b.background_version) }}')"{% endif %}>
-      <div class="auth-card">
-        {% if b.logo_version %}
-        <div class="auth-brand auth-logo"><img src="{{ url_for('auth.brand_asset', key='logo', v=b.logo_version) }}" alt="Attendance Hub"></div>
-        {% else %}
-        <div class="brand auth-brand"><span class="brand-mark">{{ ui.icon('scan-line') }}</span><span class="brand-name">Attendance Hub</span></div>
-        {% endif %}
-        {% block card %}{% endblock %}
-      </div>
-    </main>
+    <div class="auth-layout">
+      <header class="auth-panel">
+        <div class="auth-panel-brand">
+          <img class="auth-wordmark" src="{{ url_for('static', filename='brand/wordmark-white.png') }}" alt="NITCO" width="640" height="175">
+          <p class="auth-product">Attendance Hub</p>
+        </div>
+      </header>
+      <main class="auth-wrap">
+        <div class="auth-card">
+          {% block card %}{% endblock %}
+        </div>
+      </main>
+    </div>
   </body>
 </html>

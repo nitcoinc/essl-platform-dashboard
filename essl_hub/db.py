@@ -1420,39 +1420,6 @@ class Database:
                 (key, value),
             )
 
-    # --- Sign-in branding (U6) -------------------------------------------
-
-    def branding_versions(self) -> dict[str, str]:
-        """key -> sha256 for every stored asset, without loading the bytes."""
-        with self.connect() as connection:
-            rows = connection.execute("SELECT key, sha256 FROM branding_assets").fetchall()
-        return {row["key"]: row["sha256"] for row in rows}
-
-    def branding_asset(self, key: str) -> dict | None:
-        with self.connect() as connection:
-            row = connection.execute(
-                "SELECT key, content_type, data, sha256, updated_at "
-                "FROM branding_assets WHERE key=?",
-                (key,),
-            ).fetchone()
-        if row is None:
-            return None
-        return {**row, "data": bytes(row["data"])}
-
-    def set_branding_asset(self, key: str, *, content_type: str, data: bytes, sha256: str) -> None:
-        with self.transaction() as connection:
-            connection.execute(
-                "INSERT INTO branding_assets (key, content_type, data, sha256, updated_at) "
-                "VALUES (?, ?, ?, ?, ?) ON CONFLICT (key) DO UPDATE SET "
-                "content_type = excluded.content_type, data = excluded.data, "
-                "sha256 = excluded.sha256, updated_at = excluded.updated_at",
-                (key, content_type, data, sha256, _now()),
-            )
-
-    def delete_branding_asset(self, key: str) -> None:
-        with self.transaction() as connection:
-            connection.execute("DELETE FROM branding_assets WHERE key=?", (key,))
-
 
 def _manager_chain(connection: _Connection, employee_id: int) -> list[int]:
     # UNION (not UNION ALL) stops on a pre-existing cycle instead of looping.

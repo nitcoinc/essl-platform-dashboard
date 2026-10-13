@@ -3,7 +3,7 @@
 {% block card %}
 <div class="auth-title">
   <h1>Check your email</h1>
-  <p>If {% if email %}<strong>{{ email }}</strong>{% else %}that address{% endif %} is on the roster, a 6-digit code is on its way. It expires in 5 minutes.</p>
+  <p>If {% if email %}<strong>{{ email }}</strong>{% else %}that address{% endif %} is on the roster, a 6&#8209;digit code is on its way. It expires in 5 minutes.</p>
 </div>
 {% if error_kind in ('expired', 'locked') %}
 <div class="auth-error" role="alert">{{ ui.icon('circle-alert') }}<span>{{ error }}</span></div>

@@ -53,7 +53,6 @@ class FakeDatabase:
         self._next_login_code_id = 1
         self.sessions: dict[str, dict] = {}
         self.api_keys_list: list[dict] = []
-        self.branding: dict[str, dict] = {}
         # Local mode by default: no sync loop. `offline` makes every write
         # raise OfflineError the way a degraded replica does (KTD11).
         self.replica = False
@@ -440,30 +439,30 @@ class FakeDatabase:
     def set_setting(self, key: str, value: str) -> None:
         self.settings[key] = value
 
-    # branding -------------------------------------------------------------
-
-    def branding_versions(self) -> dict:
-        return {k: a["sha256"] for k, a in self.branding.items()}
-
-    def branding_asset(self, key: str):
-        asset = self.branding.get(key)
-        return dict(asset, key=key) if asset else None
-
-    def set_branding_asset(self, key: str, *, content_type: str, data: bytes, sha256: str) -> None:
-        self._check_online()
-        self.branding[key] = {
-            "content_type": content_type, "data": data, "sha256": sha256}
-
-    def delete_branding_asset(self, key: str) -> None:
-        self._check_online()
-        self.branding.pop(key, None)
-
 
 def _make_app():
     database = FakeDatabase()
     app = create_app(database=database)
     app.testing = True
     return app, database
+
+
+def _assert_auth_layout(test: unittest.TestCase, html: str, heading: str) -> None:
+    """U3: every auth page shares the NITCO split layout."""
+    test.assertIn('class="auth-panel"', html)
+    test.assertIn('alt="NITCO"', html)
+    test.assertIn("brand/wordmark-white.png", html)
+    test.assertIn("Attendance Hub</p>", html)
+    test.assertNotIn("auth-brand", html)
+    test.assertNotIn("brand-mark", html)
+    test.assertNotIn("auth-bg", html)
+    test.assertNotIn('"/brand/', html)
+    test.assertEqual(html.count("<main"), 1)
+    test.assertIn(f"<h1>{heading}</h1>", html)
+    # The brand panel sits before main; the heading precedes any form.
+    test.assertLess(html.index('class="auth-panel"'), html.index("<main"))
+    if "<form" in html:
+        test.assertLess(html.index("<h1>"), html.index("<form"))
 
 
 class TurnstileSigninTest(unittest.TestCase):
@@ -486,6 +485,26 @@ class TurnstileSigninTest(unittest.TestCase):
         self.assertIn('data-sitekey="site-key-1"', page)
         self.assertIn("challenges.cloudflare.com/turnstile/v0/api.js", page)
         self.assertNotIn("secret-1", page)
+
+    def test_widget_renders_inside_the_form_column(self) -> None:
+        page = self.client.get("/signin").text
+        main = page[page.index("<main"):page.index("</main>")]
+        form = main[main.index("<form"):main.index("</form>")]
+        self.assertIn('class="cf-turnstile auth-turnstile"', form)
+        self.assertNotIn("cf-turnstile", page[:page.index("<main")])
+
+    def test_signin_renders_brand_panel_and_email_form(self) -> None:
+        page = self.client.get("/signin").text
+        _assert_auth_layout(self, page, "Sign in")
+        self.assertIn('name="email"', page)
+
+    def test_code_page_uses_the_same_layout(self) -> None:
+        with patch("essl_hub.turnstile.verify", return_value=True):
+            page = self.client.post(
+                "/signin", data={"email": "ravi.kumar@example.com", "cf-turnstile-response": "tok"}
+            ).text
+        _assert_auth_layout(self, page, "Check your email")
+        self.assertIn('name="code"', page)
 
     def test_failed_check_sends_nothing(self) -> None:
         with patch("essl_hub.turnstile.verify", return_value=False) as verify:
@@ -1084,6 +1103,125 @@ class LiveTodayTest(unittest.TestCase):
         page = self.client.get("/week").text
         self.assertIn("7h 42m", page)
         self.assertNotIn("7:42:30", page)
+
+
+class _QuickViewBase(unittest.TestCase):
+    """Shared setup for the quick-view tests: Ravi plus a pinned clock."""
+
+    DAY = datetime(2026, 9, 9)
+
+    def setUp(self) -> None:
+        self.app, self.database = _make_app()
+        self.client = self.app.test_client()
+        from essl_hub import mail as mail_module
+
+        self.captured = {}
+        original = mail_module.send_login_code
+        mail_module.send_login_code = lambda e, c: self.captured.update(code=c)
+        self.addCleanup(lambda: setattr(mail_module, "send_login_code", original))
+        self.ravi = self._person("118", "Ravi Kumar")
+        common, me = _fixed_now(self.DAY + timedelta(hours=11))
+        common.start()
+        me.start()
+        self.addCleanup(common.stop)
+        self.addCleanup(me.stop)
+
+    def _person(self, uid: str, name: str, role: str = "employee") -> dict:
+        email = f"{uid}@example.com"
+        self.database.upsert_employee(device_user_id=uid, name=name, email=email)
+        person = self.database.employee_by_email(email)
+        if role != "employee":
+            self.database.set_employee_role(person["id"], role)
+        return self.database.employee_by_email(email)
+
+    def _sign_in(self, person: dict) -> None:
+        self.client.post("/signin", data={"email": person["email"]})
+        self.client.post("/signin/verify", data={"code": self.captured["code"]})
+
+    def _quick(self, employee_id: int, query: str = ""):
+        return self.client.get(f"/quick/{employee_id}{query}", headers={"HX-Request": "true"})
+
+
+class QuickViewTest(_QuickViewBase):
+    """Quick-view drawer fragment: same Today context as /day, same access."""
+
+    def test_hr_gets_fragment_with_name_live_region_and_links(self) -> None:
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        response = self._quick(self.ravi["id"])
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("HX-Request", response.headers.get("Vary", ""))
+        page = response.text
+        self.assertNotIn("<html", page)
+        self.assertIn('id="quick-view-title"', page)
+        self.assertIn(">Ravi Kumar</h2>", page)
+        self.assertIn('id="day-live"', page)
+        self.assertIn(f'href="/day?employee={self.ravi["id"]}"', page)
+        self.assertIn(f'href="/week?employee={self.ravi["id"]}"', page)
+
+    def test_person_inside_gets_live_region_polling_their_day(self) -> None:
+        self.database.insert_punches([_punch_row("qv-1", self.DAY + timedelta(hours=9), "entry")])
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        page = self._quick(self.ravi["id"]).text
+        self.assertIn('data-live="true"', page)
+        self.assertIn(f'data-poll="/day?employee={self.ravi["id"]}&amp;date=2026-09-09"', page)
+
+    def test_edit_details_only_from_people_for_editors(self) -> None:
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        self.assertIn("Edit details", self._quick(self.ravi["id"], "?from=people").text)
+        self.assertNotIn("Edit details", self._quick(self.ravi["id"]).text)
+
+    def test_manager_sees_subtree_only_and_unknown_is_404(self) -> None:
+        boss = self._person("900", "Boss", "manager")
+        other = self._person("901", "Other")
+        self.database.set_employee_manager(self.ravi["id"], boss["id"])
+        self._sign_in(boss)
+        self.assertEqual(self._quick(self.ravi["id"]).status_code, 200)
+        self.assertEqual(self._quick(other["id"]).status_code, 404)
+        self.assertEqual(self._quick(99999).status_code, 404)
+        self.assertNotIn("Edit details", self._quick(self.ravi["id"], "?from=people").text)
+
+    def test_no_punches_shows_empty_state(self) -> None:
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        self.assertIn("No punches yet today", self._quick(self.ravi["id"]).text)
+
+    def test_expired_session_gets_hx_redirect(self) -> None:
+        response = self._quick(self.ravi["id"])
+        self.assertEqual(response.headers.get("HX-Redirect"), "/signin")
+        self.assertNotIn("<form", response.text)
+
+    def test_plain_get_redirects_to_full_day(self) -> None:
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        response = self.client.get(f"/quick/{self.ravi['id']}")
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.headers["Location"].endswith(f"/day?employee={self.ravi['id']}"))
+
+
+class QuickViewDrawerTest(_QuickViewBase):
+    """U6: one drawer in the shell, name links carry data-quick-view."""
+
+    def test_team_and_people_have_one_drawer_and_quick_view_links(self) -> None:
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        rid = self.ravi["id"]
+        team = self.client.get("/team").text
+        self.assertEqual(team.count('<dialog id="quick-view"'), 1)
+        self.assertIn(f'href="/day?employee={rid}" data-quick-view="/quick/{rid}"', team)
+        self.assertNotIn("hx-trigger", team.split('data-quick-view')[1][:200])
+        people = self.client.get("/people").text
+        self.assertEqual(people.count('<dialog id="quick-view"'), 1)
+        self.assertIn(f'href="/people/{rid}/edit" data-quick-view="/quick/{rid}?from=people"', people)
+
+    def test_day_loads_timer_once(self) -> None:
+        self._sign_in(self.ravi)
+        page = self.client.get("/day").text
+        self.assertEqual(page.count("timer.js"), 1)
+        self.assertEqual(page.count("quick-view.js"), 1)
+
+    def test_employee_day_renders_with_unused_drawer(self) -> None:
+        self._sign_in(self.ravi)
+        response = self.client.get(f"/day?employee={self.ravi['id']}")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('<dialog id="quick-view"', response.text)
+        self.assertNotIn("data-quick-view=", response.text)
 
 
 class AdminViewTest(unittest.TestCase):
@@ -1986,6 +2124,8 @@ class SetupPageTest(unittest.TestCase):
         response = app.test_client().get("/setup")
         self.assertEqual(response.status_code, 200)
         self.assertIn("First-time setup", response.text)
+        _assert_auth_layout(self, response.text, "First-time setup")
+        self.assertIn('name="setup_token"', response.text)
 
     def test_wrong_token_is_refused_and_creates_nobody(self) -> None:
         database = FakeDatabase()
@@ -2204,157 +2344,40 @@ class AppShellTest(unittest.TestCase):
 
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
-SVG_BYTES = b'<svg xmlns="http://www.w3.org/2000/svg"></svg>'
 
 
-class BrandingTest(unittest.TestCase):
-    """U6: sign-in logo and background (R10, R11)."""
+class BrandingRemovedTest(unittest.TestCase):
+    """U2: the admin sign-in branding feature is gone; stale settings are ignored."""
 
     setUp = AdminViewTest.setUp
     _csrf = AdminViewTest._csrf
 
-    def _upload(self, key: str, data: bytes, name: str = "logo.png"):
-        return self.client.post(
-            f"/settings/branding/{key}",
-            data={"image": (io.BytesIO(data), name), "csrf": self._csrf()},
-            content_type="multipart/form-data",
-        )
+    def test_settings_page_has_no_branding_section(self) -> None:
+        html = self.client.get("/settings").text
+        self.assertNotIn("Sign-in branding", html)
+        self.assertNotIn("/settings/branding", html)
 
-    def _signin_html(self) -> str:
-        return self.app.test_client().get("/signin").text
-
-    def test_valid_png_logo_is_stored_referenced_and_served(self) -> None:
-        response = self._upload("logo", PNG_BYTES)
-        self.assertEqual(response.status_code, 302)
-        page = self._signin_html()
-        self.assertRegex(page, r'/brand/logo\?v=[0-9a-f]{12}')
-        served = self.app.test_client().get("/brand/logo")
-        self.assertEqual(served.status_code, 200)
-        self.assertEqual(served.mimetype, "image/png")
-        self.assertEqual(served.data, PNG_BYTES)
-        self.assertTrue(served.headers.get("ETag"))
-        self.assertIn("max-age", served.headers["Cache-Control"])
-        self.assertNotIn("no-store", served.headers["Cache-Control"])
-        self.assertEqual(served.headers["X-Content-Type-Options"], "nosniff")
-
-    def test_jpeg_and_webp_are_sniffed_by_magic_bytes(self) -> None:
-        from essl_hub.routes.admin import sniff_image_type
-
-        self.assertEqual(sniff_image_type(b"\xff\xd8\xff\xe0rest"), "image/jpeg")
-        self.assertEqual(sniff_image_type(b"RIFF\x00\x00\x00\x00WEBPVP8 "), "image/webp")
-        self.assertIsNone(sniff_image_type(SVG_BYTES))
-
-    def test_svg_or_renamed_text_is_rejected_inline(self) -> None:
-        for data, name in ((SVG_BYTES, "logo.svg"), (b"hello world", "logo.png")):
-            response = self._upload("logo", data, name)
-            self.assertEqual(response.status_code, 400, name)
-            self.assertIn("Upload a PNG, JPEG or WebP image", response.text)
-        self.assertEqual(self.database.branding_versions(), {})
-
-    def test_over_per_asset_cap_is_rejected_inline(self) -> None:
-        response = self._upload("logo", PNG_BYTES + b"\x00" * (512 * 1024))
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("larger than 512 KB", response.text)
-
-    def test_over_request_limit_renders_settings_error_not_import_page(self) -> None:
+    def test_branding_routes_are_gone(self) -> None:
         csrf = self._csrf()
-        self.app.config["MAX_CONTENT_LENGTH"] = 1024
-        response = self.client.post(
-            "/settings/branding/background",
-            data={"image": (io.BytesIO(PNG_BYTES + b"\x00" * 4096), "bg.png"), "csrf": csrf},
-            content_type="multipart/form-data",
-        )
-        self.assertEqual(response.status_code, 413)
-        self.assertIn("Sign-in branding", response.text)
-        self.assertIn("Use a smaller image", response.text)
-        self.assertNotIn("Upload roster", response.text)
+        for path in ("/settings/branding/logo", "/settings/branding/logo/reset", "/settings/branding-background"):
+            with self.subTest(path=path):
+                response = self.client.post(
+                    path,
+                    data={"image": (io.BytesIO(PNG_BYTES), "logo.png"), "mode": "color",
+                          "color": "#112233", "csrf": csrf},
+                    content_type="multipart/form-data",
+                )
+                self.assertIn(response.status_code, (404, 405))
+        self.assertEqual(self.client.get("/brand/logo").status_code, 404)
 
-    def test_conditional_get_with_matching_etag_returns_304(self) -> None:
-        self._upload("logo", PNG_BYTES)
-        client = self.app.test_client()
-        etag = client.get("/brand/logo").headers["ETag"]
-        response = client.get("/brand/logo", headers={"If-None-Match": etag})
-        self.assertEqual(response.status_code, 304)
-
-    def test_public_get_works_and_non_admin_upload_is_refused(self) -> None:
-        self._upload("logo", PNG_BYTES)
-        self.assertEqual(self.app.test_client().get("/brand/logo").status_code, 200)
-        self.assertEqual(self.app.test_client().get("/brand/other").status_code, 404)
-        anon = self.app.test_client().post(
-            "/settings/branding/logo", data={"image": (io.BytesIO(PNG_BYTES), "x.png")},
-            content_type="multipart/form-data",
-        )
-        self.assertIn(anon.status_code, (302, 401, 403))
-        before = self.database.branding_versions()
-        csrf = self._csrf()
-        admin = self.database.employee_by_email("admin@example.com")
-        self.database.employees_by_id[admin["id"]]["role"] = "hr"
-        response = self.client.post(
-            "/settings/branding/logo",
-            data={"image": (io.BytesIO(PNG_BYTES + b"x"), "x.png"), "csrf": csrf},
-            content_type="multipart/form-data",
-        )
-        self.assertIn(response.status_code, (403, 404))
-        self.assertEqual(self.database.branding_versions(), before)
-
-    def test_reset_removes_asset_and_signin_falls_back(self) -> None:
-        self._upload("logo", PNG_BYTES)
-        response = self.client.post("/settings/branding/logo/reset", data={"csrf": self._csrf()})
-        self.assertEqual(response.status_code, 302)
-        page = self._signin_html()
-        self.assertNotIn("/brand/logo", page)
-        self.assertIn("brand-name", page)
-        self.assertEqual(self.app.test_client().get("/brand/logo").status_code, 404)
-
-    def test_background_image_upload_and_reset(self) -> None:
-        self._upload("background", PNG_BYTES, "bg.png")
-        page = self._signin_html()
-        self.assertIn("auth-bg-image", page)
-        self.assertRegex(page, r"/brand/background\?v=[0-9a-f]{12}")
-        self.client.post("/settings/branding/background/reset", data={"csrf": self._csrf()})
-        self.assertNotIn("auth-bg", self._signin_html())
-        self.assertEqual(self.database.setting("signin_background"), "default")
-
-    def test_brand_colour_renders_colour_and_card_stays_solid(self) -> None:
-        response = self.client.post(
-            "/settings/branding-background",
-            data={"mode": "color", "color": "#1A7F37", "csrf": self._csrf()},
-        )
-        self.assertEqual(response.status_code, 302)
-        page = self._signin_html()
-        self.assertIn("auth-bg-color", page)
-        self.assertIn("--auth-bg: #1a7f37", page)
-        self.assertIn('class="auth-card"', page)
-        css = (Path(__file__).resolve().parent.parent / "static" / "styles.css").read_text()
-        self.assertRegex(css, r"\.auth-bg-color \.auth-card[^{]*\{[^}]*background: var\(--surface\)")
-
-    def test_bad_colour_or_image_mode_without_upload_is_refused(self) -> None:
-        for data in ({"mode": "color", "color": "red;}"}, {"mode": "image"}, {"mode": "x"}):
-            response = self.client.post(
-                "/settings/branding-background", data={**data, "csrf": self._csrf()})
-            self.assertEqual(response.status_code, 400, data)
-        self.assertIsNone(self.database.setting("signin_background"))
-
-    def test_without_uploads_signin_is_unchanged(self) -> None:
-        page = self._signin_html()
-        self.assertNotIn("/brand/", page)
-        self.assertNotIn("auth-bg", page)
-        self.assertIn("brand-name", page)
-
-    def test_offline_signin_renders_stored_assets_and_upload_shows_offline(self) -> None:
-        self._upload("logo", PNG_BYTES)
-        csrf = self._csrf()
-        self.database.offline = True
-        self.assertIn("/brand/logo?v=", self._signin_html())
-        self.assertEqual(self.app.test_client().get("/brand/logo").status_code, 200)
-        with self.assertLogs("essl_hub.web", level="WARNING"):
-            response = self.client.post(
-                "/settings/branding/logo",
-                data={"image": (io.BytesIO(PNG_BYTES), "x.png"), "csrf": csrf},
-                content_type="multipart/form-data",
-            )
-        self.assertEqual(response.status_code, 503)
-        self.assertIn("Temporarily offline", response.text)
+    def test_stale_branding_settings_do_not_affect_signin(self) -> None:
+        self.database.set_setting("signin_background", "image")
+        self.database.set_setting("signin_background_color", "#112233")
+        page = self.app.test_client().get("/signin")
+        self.assertEqual(page.status_code, 200)
+        self.assertNotIn("auth-bg", page.text)
+        self.assertNotIn('"/brand/', page.text)
+        self.assertNotIn("#112233", page.text)
 
 
 class OfflineTest(unittest.TestCase):
@@ -2388,6 +2411,7 @@ class OfflineTest(unittest.TestCase):
         response = self.app.test_client().post("/signin", data={"email": "admin@example.com"})
         self.assertEqual(response.status_code, 503)
         self.assertIn("Temporarily offline", response.text)
+        _assert_auth_layout(self, response.text, "Temporarily offline")
         self.assertEqual(self.captured, {})
 
 
@@ -2557,6 +2581,25 @@ class RolesAndVisibilityTest(unittest.TestCase):
         self.assertNotIn("<html", partial.text)
         self.assertIn("HX-Request", restore.headers.get("Vary", ""))
         self.assertIn("HX-Request", partial.headers.get("Vary", ""))
+
+    def test_team_table_has_a_colgroup_matching_its_header(self) -> None:
+        a, *_ = self._team()
+        self._sign_in(a)
+        for headers in ({}, {"HX-Request": "true"}):
+            page = self.client.get("/team?q=p4", headers=headers)
+            table = re.search(r'<table class="[^"]*team-table.*?</table>', page.text, re.S).group(0)
+            colgroup = re.search(r"<colgroup>(.*?)</colgroup>", table, re.S)
+            self.assertIsNotNone(colgroup, headers)
+            head = re.search(r"<thead>(.*?)</thead>", table, re.S).group(1)
+            self.assertEqual(colgroup.group(1).count("<col "), head.count("<th "), headers)
+
+    def test_team_history_restore_keeps_full_page_with_colgroup(self) -> None:
+        a, *_ = self._team()
+        self._sign_in(a)
+        restore = self.client.get("/team", headers={"HX-Request": "true", "HX-History-Restore-Request": "true"})
+        self.assertIn("<html", restore.text)
+        self.assertIn("<colgroup>", restore.text)
+        self.assertIn("HX-Request", restore.headers.get("Vary", ""))
 
     def test_team_puts_incomplete_and_empty_days_first(self) -> None:
         a, b, c, _ = self._team()
@@ -3254,3 +3297,43 @@ class SyncHealthTest(unittest.TestCase):
     def test_local_mode_is_neutral(self) -> None:
         health = self._health(web=None, collector=None, exports=None, local=True)
         self.assertEqual((health["tone"], health["label"]), ("neutral", "Local database"))
+
+
+class BrandIconsTest(unittest.TestCase):
+    """U1: the NITCO favicon set on every page."""
+
+    setUp = HoursRenderingTest.setUp
+    _sign_in = HoursRenderingTest._sign_in
+
+    ICON_HREF = re.compile(r'<link rel="(?:icon|apple-touch-icon)"[^>]*href="([^"]+)"')
+
+    def _icon_hrefs(self, html: str) -> list[str]:
+        return self.ICON_HREF.findall(html)
+
+    def test_signin_and_app_pages_link_existing_brand_icons(self) -> None:
+        static_root = Path(self.app.static_folder)
+        signin = self.client.get("/signin").get_data(as_text=True)
+        self._sign_in()
+        day = self.client.get("/day").get_data(as_text=True)
+        for html in (signin, day):
+            hrefs = self._icon_hrefs(html)
+            self.assertGreaterEqual(len(hrefs), 5)
+            for href in hrefs:
+                self.assertTrue(href.startswith("/static/brand/"), href)
+                self.assertTrue((static_root / href.removeprefix("/static/")).is_file(), href)
+
+    def test_head_icons_template_paths_resolve_on_disk(self) -> None:
+        source = Path(self.app.template_folder) / "_head_icons.html"
+        names = re.findall(r"filename='([^']+)'", source.read_text())
+        self.assertTrue(names)
+        for name in names:
+            self.assertTrue((Path(self.app.static_folder) / name).is_file(), name)
+
+    def test_root_favicon_is_public_and_long_cached(self) -> None:
+        response = self.app.test_client().get("/favicon.ico")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("icon", response.mimetype)
+        cache = response.headers.get("Cache-Control", "")
+        self.assertIn("max-age", cache)
+        self.assertNotIn("no-store", cache)
+        response.close()

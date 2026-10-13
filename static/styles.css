@@ -29,7 +29,6 @@
   --accent-hover: #2a43a8;
   --accent-text: #ffffff;
   --accent-subtle: #eef1fc;
-  --auth-scrim: rgba(255, 255, 255, 0);
 
   /* Semantic roles */
   --bg: var(--gray-25);
@@ -116,7 +115,6 @@
     --accent-hover: #9aabf8;
     --accent-text: #0e0e10;
     --accent-subtle: #1c2140;
-    --auth-scrim: rgba(14, 14, 16, 0.55);
 
     --hover: rgba(236, 236, 240, 0.06);
 
@@ -156,7 +154,6 @@
     --accent-hover: #9aabf8;
     --accent-text: #0e0e10;
     --accent-subtle: #1c2140;
-    --auth-scrim: rgba(14, 14, 16, 0.55);
 
     --hover: rgba(236, 236, 240, 0.06);
 
@@ -590,31 +587,64 @@ input[type="file"]::file-selector-button {
 .notice + .admin-section { margin-top: var(--s6); }
 .roster-drop { padding: var(--s5); background: var(--surface); border: 1px dashed var(--border-input); border-radius: var(--radius-lg); }
 
-/* ---------- Auth pages ---------- */
-.auth-wrap { min-height: 100vh; min-height: 100dvh; display: grid; place-items: center; padding: var(--s6) var(--s4); }
-.auth-card { width: 100%; max-width: 360px; display: flex; flex-direction: column; gap: var(--s4); }
-.auth-title h1 { font-size: var(--text-20); }
-.auth-title p { margin-top: var(--s1); color: var(--text-secondary); }
-.auth-card form { display: flex; flex-direction: column; gap: var(--s3); }
-.auth-card .button { width: 100%; }
-.auth-brand { padding: 0; margin-bottom: var(--s2); }
-.auth-card .auth-error { margin-top: 0; }
-/* Sign-in branding (U6): the background stays behind a solid card so card
-   text keeps its normal AA contrast in both themes. */
-.auth-bg-color { background: var(--auth-bg); }
-.auth-bg-image { background: linear-gradient(var(--auth-scrim), var(--auth-scrim)), var(--auth-bg-image) center / cover no-repeat, var(--bg); }
-.auth-bg-color .auth-card, .auth-bg-image .auth-card {
-  padding: var(--s6); background: var(--surface); border: 1px solid var(--border-strong);
-  border-radius: var(--radius-lg); box-shadow: var(--shadow-card);
+/* ---------- Auth pages ----------
+   Split layout: a fixed brand panel (identical in both themes, brand-only
+   colours) beside a theme-token form column. Below 1024px the panel becomes a
+   top band; below 500px of height it collapses to a slim wordmark strip. */
+.auth-layout { min-height: 100vh; min-height: 100dvh; display: grid; grid-template-columns: minmax(0, 11fr) minmax(440px, 9fr); background: var(--bg); }
+.auth-panel {
+  position: sticky; top: 0; height: 100vh; height: 100dvh; overflow: hidden; isolation: isolate;
+  display: flex; flex-direction: column; padding: var(--s12);
+  background-color: #04508f;
+  background-image: url("brand/wave.jpg");
+  background-image: image-set(url("brand/wave.webp") type("image/webp"), url("brand/wave.jpg") type("image/jpeg"));
+  background-size: cover; background-position: 30% 50%; background-repeat: no-repeat;
 }
-.auth-logo img { display: block; max-width: 180px; max-height: 48px; width: auto; height: auto; }
-.brand-preview { display: flex; align-items: center; gap: var(--s4); flex-wrap: wrap; margin-bottom: var(--s3); }
-.brand-preview img { max-width: 180px; max-height: 64px; padding: var(--s2); background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius); }
-.brand-modes { display: flex; flex-direction: column; gap: var(--s2); border: 0; padding: 0; margin: 0; }
-.brand-modes label { display: flex; align-items: center; gap: var(--s2); font-size: var(--text-13); }
-.brand-modes input[type="color"] { width: 44px; height: 28px; padding: 0; }
+/* Fixed scrim behind the wordmark so text stays above 4.5:1 on any crop. */
+.auth-panel::before {
+  content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none;
+  background: linear-gradient(160deg, rgba(1, 28, 72, 0.55) 0%, rgba(1, 28, 72, 0.18) 45%, rgba(1, 28, 72, 0) 70%);
+}
+.auth-panel-brand { display: flex; flex-direction: column; gap: var(--s3); }
+.auth-wordmark { display: block; width: 196px; height: auto; }
+.auth-product { color: #ffffff; font-size: var(--text-16); font-weight: 500; letter-spacing: 0.01em; padding-left: 2px; }
+.auth-wrap { display: grid; place-items: center; padding: var(--s10) var(--s8); }
+.auth-card { width: 100%; max-width: 380px; display: flex; flex-direction: column; gap: var(--s5); }
+.auth-title h1 { font-size: var(--text-28); line-height: 1.2; letter-spacing: -0.015em; }
+.auth-title p { margin-top: var(--s2); color: var(--text-secondary); text-wrap: pretty; hyphens: manual; }
+.auth-card form { display: flex; flex-direction: column; gap: var(--s4); }
+.auth-card .button { width: 100%; }
+.auth-card .auth-error { margin-top: 0; }
 .code-input { font-size: var(--text-20) !important; letter-spacing: 0.3em; font-variant-numeric: tabular-nums; }
 .auth-note { font-size: var(--text-13); color: var(--text-secondary); }
+
+@media (max-width: 1023.98px) {
+  .auth-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 1fr; }
+  .auth-panel { position: relative; height: 168px; padding: var(--s8); justify-content: flex-end; background-position: 70% 6%; }
+  .auth-panel::before { background: linear-gradient(90deg, rgba(1, 28, 72, 0.6) 0%, rgba(1, 28, 72, 0.3) 55%, rgba(1, 28, 72, 0.1) 100%); }
+  .auth-panel-brand { flex-direction: row; align-items: baseline; gap: var(--s3); }
+  .auth-wordmark { width: 128px; }
+  .auth-product { font-size: var(--text-14); }
+  .auth-wrap { place-items: start center; padding: var(--s12) var(--s6) var(--s10); }
+}
+@media (max-width: 767.98px) {
+  .auth-panel { height: 128px; padding: var(--s5) var(--s4); }
+  .auth-panel-brand { flex-direction: column; align-items: flex-start; gap: var(--s1); }
+  .auth-wordmark { width: 112px; }
+  .auth-product { font-size: var(--text-13); }
+  .auth-wrap { padding: var(--s8) var(--s4) var(--s6); }
+  .auth-card { gap: var(--s4); }
+  .auth-title h1 { font-size: var(--text-20); }
+  .auth-card form { gap: var(--s3); }
+}
+@media (max-height: 499.98px) {
+  .auth-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 1fr; }
+  .auth-panel { position: relative; height: 48px; padding: 0 var(--s4); justify-content: center; }
+  .auth-panel-brand { flex-direction: row; align-items: center; }
+  .auth-wordmark { width: 80px; }
+  .auth-product { display: none; }
+  .auth-wrap { place-items: start center; padding: var(--s6) var(--s4); }
+}
 
 /* ---------- Mobile (<768px) ---------- */
 @media (max-width: 767.98px) {
@@ -732,6 +762,20 @@ input[type="file"]::file-selector-button {
 /* ---------- Team ---------- */
 .topbar .subject-name { margin: 0 0 var(--s1); font-size: var(--text-16); font-weight: 600; color: var(--text); }
 .team-table td.num { white-space: nowrap; }
+.team-table { table-layout: fixed; min-width: 920px; }
+.team-table .col-select { width: 48px; }
+.team-table .col-person { width: 27%; }
+.team-table .col-manager { width: 17%; }
+.team-table .col-first, .team-table .col-last, .team-table .col-effective { width: 10%; }
+.team-table .col-today { width: 15%; }
+.team-table .col-actions { width: 9%; }
+.team-table td { overflow: hidden; text-overflow: ellipsis; }
+.team-table td[data-label="Manager"], .team-table .person-name, .team-table .person-email { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.team-table td.row-actions { overflow: visible; }
+@media (max-width: 767.98px) {
+  .team-table { table-layout: auto; min-width: 0; }
+  .team-table colgroup { display: none; }
+}
 .select-cell { width: 40px; }
 .export-panel { margin-top: var(--s10); padding-top: var(--s6); border-top: 1px solid var(--border); scroll-margin-top: var(--s6); }
 .export-panel h2 { font-size: var(--text-16); font-weight: 600; }
@@ -753,7 +797,7 @@ input[type="file"]::file-selector-button {
 .admin-section .empty-state { padding: var(--s5) 0; }
 
 /* Cloudflare Turnstile widget on the sign-in and setup cards */
-.auth-turnstile { margin: 4px 0 12px; min-height: 65px; }
+.auth-turnstile { min-height: 65px; }
 
 /* ---------- People sub-tabs and ID issues ---------- */
 /* The sub-tabs carry the rule under the header, so the topbar drops its own. */
@@ -809,3 +853,40 @@ input[type="file"]::file-selector-button {
 .device-retired { margin-bottom: var(--s8); }
 .device-retired > summary { margin-bottom: var(--s4); color: var(--text-secondary); }
 .device-retired .device { opacity: 0.85; }
+
+/* ---------- Quick-view drawer (U6) ----------
+   A right-anchored sheet. The dialog has no padding so a click on the dialog
+   itself is a backdrop click; content lives in .qv-panel. */
+.quick-view {
+  position: fixed; inset: 0 0 0 auto; margin: 0; padding: 0; border: 0;
+  width: min(460px, 100vw); max-width: 100vw; height: 100dvh; max-height: 100dvh;
+  background: var(--bg); color: var(--text); box-shadow: var(--shadow-card);
+  border-left: 1px solid var(--border);
+}
+.quick-view[open] { animation: qv-in 150ms var(--ease); }
+.quick-view::backdrop { background: rgba(10, 10, 14, 0.32); }
+@keyframes qv-in { from { transform: translateX(24px); opacity: 0; } to { transform: none; opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .quick-view[open] { animation: none; } }
+.qv-panel { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.qv-head {
+  position: sticky; top: 0; z-index: 1; display: flex; align-items: center; justify-content: space-between; gap: var(--s3);
+  padding: var(--s3) var(--s4) var(--s3) var(--s5); border-bottom: 1px solid var(--border); background: var(--bg);
+}
+.qv-name { margin: 0; font-size: var(--text-16); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qv-name:focus { outline: none; }
+.qv-name:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.qv-scroll { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: var(--s4) var(--s5); display: flex; flex-direction: column; gap: var(--s4); }
+.qv-identity { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s3) var(--s4); margin: 0; font-size: var(--text-13); }
+.qv-identity dt { color: var(--text-secondary); }
+.qv-identity dd { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qv-scroll .day-card { padding: var(--s4); }
+.qv-scroll .day-card-main { flex-direction: column; align-items: center; text-align: center; }
+.qv-scroll .day-facts-quiet { justify-content: center; }
+.qv-foot { display: flex; flex-wrap: wrap; gap: var(--s2); padding: var(--s3) var(--s5); border-top: 1px solid var(--border); background: var(--bg); }
+.qv-message { margin: 0; color: var(--text-secondary); }
+.qv-actions { display: flex; gap: var(--s2); margin: 0; }
+.qv-skel { display: block; border-radius: var(--radius); background: var(--surface-sunken); }
+.qv-skel-title { width: 160px; height: 18px; }
+.qv-skel-line { height: 14px; width: 70%; }
+.qv-skel-card { height: 220px; }
+@media (max-width: 767.98px) { .quick-view { width: 100vw; border-left: 0; } }

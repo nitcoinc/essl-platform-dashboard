@@ -348,19 +348,10 @@ class DatabaseTest(unittest.TestCase):
         with old.connect() as connection:
             version = connection.execute("PRAGMA user_version").fetchone()["user_version"]
         self.assertEqual(version, 5)
-        self.assertEqual(old.branding_versions(), {})
-
-    def test_branding_asset_round_trip_replace_and_delete(self) -> None:
-        self.database.initialize(self.devices)
-        png = b"\x89PNG\r\n\x1a\n" + b"\x01" * 10
-        self.database.set_branding_asset("logo", content_type="image/png", data=png, sha256="a" * 64)
-        asset = self.database.branding_asset("logo")
-        self.assertEqual(asset["data"], png)
-        self.assertEqual(asset["content_type"], "image/png")
-        self.database.set_branding_asset("logo", content_type="image/webp", data=b"RIFF", sha256="b" * 64)
-        self.assertEqual(self.database.branding_versions(), {"logo": "b" * 64})
-        self.database.delete_branding_asset("logo")
-        self.assertIsNone(self.database.branding_asset("logo"))
+        with old.connect() as connection:
+            row = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='branding_assets'").fetchone()
+        self.assertIsNotNone(row)
 
     def test_record_poll_commits_punches_and_device_row_together(self) -> None:
         inserted = self.database.record_poll(

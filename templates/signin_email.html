@@ -3,7 +3,7 @@
 {% block card %}
 <div class="auth-title">
   <h1>Sign in</h1>
-  <p>Enter your work email and we will send you a 6-digit code.</p>
+  <p>Enter your work email and we will send you a 6&#8209;digit code.</p>
 </div>
 {% if bot_error %}<div class="auth-error" role="alert">{{ ui.icon('circle-alert') }}<span>{{ bot_error }}</span></div>{% endif %}
 <form method="post" action="{{ url_for('auth.signin_submit') }}">

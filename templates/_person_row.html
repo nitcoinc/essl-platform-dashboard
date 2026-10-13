@@ -17,7 +17,7 @@
       <input type="hidden" name="csrf" value="{{ csrf_token }}">
     </form>
     {% endif %}
-    <a class="person-name" href="{{ url_for('people.person_edit', employee_id=p.id) }}">{{ p.name }}</a>
+    <a class="person-name" href="{{ url_for('people.person_edit', employee_id=p.id) }}" data-quick-view="{{ url_for('me.quick_view', employee_id=p.id, **{'from': 'people'}) }}">{{ p.name }}</a>
     <span class="person-email">{{ p.email }}</span>
   </td>
   <td data-label="Device ID" class="num">{{ p.device_user_id }}{% if row.identity_locked %} <span class="lock" title="Only an admin can change this">{{ ui.icon('lock') }}<span class="visually-hidden">locked</span></span>{% endif %}</td>

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import ipaddress
 import re
 import secrets
@@ -143,41 +142,6 @@ def _render_devices(status: int = 200, **overrides):
     return render_template("devices.html", **context), status
 
 
-# --- Sign-in branding (U6) ----------------------------------------------
-
-# Per-asset size caps; MAX_CONTENT_LENGTH still bounds the whole request.
-BRANDING_CAPS = {"logo": 512 * 1024, "background": 1536 * 1024}
-BRANDING_LABELS = {"logo": "logo", "background": "background image"}
-BACKGROUND_MODES = ("default", "color", "image")
-BRAND_TYPES_MESSAGE = "Upload a PNG, JPEG or WebP image. SVG and other files are not accepted."
-_HEX_COLOUR = re.compile(r"^#[0-9a-fA-F]{6}$")
-
-
-def sniff_image_type(data: bytes) -> str | None:
-    """Magic-byte check (no Pillow); the filename and declared type are ignored."""
-    if data.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if data.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg"
-    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "image/webp"
-    return None
-
-
-def _branding_context() -> dict:
-    versions = database.branding_versions()
-    return {
-        "brand_logo": "logo" in versions,
-        "brand_background": "background" in versions,
-        "background_mode": database.setting("signin_background", "default"),
-        "background_color": database.setting("signin_background_color", "#3451c7"),
-        "brand_saved": request.args.get("saved") if request.args.get("saved", "").startswith("brand-") else None,
-        "brand_error": None,
-        "brand_error_key": None,
-        "brand_caps_kb": {k: v // 1024 for k, v in BRANDING_CAPS.items()},
-    }
-
-
 def _render_settings(status: int = 200, **overrides):
     context = {
         "employee": g.employee,
@@ -190,7 +154,6 @@ def _render_settings(status: int = 200, **overrides):
         "day_start_hour": _day_start_hour(database),
         "day_start_saved": request.args.get("saved") == "day-start",
         "day_start_error": None,
-        **_branding_context(),
     }
     context.update(overrides)
     return render_template("settings.html", **context), status
@@ -376,69 +339,6 @@ def settings_set_day_start():
         )
     database.set_setting("day_start_hour", str(int(raw)))
     return redirect(url_for("admin.settings_view", saved="day-start"))
-
-
-@bp.post("/settings/branding/<key>")
-@_role_required("admin")
-def settings_upload_branding(key: str):
-    _require_csrf()
-    if key not in BRANDING_CAPS:
-        abort(404)
-    file = request.files.get("image")
-    label = BRANDING_LABELS[key]
-    if file is None or not file.filename:
-        error = f"Choose a {label} file to upload."
-    else:
-        data = file.read(BRANDING_CAPS[key] + 1)
-        content_type = sniff_image_type(data)
-        if len(data) > BRANDING_CAPS[key]:
-            error = f"That {label} is larger than {BRANDING_CAPS[key] // 1024} KB. Use a smaller image."
-        elif content_type is None:
-            error = BRAND_TYPES_MESSAGE
-        else:
-            error = None
-    if error is not None:
-        return _render_settings(status=400, brand_error=error, brand_error_key=key)
-    database.set_branding_asset(
-        key, content_type=content_type, data=data, sha256=hashlib.sha256(data).hexdigest()
-    )
-    if key == "background":
-        # Uploading a background is a clear intent to show it.
-        database.set_setting("signin_background", "image")
-    return redirect(url_for("admin.settings_view", saved=f"brand-{key}"))
-
-
-@bp.post("/settings/branding/<key>/reset")
-@_role_required("admin")
-def settings_reset_branding(key: str):
-    _require_csrf()
-    if key not in BRANDING_CAPS:
-        abort(404)
-    database.delete_branding_asset(key)
-    if key == "background" and database.setting("signin_background") == "image":
-        database.set_setting("signin_background", "default")
-    return redirect(url_for("admin.settings_view", saved=f"brand-{key}-reset"))
-
-
-@bp.post("/settings/branding-background")
-@_role_required("admin")
-def settings_set_background():
-    _require_csrf()
-    mode = request.form.get("mode") or ""
-    colour = (request.form.get("color") or "").strip()
-    error = None
-    if mode not in BACKGROUND_MODES:
-        error = "Choose default, brand colour or uploaded image."
-    elif mode == "color" and not _HEX_COLOUR.match(colour):
-        error = "Enter the colour as a hex value like #3451c7."
-    elif mode == "image" and "background" not in database.branding_versions():
-        error = "Upload a background image first."
-    if error is not None:
-        return _render_settings(status=400, brand_error=error, brand_error_key="mode")
-    database.set_setting("signin_background", mode)
-    if mode == "color":
-        database.set_setting("signin_background_color", colour.lower())
-    return redirect(url_for("admin.settings_view", saved="brand-mode"))
 
 
 @bp.post("/settings/keys")
