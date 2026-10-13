@@ -237,11 +237,7 @@ code { font-family: var(--mono); font-size: 0.92em; }
   overflow-y: auto;
 }
 .brand { display: flex; align-items: center; gap: var(--s2); padding: var(--s1) var(--s2); color: var(--text); text-decoration: none; }
-.brand-mark {
-  display: grid; place-items: center; width: 24px; height: 24px;
-  border-radius: var(--radius); background: var(--text); color: var(--bg);
-}
-.brand-mark .icon { width: 14px; height: 14px; stroke-width: 2; }
+.brand-mark { display: block; width: 24px; height: 24px; border-radius: var(--radius); flex: none; }
 .brand-name { font-size: var(--text-14); font-weight: 600; letter-spacing: -0.01em; }
 
 .nav-list { display: flex; flex-direction: column; gap: 1px; margin: 0; padding: 0; list-style: none; }

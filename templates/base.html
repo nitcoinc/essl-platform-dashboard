@@ -78,7 +78,7 @@
       <aside class="sidebar">
         <div class="sidebar-inner">
         <a class="brand" href="{{ url_for('auth.index') }}">
-          <span class="brand-mark">{{ ui.icon('scan-line') }}</span>
+          <img class="brand-mark" src="{{ url_for('static', filename='brand/favicon-192.png') }}" alt="" width="24" height="24">
           <span class="brand-name">Attendance Hub</span>
         </a>
         <nav aria-label="Main">{{ nav_links() }}</nav>
@@ -88,7 +88,7 @@
       <header class="mobile-bar">
         <details class="mobile-menu">
           <summary class="mobile-bar-row">
-            <span class="brand"><span class="brand-mark">{{ ui.icon('scan-line') }}</span><span class="brand-name">Attendance Hub</span></span>
+            <span class="brand"><img class="brand-mark" src="{{ url_for('static', filename='brand/favicon-192.png') }}" alt="" width="24" height="24"><span class="brand-name">Attendance Hub</span></span>
             <span class="button button-tertiary button-icon menu-toggle" role="presentation">
               {{ ui.icon('menu', 'icon-20 menu-open-icon') }}{{ ui.icon('x', 'icon-20 menu-close-icon') }}
               <span class="visually-hidden">Menu</span>
