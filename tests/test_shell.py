@@ -117,9 +117,9 @@ class SyncHealthShellTest(ShellTest):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.collector_path = os.path.join(tmp.name, "collector-status.json")
-        self.export_path = os.path.join(tmp.name, "export-status.json")
+        self.export_path = os.path.join(tmp.name, "backup-status.json")
         env = patch.dict(os.environ, {"ESSL_COLLECTOR_STATUS_PATH": self.collector_path,
-                                      "ESSL_EXPORT_STATUS_PATH": self.export_path})
+                                      "ESSL_BACKUP_STATUS_PATH": self.export_path})
         env.start()
         self.addCleanup(env.stop)
         now = _now_naive().replace(microsecond=0)
@@ -129,8 +129,10 @@ class SyncHealthShellTest(ShellTest):
         with open(self.collector_path, "w") as f:
             json.dump({"last_poll": now.isoformat(sep=" "), "spool_depth": 0, "dead_count": 0}, f)
         with open(self.export_path, "w") as f:
-            json.dump([{"status": "ok", "started": now.isoformat(sep=" "), "finished": now.isoformat(sep=" "),
-                        "key": f"exports/run-{i}.db.gz", "size": 2048} for i in range(20)], f)
+            json.dump({"entries": [{"status": "ok", "started": now.isoformat(sep=" "),
+                                    "finished": now.isoformat(sep=" "),
+                                    "key": f"exports/run-{i}.db.gz", "size": 2048}
+                                   for i in range(20)]}, f)
 
     def test_admin_sees_green_indicator_with_icon_text_and_ist_title(self) -> None:
         self._sign_in_as("admin")

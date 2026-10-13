@@ -98,7 +98,7 @@ jobs:
           # (compose supplies one), so assert the imports both entrypoints need
           # rather than starting a server.
           docker run --rm --entrypoint python "$PRIMARY" -c \
-            "import openpyxl, essl_hub.web, essl_hub.collector_main, essl_hub.nightly_export, essl_hub.roster, libsql; print('image imports OK')"
+            "import openpyxl, essl_hub.web, essl_hub.collector_main, essl_hub.backup, essl_hub.roster, libsql; print('image imports OK')"
 
           if [ "$GITHUB_EVENT_NAME" = "push" ]; then
             for tag in $TAGS; do docker push "$tag"; done

@@ -435,9 +435,9 @@ def _read_json(path: str) -> object:
 
 def current_sync_health(db: object) -> tuple[dict, list[dict]]:
     """Read the status files tolerantly and summarise; also returns export entries."""
-    from ..nightly_export import export_status_path, load_export_status
+    from ..backup import backup_status_path, status_entries
 
-    exports = load_export_status(export_status_path())
+    exports = status_entries(backup_status_path())
     health = sync_health(
         getattr(db, "last_sync_ok_at", None),
         _read_json(config.collector_status_path()),

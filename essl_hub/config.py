@@ -84,6 +84,34 @@ def collector_status_path() -> str:
     )
 
 
+def _positive_int_env(name: str, default: int) -> int:
+    value = (os.getenv(name) or "").strip()
+    if not value:
+        return default
+    try:
+        number = int(value)
+    except ValueError:
+        raise RuntimeError(f"{name} must be a whole number") from None
+    if number < 1:
+        raise RuntimeError(f"{name} must be at least 1")
+    return number
+
+
+def backup_minutes() -> int:
+    """Minutes between R2 snapshots (ESSL_BACKUP_MINUTES, R5)."""
+    return _positive_int_env("ESSL_BACKUP_MINUTES", 15)
+
+
+def backup_keep_hours() -> int:
+    """Hours of recent/ snapshots kept (ESSL_BACKUP_KEEP_HOURS, R6)."""
+    return _positive_int_env("ESSL_BACKUP_KEEP_HOURS", 48)
+
+
+def backup_keep_days() -> int:
+    """Days of nightly/ snapshots kept (ESSL_BACKUP_KEEP_DAYS, R6)."""
+    return _positive_int_env("ESSL_BACKUP_KEEP_DAYS", 30)
+
+
 def turso_settings() -> tuple[str, str] | None:
     """(TURSO_DATABASE_URL, TURSO_AUTH_TOKEN), or None for local mode (KTD2).
 

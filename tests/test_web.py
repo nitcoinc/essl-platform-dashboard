@@ -2442,7 +2442,8 @@ class BackupsRemovedTest(unittest.TestCase):
     def test_backup_modules_are_gone(self) -> None:
         import importlib
 
-        for name in ("essl_hub.backup", "essl_hub.restore_tool"):
+        # essl_hub.backup returned as the R2 snapshot service (2026-10-14 plan U2/U3).
+        for name in ("essl_hub.restore_tool",):
             with self.subTest(module=name):
                 with self.assertRaises(ModuleNotFoundError):
                     importlib.import_module(name)
