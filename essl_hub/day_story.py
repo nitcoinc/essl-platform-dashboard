@@ -117,18 +117,31 @@ class BarSegment:
     seconds: int
     percent: float
     open: bool = False  # the live stretch, ending at now
+    text_wide: str = ""  # in-segment text, e.g. "1 · 33m"; "" when too narrow
+    text_narrow: str = ""  # same at phone width
+
+
+@dataclass(frozen=True)
+class BarMark:
+    """A boundary on the day bar: a tick, and a time label when it fits."""
+
+    position: float  # percent from the left
+    time: datetime | None  # None for the live "now" edge
+    label: str  # "" = tick only
+    narrow: bool  # label also shown at phone width
+    align: str  # "start" | "center" | "end"
 
 
 @dataclass(frozen=True)
 class RawPunch:
     time: datetime
     direction: str  # "entry" | "exit" | ""
-    flags: tuple[str, ...]  # "not counted", "unpaired", "interval too short"
+    flags: tuple[str, ...]  # "not counted", "unpaired", "inferred", "interval too short"
 
 
 @dataclass(frozen=True)
 class BreakView:
-    """KTD10: summary, day bar, numbered break list and every stored swipe."""
+    """KTD10: summary, labelled day bar and every stored swipe."""
 
     inside_seconds: int
     break_seconds: int
@@ -138,12 +151,87 @@ class BreakView:
     bar_start: datetime | None
     bar_end: datetime | None
     bar_label: str
+    marks: tuple[BarMark, ...]
     gaps: tuple  # result.gaps, time-ordered (breaks and unclear)
     punches: tuple[RawPunch, ...]
 
 
 def _hm(seconds: int) -> str:
     return f"{seconds // 3600}:{seconds % 3600 // 60:02d}"
+
+
+def _dur(seconds: int) -> str:
+    """Compact duration for the bar: "19s", "33m", "1h 05m"."""
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    return f"{seconds // 3600}h {seconds % 3600 // 60:02d}m"
+
+
+# Label width as a share of the bar (a "16:14" label is ~34px): the bar is up
+# to 640px wide on desktop and ~340px on a phone.
+_LABEL_WIDE, _LABEL_NARROW = 6.2, 11.5
+
+
+def _segment_text(kind: str, number: int | None, seconds: int, percent: float) -> tuple[str, str]:
+    full = f"{number} · {_dur(seconds)}" if kind == "break" else f"Unclear · {_dur(seconds)}"
+    options = (full, str(number)) if kind == "break" else (full, "Unclear", "?")
+
+    def fit(px_per_percent: float) -> str:
+        width = percent * px_per_percent
+        return next((t for t in options if width >= 7 * len(t) + 7), "")
+
+    return fit(6.4), fit(3.4)
+
+
+def _bar_marks(bar: list[BarSegment], live: bool) -> tuple[BarMark, ...]:
+    """Ticks at every segment boundary; time labels where they fit. The two
+    edges always label; break and unclear edges follow, longest gap first, and
+    a label that would collide is dropped (the punch list holds every time)."""
+    if not bar:
+        return ()
+    edges: list[tuple[float, datetime | None, int]] = []  # position, time, priority
+    pos = 0.0
+    edges.append((0.0, bar[0].start, 0))
+    for seg in bar[:-1]:
+        pos += seg.percent
+        edges.append((pos, seg.end, 0))
+    edges.append((100.0, None if live else bar[-1].end, 0))
+    # Priority: edges of the bar first, then by the length of the gap touched.
+    ranked = []
+    for i, (p, t, _) in enumerate(edges):
+        if i in (0, len(edges) - 1):
+            rank = float("inf")
+        else:
+            touching = [s for s in (bar[i - 1], bar[i]) if s.kind != "inside"]
+            rank = max((s.seconds for s in touching), default=0)
+        ranked.append((rank, i))
+    ranked.sort(key=lambda r: (-r[0], r[1]))
+
+    def place(width: float) -> set[int]:
+        taken: list[tuple[float, float]] = []
+        chosen: set[int] = set()
+        for _, i in ranked:
+            p = edges[i][0]
+            if i == 0:
+                span = (0.0, width)
+            elif i == len(edges) - 1:
+                span = (100.0 - width, 100.0)
+            else:
+                span = (p - width / 2, p + width / 2)
+            if all(span[1] <= a or span[0] >= b for a, b in taken):
+                taken.append(span)
+                chosen.add(i)
+        return chosen
+
+    wide, narrow = place(_LABEL_WIDE), place(_LABEL_NARROW)
+    marks = []
+    for i, (p, t, _) in enumerate(edges):
+        align = "start" if i == 0 else "end" if i == len(edges) - 1 else "center"
+        text = "now" if t is None else t.strftime("%H:%M")
+        marks.append(BarMark(round(p, 3), t, text if i in wide else "", i in narrow, align))
+    return tuple(marks)
 
 
 def break_view(result: DayResult, now: datetime | None, raw_rows=()) -> BreakView:
@@ -166,14 +254,20 @@ def break_view(result: DayResult, now: datetime | None, raw_rows=()) -> BreakVie
         total = _seconds(bar_start, bar_end) or 1
         for kind, number, a, b, is_open in pieces:
             secs = _seconds(a, b)
-            bar.append(BarSegment(kind, number, a, b, secs, round(secs * 100 / total, 3), is_open))
+            pct = round(secs * 100 / total, 3)
+            wide, narrow = _segment_text(kind, number, secs, pct) if kind != "inside" else ("", "")
+            bar.append(BarSegment(kind, number, a, b, secs, pct, is_open, wide, narrow))
     breaks = [g for g in result.gaps if g.kind == "break"]
     if breaks:
         label = f"Inside {_hm(result.effective_seconds)}, {len(breaks)} break{'s' if len(breaks) != 1 else ''} totalling {_hm(result.break_seconds)}"
+        label += ": " + "; ".join(
+            f"break {g.number} {g.start:%H:%M} to {g.end:%H:%M} ({_dur(g.seconds)})" for g in breaks)
     else:
         label = f"Inside {_hm(result.effective_seconds)}, no breaks"
-    if result.unclear_seconds:
-        label += f", {_hm(result.unclear_seconds)} unclear"
+    unclear = [g for g in result.gaps if g.kind == "unclear"]
+    if unclear:
+        label += f", {_hm(result.unclear_seconds)} unclear: " + "; ".join(
+            f"{g.start:%H:%M} to {g.end:%H:%M} ({_dur(g.seconds)})" for g in unclear)
 
     starts = {s.start for s in result.segments}
     ends = {s.end for s in result.segments if s.end is not None}
@@ -181,13 +275,14 @@ def break_view(result: DayResult, now: datetime | None, raw_rows=()) -> BreakVie
     for gap in result.gaps:
         unpaired.update({t: d for t, d in gap.unpaired})
     collapsed = [p.timestamp for p in result.collapsed]
+    inferred = set(result.inferred)
     punches: list[RawPunch] = []
     for row in raw_rows:
         t = row["event_timestamp"]
         flags: list[str] = []
         if t in collapsed:
             collapsed.remove(t)
-            direction = ""
+            direction = row.get("trusted_direction") or ""
             flags.append("not counted")
         elif t in starts:
             direction = "entry"
@@ -198,6 +293,8 @@ def break_view(result: DayResult, now: datetime | None, raw_rows=()) -> BreakVie
             flags.append("unpaired")
         else:
             direction = row.get("trusted_direction") or ""
+        if t in inferred and "not counted" not in flags:
+            flags.append("inferred")
         flags.extend(punch_flags(row.get("raw_state")))
         punches.append(RawPunch(t, direction, tuple(flags)))
     return BreakView(
@@ -209,6 +306,7 @@ def break_view(result: DayResult, now: datetime | None, raw_rows=()) -> BreakVie
         bar_start=bar_start,
         bar_end=bar_end,
         bar_label=label,
+        marks=_bar_marks(bar, open_day),
         gaps=result.gaps,
         punches=tuple(punches),
     )

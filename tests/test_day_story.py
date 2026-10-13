@@ -158,7 +158,10 @@ class BreakViewTest(unittest.TestCase):
         self.assertEqual(view.break_seconds, 4800)
         self.assertEqual(view.break_count, 3)
         self.assertEqual([s.number for s in view.bar if s.kind == "break"], [1, 2, 3])
-        self.assertEqual(view.bar_label, "Inside 6:12, 3 breaks totalling 1:20")
+        self.assertEqual(view.bar_label, "Inside 6:12, 3 breaks totalling 1:20: break 1 11:00 to 11:20 (20m); "
+                                          "break 2 13:00 to 13:40 (40m); break 3 15:00 to 15:20 (20m)")
+        self.assertEqual([m.label for m in view.marks if m.label][0], "09:00")
+        self.assertEqual(view.marks[-1].label, "16:32")
         self.assertAlmostEqual(sum(s.percent for s in view.bar), 100, places=1)
         self.assertEqual(sum(g.seconds for g in view.gaps if g.kind == "break"), view.break_seconds)
         self.assertEqual([p.direction for p in view.punches][:2], ["entry", "exit"])
@@ -180,6 +183,19 @@ class BreakViewTest(unittest.TestCase):
         self.assertGreater(view.unclear_seconds, 0)
         self.assertIn("unclear", view.bar_label)
         self.assertIn("unpaired", [f for p in view.punches for f in p.flags])
+
+    def test_filler_swipe_shows_inferred_in_and_short_break_merges_labels(self) -> None:
+        swipes = [(_at(9), "entry"), (_at(12), "exit"), (_at(12).replace(second=19), None), (_at(13), "exit"),
+                  (_at(13, 30), "entry"), (_at(18), "exit")]
+        view = day_story.break_view(self._day(*swipes), None, self._rows(*swipes))
+        filler = view.punches[2]
+        self.assertEqual((filler.direction, filler.flags), ("entry", ("inferred",)))
+        self.assertEqual(view.break_count, 2)
+        labels = [m.label for m in view.marks if m.label]
+        self.assertEqual(labels[0], "09:00")
+        self.assertEqual(labels[-1], "18:00")
+        self.assertEqual(len([lab for lab in labels if lab == "12:00"]), 1)  # 19s break: one label
+        self.assertIn("break 1 12:00 to 12:00 (19s)", view.bar_label)
 
     def test_open_day_bar_ends_at_now(self) -> None:
         swipes = [(_at(9), "entry"), (_at(12), "exit"), (_at(12, 30), "entry")]
