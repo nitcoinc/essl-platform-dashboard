@@ -61,8 +61,8 @@ def collector_interval_seconds() -> int:
 
 def heartbeat_write_seconds() -> int:
     """KTD11: an unchanged device row is still rewritten after this many
-    seconds (default 300) so Devices can show "last checked"."""
-    return int(os.getenv("ESSL_HEARTBEAT_WRITE_SECONDS", "300"))
+    seconds (default 900) so Devices can show "last checked"."""
+    return int(os.getenv("ESSL_HEARTBEAT_WRITE_SECONDS", "900"))
 
 
 def db_path() -> str:
@@ -99,9 +99,13 @@ def turso_settings() -> tuple[str, str] | None:
     return url, token
 
 
+# Web replica pull default; every pull downloads all changed pages (Turso sync quota).
+WEB_SYNC_SECONDS = 300
+
+
 def turso_sync_seconds(default: int) -> int:
     """Replica sync interval (KTD4); each process passes its own default
-    (web 60, collector 300)."""
+    (web 300, collector 300)."""
     value = os.getenv("TURSO_SYNC_SECONDS")
     if value in (None, ""):
         return default

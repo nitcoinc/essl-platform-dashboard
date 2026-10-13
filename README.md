@@ -166,7 +166,7 @@ Everything is one `docker-compose.yml` on one x86_64 host that can reach both de
 | Service | Job |
 | --- | --- |
 | `collector` | Polls the devices every `ESSL_COLLECTOR_INTERVAL_SECONDS` and writes punches. Boots and polls without the internet; a punch write that fails goes to the local spool and is replayed in order later. Syncs its replica every `TURSO_COLLECTOR_SYNC_SECONDS`. |
-| `web` | Flask + gunicorn (`-w 1 --threads 4`). The screens and the read-only HRMS API. Owns the schema. Syncs its replica every `TURSO_WEB_SYNC_SECONDS`, so collector punches show up within about a minute. Published on host loopback only (`127.0.0.1:ESSL_WEB_PORT`, default 8080). |
+| `web` | Flask + gunicorn (`-w 1 --threads 4`). The screens and the read-only HRMS API. Owns the schema. Syncs its replica every `TURSO_WEB_SYNC_SECONDS`, so collector punches show up within about five minutes. Published on host loopback only (`127.0.0.1:ESSL_WEB_PORT`, default 8080). |
 | `nightly-export` | Once a night, syncs a read-only replica, strips sessions and login codes, integrity-checks, gzips and puts it to R2 under `nightly/`. |
 | `cloudflared` | *Optional* bundled Cloudflare Tunnel (compose profile `tunnel`). Skip it when the host already runs cloudflared. |
 
@@ -498,8 +498,8 @@ Turso plans cap rows read and written, storage, embedded-replica sync bandwidth 
 
 What drives usage here:
 
-- Replica syncs: web every `TURSO_WEB_SYNC_SECONDS` (60), collector every `TURSO_COLLECTOR_SYNC_SECONDS` (300), export once a night. Raising them cuts sync traffic; the cost is staler reads.
-- Writes: punches, a device row on change or every `ESSL_HEARTBEAT_WRITE_SECONDS`, sign-ins and admin edits. Small at about 100 users.
+- Replica syncs: web every `TURSO_WEB_SYNC_SECONDS` (300), collector every `TURSO_COLLECTOR_SYNC_SECONDS` (300), export once a night. Raising them cuts sync traffic; the cost is staler reads.
+- Writes: punches, a device row only when its status or punches change, or every `ESSL_HEARTBEAT_WRITE_SECONDS` (15 min), the Frappe status on change or every 15 min, sign-ins and admin edits. Small at about 100 users.
 - The nightly export reads the whole database once.
 
 Set a **usage alert** in the Turso dashboard well below your plan's limits, and check usage monthly. If you hit a limit, writes can be refused: the indicator and the offline page show it.
@@ -614,7 +614,7 @@ All settings live in `.env`; `.env.example` documents each one. The daily target
 | `TURSO_DATABASE_URL` | required (unset = local mode, dev only) | collector, web, nightly-export |
 | `TURSO_AUTH_TOKEN` | required, read-write | collector, web |
 | `TURSO_EXPORT_AUTH_TOKEN` | required, read-only | nightly-export |
-| `TURSO_WEB_SYNC_SECONDS` / `TURSO_COLLECTOR_SYNC_SECONDS` | `60` / `300` | passed as `TURSO_SYNC_SECONDS` to web / collector |
+| `TURSO_WEB_SYNC_SECONDS` / `TURSO_COLLECTOR_SYNC_SECONDS` | `300` / `300` | passed as `TURSO_SYNC_SECONDS` to web / collector |
 | `ESSL_DB_PATH` | set per service in compose (`/data/<service>-replica.db`) | replica file; local database file in dev |
 | `ESSL_SPOOL_PATH` | `/data/collector-spool.db` | collector |
 | `ESSL_COLLECTOR_STATUS_PATH`, `ESSL_EXPORT_STATUS_PATH` | next to `ESSL_DB_PATH` | collector, nightly-export, web (reads) |
@@ -624,7 +624,7 @@ All settings live in `.env`; `.env.example` documents each one. The daily target
 | `ESSL_WEB_PORT` / `ESSL_WEB_BIND` | `8080` / `127.0.0.1` | web host port; bind `0.0.0.0` for LAN access |
 | `TUNNEL_TOKEN`, `COMPOSE_PROFILES` | optional; token + `tunnel` turns on the bundled cloudflared | cloudflared |
 | `ESSL_COLLECTOR_INTERVAL_SECONDS` | `60` | collector, Devices page |
-| `ESSL_HEARTBEAT_WRITE_SECONDS` | `300` | collector, Devices staleness warning |
+| `ESSL_HEARTBEAT_WRITE_SECONDS` | `900` | collector, Devices staleness warning |
 | `ESSL_X990_IP` / `_PORT` / `_PASSWORD` | `192.168.1.201` / `4370` / `0` | collector (seeds the row once) |
 | `ESSL_C3_IP` / `_PORT` / `_PASSWORD` | `192.168.1.202` / `4370` / blank | collector (seeds the row once) |
 | `ESSL_C3_MODE`, `ESSL_C3_HISTORY_HOURS`, `ESSL_C3_RTLOG_BATCH` | `auto`, `6`, `250` | collector |

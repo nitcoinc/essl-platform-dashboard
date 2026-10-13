@@ -42,6 +42,7 @@ DUPLICATE_CHECKIN = "This employee already has a log with the same timestamp"
 _RETRY_STATUSES = {401, 403, 408, 409, 417, 429}
 
 STATUS_SETTING = "frappe_last_sync"
+STATUS_HEARTBEAT_SECONDS = 900
 
 
 @dataclass(frozen=True)
@@ -150,6 +151,8 @@ class FrappeSync:
         self.config = config
         self.transport = transport
         self.clock = clock
+        self._status_shape: tuple | None = None
+        self._status_at = 0.0
 
     def _request(self, method: str, path: str, payload: dict) -> HttpResult:
         headers = {
@@ -272,8 +275,15 @@ class FrappeSync:
             "skipped": report.skipped,
             "error": report.retry_error,
         }
+        # Every write is replicated to each Turso replica; an unchanged
+        # status is only refreshed once per heartbeat.
+        shape = (status["ok"], status["synced"], status["skipped"], status["error"])
+        now = time.monotonic()
+        if shape == self._status_shape and now - self._status_at < STATUS_HEARTBEAT_SECONDS:
+            return
         try:
             self.database.set_setting(STATUS_SETTING, json.dumps(status))
+            self._status_shape, self._status_at = shape, now
         except Exception:
             _logger.warning("could not record Frappe sync status", exc_info=True)
 
