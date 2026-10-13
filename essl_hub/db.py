@@ -20,7 +20,7 @@ _TZ = ZoneInfo(TIMEZONE_NAME)
 _logger = logging.getLogger(__name__)
 
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Seconds the TCP probe waits before calling the primary unreachable. libsql's
 # own replica connect can block ~134s holding the GIL on a black-holed address
@@ -405,6 +405,53 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
             sha256 TEXT NOT NULL,
             updated_at TIMESTAMP NOT NULL
         )
+        """,
+    ),
+    # v6: archive instead of delete, and extra device IDs per person. A
+    # device user ID lives in exactly one place: employees.device_user_id or
+    # employee_device_ids. The triggers guard every write path; the message
+    # carries "constraint failed" so classify_error maps it to IntegrityError.
+    6: (
+        "ALTER TABLE employees ADD COLUMN archived_at TIMESTAMP",
+        """
+        CREATE TABLE IF NOT EXISTS employee_device_ids (
+            device_user_id TEXT PRIMARY KEY,
+            employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+            created_at TIMESTAMP NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_employee_device_ids_employee ON employee_device_ids(employee_id)",
+        """
+        CREATE TRIGGER IF NOT EXISTS employees_device_id_insert_unique
+        BEFORE INSERT ON employees
+        WHEN EXISTS (SELECT 1 FROM employee_device_ids WHERE device_user_id = NEW.device_user_id)
+        BEGIN
+            SELECT RAISE(ABORT, 'UNIQUE constraint failed: device user ID is an extra ID');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS employees_device_id_update_unique
+        BEFORE UPDATE OF device_user_id ON employees
+        WHEN EXISTS (SELECT 1 FROM employee_device_ids WHERE device_user_id = NEW.device_user_id)
+        BEGIN
+            SELECT RAISE(ABORT, 'UNIQUE constraint failed: device user ID is an extra ID');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS employee_device_ids_insert_unique
+        BEFORE INSERT ON employee_device_ids
+        WHEN EXISTS (SELECT 1 FROM employees WHERE device_user_id = NEW.device_user_id)
+        BEGIN
+            SELECT RAISE(ABORT, 'UNIQUE constraint failed: device user ID is a main ID');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS employee_device_ids_update_unique
+        BEFORE UPDATE OF device_user_id ON employee_device_ids
+        WHEN EXISTS (SELECT 1 FROM employees WHERE device_user_id = NEW.device_user_id)
+        BEGIN
+            SELECT RAISE(ABORT, 'UNIQUE constraint failed: device user ID is a main ID');
+        END
         """,
     ),
 }
@@ -1024,6 +1071,58 @@ class Database:
                 WHERE id = ?
                 """,
                 (name, email, device_user_id, _now(), employee_id),
+            )
+
+    def extra_device_ids(self, employee_id: int) -> list[str]:
+        """Extra device user IDs for one employee (v6), oldest first."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT device_user_id FROM employee_device_ids WHERE employee_id = ? "
+                "ORDER BY created_at, device_user_id",
+                (employee_id,),
+            ).fetchall()
+        return [str(row["device_user_id"]) for row in rows]
+
+    def add_extra_device_id(self, employee_id: int, device_user_id: str) -> None:
+        """Attach an extra device user ID. Raises IntegrityError when the ID is
+        already anyone's main or extra ID (PRIMARY KEY plus v6 triggers)."""
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO employee_device_ids (device_user_id, employee_id, created_at) "
+                "VALUES (?, ?, ?)",
+                (device_user_id, employee_id, _now()),
+            )
+
+    def remove_extra_device_id(self, employee_id: int, device_user_id: str) -> bool:
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "DELETE FROM employee_device_ids WHERE employee_id = ? AND device_user_id = ?",
+                (employee_id, device_user_id),
+            )
+        return cursor.rowcount > 0
+
+    def device_user_id_owner(self, device_user_id: str) -> dict[str, object] | None:
+        """The employee holding this ID as main or extra ID, or None."""
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT e.* FROM employees e WHERE e.device_user_id = ?
+                UNION ALL
+                SELECT e.* FROM employee_device_ids x JOIN employees e ON e.id = x.employee_id
+                WHERE x.device_user_id = ?
+                LIMIT 1
+                """,
+                (device_user_id, device_user_id),
+            ).fetchone()
+        return row
+
+    def set_employee_archived(self, employee_id: int, archived: bool) -> None:
+        """Set or clear employees.archived_at (v6). Callers check access and
+        last-admin rules first."""
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE employees SET archived_at = ?, updated_at = ? WHERE id = ?",
+                (_now() if archived else None, _now(), employee_id),
             )
 
     def employees(self) -> list[dict[str, object]]:

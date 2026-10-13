@@ -79,6 +79,7 @@ class DatabaseTest(unittest.TestCase):
                 "settings",
                 "frappe_sync_log",
                 "branding_assets",
+                "employee_device_ids",
             },
         )
 
@@ -347,11 +348,100 @@ class DatabaseTest(unittest.TestCase):
         old.migrate_schema()
         with old.connect() as connection:
             version = connection.execute("PRAGMA user_version").fetchone()["user_version"]
-        self.assertEqual(version, 5)
+        self.assertEqual(version, db_module.SCHEMA_VERSION)
         with old.connect() as connection:
             row = connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='branding_assets'").fetchone()
         self.assertIsNotNone(row)
+
+    def test_v5_to_v6_adds_archive_and_extra_ids_and_reruns_safely(self) -> None:
+        self.database.close()
+        path = os.path.join(self._tmp.name, "v5.db")
+        old = db_module.Database(path)
+        self.addCleanup(old.close)
+        with mock.patch.object(db_module, "SCHEMA_VERSION", 5), \
+                mock.patch.dict(db_module.MIGRATIONS, {}, clear=False):
+            db_module.MIGRATIONS.pop(6)
+            old.initialize(self.devices[:0])
+            old.upsert_employee(device_user_id="118", name="Asha", email="asha@x.com")
+        with old.connect() as connection:
+            columns = {r["name"] for r in connection.execute("PRAGMA table_info(employees)").fetchall()}
+        self.assertNotIn("archived_at", columns)
+        old.migrate_schema()
+        with old.transaction() as connection:  # simulate a re-run of step 6
+            connection.execute("UPDATE settings SET value='5' WHERE key='schema_version'")
+            connection.execute("PRAGMA user_version=5")
+        old.migrate_schema()
+        old.migrate_schema()
+        with old.connect() as connection:
+            columns = {r["name"] for r in connection.execute("PRAGMA table_info(employees)").fetchall()}
+            version = connection.execute("PRAGMA user_version").fetchone()["user_version"]
+            marker = connection.execute(
+                "SELECT value FROM settings WHERE key='schema_version'").fetchone()["value"]
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='employee_device_ids'"
+            ).fetchone()
+        self.assertIn("archived_at", columns)
+        self.assertIsNotNone(table)
+        self.assertEqual((version, marker), (6, "6"))
+        self.assertIsNone(old.employee_by_device_user_id("118")["archived_at"])
+
+    def test_fresh_database_has_v6_schema(self) -> None:
+        with self.database.connect() as connection:
+            columns = {r["name"] for r in connection.execute("PRAGMA table_info(employees)").fetchall()}
+            extra = {r["name"] for r in connection.execute(
+                "PRAGMA table_info(employee_device_ids)").fetchall()}
+        self.assertIn("archived_at", columns)
+        self.assertEqual(extra, {"device_user_id", "employee_id", "created_at"})
+
+    def _employee(self, device_user_id: str, email: str) -> int:
+        self.database.upsert_employee(device_user_id=device_user_id, name=email, email=email)
+        return int(self.database.employee_by_device_user_id(device_user_id)["id"])
+
+    def test_extra_device_ids_add_list_remove_and_owner(self) -> None:
+        asha = self._employee("118", "asha@x.com")
+        self.database.add_extra_device_id(asha, "NP0118")
+        self.assertEqual(self.database.extra_device_ids(asha), ["NP0118"])
+        self.assertEqual(self.database.device_user_id_owner("NP0118")["id"], asha)
+        self.assertEqual(self.database.device_user_id_owner("118")["id"], asha)
+        self.assertIsNone(self.database.device_user_id_owner("999"))
+        self.assertTrue(self.database.remove_extra_device_id(asha, "NP0118"))
+        self.assertEqual(self.database.extra_device_ids(asha), [])
+
+    def test_deleting_employee_cascades_extra_ids(self) -> None:
+        asha = self._employee("118", "asha@x.com")
+        self.database.add_extra_device_id(asha, "NP0118")
+        with self.database.transaction() as connection:
+            connection.execute("DELETE FROM employees WHERE id = ?", (asha,))
+        with self.database.connect() as connection:
+            count = connection.execute("SELECT COUNT(*) AS n FROM employee_device_ids").fetchone()["n"]
+        self.assertEqual(count, 0)
+
+    def test_device_id_unique_across_main_and_extra(self) -> None:
+        asha = self._employee("118", "asha@x.com")
+        ravi = self._employee("200", "ravi@x.com")
+        self.database.add_extra_device_id(asha, "NP0118")
+        with self.assertRaises(db_module.IntegrityError):
+            self.database.add_extra_device_id(ravi, "200")  # someone's main ID
+        with self.assertRaises(db_module.IntegrityError):
+            self.database.add_extra_device_id(ravi, "NP0118")  # someone's extra ID
+        with self.assertRaises(db_module.IntegrityError):
+            self.database.update_employee(ravi, name="Ravi", email="ravi@x.com", device_user_id="NP0118")
+        with self.assertRaises(db_module.IntegrityError):
+            self.database.upsert_employee(device_user_id="NP0118", name="New", email="new@x.com")
+        with self.assertRaises(db_module.IntegrityError):
+            self.database.create_first_admin(name="Boss", email="boss@x.com", device_user_id="NP0118")
+        # Unrelated upsert of an existing main ID still works.
+        self.assertEqual(
+            self.database.upsert_employee(device_user_id="118", name="Asha K", email="asha@x.com"), "updated"
+        )
+
+    def test_set_employee_archived_sets_and_clears(self) -> None:
+        asha = self._employee("118", "asha@x.com")
+        self.database.set_employee_archived(asha, True)
+        self.assertIsNotNone(self.database.employee_by_id(asha)["archived_at"])
+        self.database.set_employee_archived(asha, False)
+        self.assertIsNone(self.database.employee_by_id(asha)["archived_at"])
 
     def test_record_poll_commits_punches_and_device_row_together(self) -> None:
         inserted = self.database.record_poll(
