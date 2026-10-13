@@ -36,7 +36,9 @@ def c3_user_id(pin: str, card: str = "") -> str:
     unlinked = {
         p.strip() for p in os.getenv("ESSL_C3_UNLINKED_PINS", C3_UNLINKED_PINS_DEFAULT).split(",") if p.strip()
     }
-    if pin in unlinked or not pin.isdigit():
+    # PIN 0 means "no user" on the panel; NP0000 would be rejected as an
+    # all-zero ID elsewhere, so it joins the unlinked path (KTD3).
+    if pin in unlinked or not pin.isdigit() or int(pin) == 0:
         return f"C3-{pin}"
     template = os.getenv("ESSL_C3_ID_FORMAT", "").strip() or C3_ID_FORMAT_DEFAULT
     return template.format(pin=int(pin))

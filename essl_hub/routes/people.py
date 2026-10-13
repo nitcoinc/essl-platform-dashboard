@@ -306,6 +306,7 @@ def person_new():
 def person_create():
     _require_csrf()
     values = _person_form_values()
+    values["device_user_id"] = roster.normalize_device_id(values["device_user_id"])
     errors = _identity_errors(values, None)
     role = values["role"] or "employee"
     if not errors and not access.can_assign_role(g.employee, {"role": "employee"}, role):
@@ -354,6 +355,7 @@ def person_update(employee_id: int):
     if target is None:
         abort(404)
     values = _person_form_values()
+    values["device_user_id"] = roster.normalize_device_id(values["device_user_id"], str(target["device_user_id"]))
     for field in ("email", "device_user_id"):
         changed = (
             values[field].lower() != str(target[field]).lower()
@@ -369,6 +371,8 @@ def person_update(employee_id: int):
                 status=403,
             )
     errors = _identity_errors(values, target["id"])
+    if errors.get("device_user_id") == _sentence(roster.ZERO_DEVICE_ID) and values["device_user_id"] == str(target["device_user_id"]):
+        del errors["device_user_id"]  # untouched legacy ID; only new IDs are checked
     if errors:
         return _render_person_form(target, values, errors, status=400)
     result = _change_assignment(target, manager_raw=values["manager_id"], role_raw=values["role"])

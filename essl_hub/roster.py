@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 from dataclasses import dataclass, replace
 from typing import NamedTuple
 
@@ -71,11 +72,14 @@ def apply_rows(database, rows, actor: dict | None = None) -> list[RosterOutcome]
     write to an existing record goes through access.can_modify_employee."""
     rows = [RosterRow(*row) for row in rows]
     rows = [row._replace(email=row.email.strip().lower()) for row in rows]
+    rows = [row._replace(device_user_id=_import_device_id(database, row.device_user_id)) for row in rows]
     outcomes: dict[int, RosterOutcome] = {}
 
     shape_valid: list[RosterRow] = []
     for row in rows:
         reason = identity_error(row.name, row.email, row.device_user_id)
+        if reason == ZERO_DEVICE_ID and database.employee_by_device_user_id(row.device_user_id):
+            reason = None  # an existing legacy ID re-imported unchanged
         if reason:
             outcomes[row.row_number] = _outcome(row, "rejected", reason)
         else:
@@ -159,7 +163,35 @@ def identity_error(name: str, email: str, device_user_id: str) -> str | None:
         return "email has no @ sign"
     if not device_user_id:
         return "device user ID is empty"
+    if is_zero_device_id(device_user_id):
+        return ZERO_DEVICE_ID
     return None
+
+
+ZERO_DEVICE_ID = "device ID can't be zero"
+
+
+def is_zero_device_id(value: str) -> bool:
+    """True when every digit is 0 ("0", "00", "NP0000"): devices use 0 for
+    "no user", so such an ID would collect unrelated punches (KTD3)."""
+    digits = [ch for ch in value if ch.isdigit()]
+    return bool(digits) and all(ch == "0" for ch in digits)
+
+
+def normalize_device_id(raw: str, current: str | None = None) -> str:
+    """Trim and upper-case a human-typed device user ID (KTD3). A value equal
+    to ``current`` (the stored ID) is kept verbatim, so an untouched legacy ID
+    is never rewritten. Machine-sourced IDs (punches) are not passed here."""
+    value = (raw or "").strip()
+    if current is not None and value == current:
+        return value
+    return value.upper()
+
+
+def _import_device_id(database, raw: str) -> str:
+    value = (raw or "").strip()
+    existing = database.employee_by_device_user_id(value) if value else None
+    return normalize_device_id(value, value if existing is not None else None)
 
 
 def _outcome(row: RosterRow, result: str, reason: str | None = None) -> RosterOutcome:
@@ -293,13 +325,16 @@ def parse_xlsx(file_bytes: bytes) -> list[RosterRow]:
 
 
 def _rows_from_xlsx_sheet(sheet, title: str) -> list[RosterRow]:
-    data_rows = sheet.iter_rows(values_only=True)
+    # Cells, not values: a numeric ID cell formatted "0000" shows 0118 in
+    # Excel but stores 118, so the number format restores the zero padding.
+    data_rows = ([_cell_text(cell.value, getattr(cell, "number_format", None)) for cell in row]
+                 for row in sheet.iter_rows())
     header_row = next(data_rows, None)
-    if header_row is None or not any(_cell_text(cell) for cell in header_row):
+    if header_row is None or not any(header_row):
         raise RosterFileError(f"no header row found in first row of sheet '{title}'")
 
     positions = _match_columns(
-        [_cell_text(cell) for cell in header_row], location=f"sheet '{title}'"
+        list(header_row), location=f"sheet '{title}'"
     )
     width = len(header_row)
 
@@ -313,7 +348,7 @@ def _rows_from_xlsx_sheet(sheet, title: str) -> list[RosterRow]:
                 f"sheet '{title}' has more than {MAX_ROSTER_ROWS} rows; "
                 "split the roster into smaller files"
             )
-        values = [_cell_text(cell) for cell in raw_row]
+        values = list(raw_row)
         values += [""] * (width - len(values))
         if not any(values):
             continue
@@ -349,13 +384,19 @@ def _match_columns(header_names: list[str], location: str = "") -> dict[str, int
     return positions
 
 
-def _cell_text(value) -> str:
+_ZERO_PAD_FORMAT = re.compile(r"^0+$")
+
+
+def _cell_text(value, number_format: str | None = None) -> str:
     if value is None:
         return ""
     if isinstance(value, float) and value.is_integer():
-        return str(int(value))
-    if isinstance(value, int):
-        return str(value)
+        value = int(value)
+    if isinstance(value, int) and not isinstance(value, bool):
+        text = str(value)
+        if number_format and _ZERO_PAD_FORMAT.match(number_format) and value >= 0:
+            text = text.zfill(len(number_format))
+        return text
     return str(value).strip()
 
 

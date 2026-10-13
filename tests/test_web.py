@@ -2153,6 +2153,17 @@ class SetupPageTest(unittest.TestCase):
         self.assertIn("Enter your name", response.text)
         self.assertIsNone(database.employee_by_email("boss@example.com"))
 
+    def test_zero_device_id_is_rejected_on_setup(self) -> None:
+        database = FakeDatabase()
+        app = self._make_app_with(database, self.TOKEN)
+        response = app.test_client().post(
+            "/setup",
+            data={"setup_token": self.TOKEN, "name": "Boss", "email": "boss@example.com",
+                  "device_user_id": "NP0000"},
+        )
+        self.assertIn("Device ID can&#39;t be zero", response.text)
+        self.assertFalse(database.has_admin())
+
     def test_device_id_clash_is_reported(self) -> None:
         database = FakeDatabase()
         database.upsert_employee(device_user_id="5", name="Other", email="other@example.com")

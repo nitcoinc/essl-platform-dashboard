@@ -6,7 +6,7 @@ import secrets
 
 from flask import Blueprint, Response, abort, current_app, g, redirect, render_template, request, send_from_directory, url_for
 
-from .. import auth, turnstile
+from .. import auth, roster, turnstile
 from .common import (
     PENDING_COOKIE,
     PENDING_MAX_AGE,
@@ -132,13 +132,15 @@ def setup_submit() -> str | Response:
 
     name = (request.form.get("name") or "").strip()
     email = (request.form.get("email") or "").strip().lower()
-    device_user_id = (request.form.get("device_user_id") or "").strip()
+    device_user_id = roster.normalize_device_id(request.form.get("device_user_id") or "")
 
     error = None
     if not name:
         error = "Enter your name."
     elif "@" not in email or email.startswith("@") or email.endswith("@"):
         error = "Enter a work email address."
+    elif roster.is_zero_device_id(device_user_id):
+        error = "Device ID can't be zero."
     if error is None:
         # An admin without a badge still needs a unique device_user_id; the
         # email is unique and can never match a real device badge.

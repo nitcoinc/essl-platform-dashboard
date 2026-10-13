@@ -53,6 +53,12 @@ class C3UserIdTest(unittest.TestCase):
             self.assertEqual(c3_user_id("173"), "NP0173")
             self.assertEqual(c3_user_id("1001"), "NP1001")
 
+    def test_pin_zero_is_unlinked(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(c3_user_id("0"), "C3-0")
+            self.assertEqual(c3_user_id("000"), "C3-000")
+            self.assertEqual(c3_user_id("128"), "NP0128")
+
     def test_shared_cards_stay_unlinked(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(c3_user_id("2"), "C3-2")
