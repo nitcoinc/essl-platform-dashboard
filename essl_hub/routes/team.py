@@ -1,4 +1,4 @@
-"""Team / Everyone view and the scoped CSV and Excel exports."""
+"""Team / Employees view and the scoped CSV and Excel exports."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from .common import (
     _int_list,
     _login_required,
     _now_naive,
+    _people_for_range,
     _role_required,
     _target_minutes,
     _today,
@@ -82,7 +83,7 @@ def _render_team(export_error: str | None = None, status: int = 200):
         "employee": g.employee,
         "query": query,
         "rows": _team_rows(query),
-        "title": "Everyone" if everyone_label else "Team",
+        "title": "Employees" if everyone_label else "Team",
         "today": today,
         "unmapped": database.unmapped_device_user_ids() if everyone_label else [],
         "presets": presets,
@@ -130,9 +131,11 @@ def _export(kind: str):
         wanted = visible & set(requested)  # outside ids drop silently
     else:
         wanted = visible
-    everyone = database.employees()
-    names = {person["id"]: person["name"] for person in everyone}
-    people = [person for person in everyone if person["id"] in wanted]
+    names = {person["id"]: person["name"] for person in database.employees(include_archived=True)}
+    people = [
+        person for person in _people_for_range(database, start, end, day_start_hour)
+        if person["id"] in wanted
+    ]
     report = export.build_report(
         database, people, start, end,
         manager_names=names, target_minutes=_target_minutes(database),

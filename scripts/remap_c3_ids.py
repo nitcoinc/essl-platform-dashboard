@@ -1,7 +1,8 @@
 """One-off: rewrite stored C3 punches to the mapped user ID and stable fingerprint.
 
-Also deletes stored C3 rows that are not access-granted punches (denied
-swipes, alarms), which the collector now skips, and duplicates of one swipe
+Also deletes stored C3 rows that are not attendance swipes (denied swipes,
+alarms), which the collector skips; interval-too-short swipes (event 20)
+are attendance since KTD11 and are kept, and duplicates of one swipe
 stored by both the realtime and the history path.
 
 C3 punches collected before the PIN mapping carry the bare PIN (9) and a

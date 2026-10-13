@@ -1,0 +1,21 @@
+{#- Last 7 work days (U8, KTD7). In the drawer (drawer=true) each chip also
+    carries data-qv-day so quick-view.js swaps the drawer in place; on /day
+    the chips are plain links. Status is a dot plus text, never colour alone. -#}
+<nav class="day-strip" aria-label="Last 7 days">
+  <ol class="day-strip-list">
+  {% for d in strip %}
+    {% set status = 'Today' if d.is_today else ('Punched' if d.punched else 'No punches') %}
+    <li>
+      <a class="day-chip{% if d.punched %} is-punched{% endif %}{% if d.is_today %} is-today{% endif %}"
+        href="{{ url_for('me.day_view', employee=subject.id, date=None if d.is_today else d.date.isoformat()) }}"
+        {%- if drawer %} data-qv-day="{{ url_for('me.quick_view', employee_id=subject.id, date=d.date.isoformat(), **({'from': strip_from} if strip_from else {})) }}"{% endif %}
+        {%- if d.selected %} aria-current="date"{% endif %}
+        aria-label="{{ d.date.strftime('%A %d %B') }}, {{ status }}">
+        <span class="day-chip-dow">{{ d.date.strftime('%a') }}</span>
+        <span class="day-chip-num num">{{ d.date.day }}</span>
+        <span class="day-chip-status"><span class="day-chip-dot" aria-hidden="true"></span>{{ 'Today' if d.is_today else ('In' if d.punched else 'None') }}</span>
+      </a>
+    </li>
+  {% endfor %}
+  </ol>
+</nav>

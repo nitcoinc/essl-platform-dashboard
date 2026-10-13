@@ -14,7 +14,7 @@ import openpyxl
 from flask import Blueprint, Response, abort, g, make_response, redirect, render_template, request, url_for
 
 from .. import access, export, id_issues, roster
-from ..db import IntegrityError, RuleViolation
+from ..db import IntegrityError, RuleViolation, reports_message
 from .common import (
     ROLE_LABELS,
     ROSTER_EXAMPLE_ROW,
@@ -92,7 +92,7 @@ def _person_row(person: dict, names: dict, result) -> dict:
     }
 
 
-def _render_people(row_error: tuple[int, str] | None = None, status: int = 200):
+def _render_people(row_error: tuple[int, str] | None = None, status: int = 200, values: dict | None = None):
     query = (request.args.get("q") or "").strip()
     everyone = database.employees()
     context = {
@@ -101,6 +101,7 @@ def _render_people(row_error: tuple[int, str] | None = None, status: int = 200):
         "query": query,
         "rows": _people_rows(query, everyone),
         "row_error": row_error,
+        "row_values": values,
         "role_labels": ROLE_LABELS,
     }
     if row_error:
@@ -112,8 +113,10 @@ def _render_people(row_error: tuple[int, str] | None = None, status: int = 200):
     return _vary_htmx(make_response(render_template(template, oob=partial, **context), status))
 
 
-def _render_row(target_id: int, *, edit: bool, row_error: tuple[int, str] | None = None, focus: bool = False):
-    """One People row, as text or (edit=True) with the manager and role selects."""
+def _render_row(target_id: int, *, edit: bool, row_error: tuple[int, str] | None = None, focus: bool = False,
+                values: dict | None = None):
+    """One People row, as text or (edit=True) with the device ID input and
+    the manager and role selects."""
     person = database.employee_by_id(target_id)
     if person is None:
         abort(404)
@@ -131,6 +134,7 @@ def _render_row(target_id: int, *, edit: bool, row_error: tuple[int, str] | None
         employee=g.employee,
         csrf_token=g.csrf_token,
         row_error=row_error,
+        row_values=values,
         role_labels=ROLE_LABELS,
         focus_row=focus,
     )
@@ -181,18 +185,40 @@ def _change_assignment(target: dict, *, manager_raw: str | None, role_raw: str |
     return None
 
 
-def _assignment_response(target_id: int, result):
+def _assignment_response(target_id: int, result, values: dict | None = None):
     if request.headers.get("HX-Request"):
         # htmx swaps only 2xx responses, so the error fragment goes out as
         # 200 and carries the message in a role="alert" element. Success
         # swaps the row back to text; an error keeps it in edit mode.
         if result:
-            return _render_row(target_id, edit=True, row_error=(target_id, result[0]), focus=True)
+            return _render_row(target_id, edit=True, row_error=(target_id, result[0]), focus=True, values=values)
         return _render_row(target_id, edit=False, focus=True)
     if result is None:
         return redirect(url_for("people.people_view", q=request.args.get("q") or None))
     error, status = result
-    return _render_people(row_error=(target_id, error), status=status)
+    return _render_people(row_error=(target_id, error), status=status, values=values)
+
+
+def _device_id_change(target: dict, raw: str | None):
+    """Check an inline Device ID edit with the person form's rules (KTD5).
+    Returns (new_id or None when unchanged, (error, status) or None)."""
+    if raw is None:
+        return None, None
+    current = str(target["device_user_id"])
+    value = roster.normalize_device_id(raw, current)
+    if value == current:
+        return None, None
+    if not access.can_modify_employee(g.employee, target, "device_user_id"):
+        return None, ("Only an admin can change an admin's work email or device user ID.", 403)
+    message = roster.identity_error(target["name"], target["email"], value)
+    if message:
+        return None, (_sentence(message), 400)
+    holder = database.employee_by_device_user_id(value)
+    if holder is not None and holder["id"] != target["id"]:
+        return None, (f"{_who(holder)} already uses device ID {value}.", 400)
+    if holder is not None:
+        return None, (f"{value} is already one of {target['name']}'s other device IDs. Remove it there first.", 400)
+    return value, None
 
 
 @bp.get("/people")
@@ -216,10 +242,20 @@ def people_assign(employee_id: int):
     target = database.employee_by_id(employee_id)
     if target is None:
         abort(404)
-    result = _change_assignment(
-        target, manager_raw=request.form.get("manager_id"), role_raw=request.form.get("role")
-    )
-    return _assignment_response(employee_id, result)
+    values = {key: request.form[key] for key in ("device_user_id", "manager_id", "role") if key in request.form}
+    new_id, result = _device_id_change(target, request.form.get("device_user_id"))
+    if result is None:
+        result = _change_assignment(
+            target, manager_raw=request.form.get("manager_id"), role_raw=request.form.get("role")
+        )
+    if result is None and new_id is not None:
+        try:
+            database.update_employee(target["id"], name=target["name"], email=target["email"], device_user_id=new_id)
+        except IntegrityError:
+            result = (f"Device ID {new_id} is already in use.", 400)
+        else:
+            forget_issue_count()
+    return _assignment_response(employee_id, result, values)
 
 
 @bp.post("/people/<int:employee_id>/role")
@@ -237,6 +273,11 @@ def people_set_role(employee_id: int):
     if result is None and not request.headers.get("HX-Request"):
         return redirect(_home_for(g.employee))
     return _assignment_response(employee_id, result)
+
+
+def _who(person: dict) -> str:
+    """A clash message's name; archived people keep their IDs and email (KTD6)."""
+    return f"{person['name']} (archived)" if person.get("archived_at") else person["name"]
 
 
 def _render_person_form(target: dict | None, values: dict, errors: dict, status: int = 200):
@@ -259,6 +300,8 @@ def _render_person_form(target: dict | None, values: dict, errors: dict, status:
             role_options=role_options,
             role_labels=ROLE_LABELS,
             managers=[p for p in database.employees() if target is None or p["id"] != target["id"]],
+            extra_ids=database.extra_device_ids(target["id"]) if target is not None else [],
+            extra_locked=target is not None and not access.can_modify_employee(actor, target, "device_ids"),
         ),
         status,
     )
@@ -281,12 +324,12 @@ def _identity_errors(values: dict, target_id: int | None) -> dict:
         field = {"name": "name", "email": "email", "device": "device_user_id"}[message.split()[0]]
         return {field: _sentence(message)}
     errors = {}
-    clash = database.employee_by_email(values["email"])
+    clash = database.employee_by_email(values["email"], include_archived=True)
     if clash is not None and clash["id"] != target_id:
-        errors["email"] = f"{clash['name']} already uses this work email."
+        errors["email"] = f"{_who(clash)} already uses this work email."
     clash = database.employee_by_device_user_id(values["device_user_id"])
     if clash is not None and clash["id"] != target_id:
-        errors["device_user_id"] = f"{clash['name']} already uses this device user ID."
+        errors["device_user_id"] = f"{_who(clash)} already uses this device user ID."
     return errors
 
 
@@ -306,6 +349,7 @@ def person_new():
 def person_create():
     _require_csrf()
     values = _person_form_values()
+    values["device_user_id"] = roster.normalize_device_id(values["device_user_id"])
     errors = _identity_errors(values, None)
     role = values["role"] or "employee"
     if not errors and not access.can_assign_role(g.employee, {"role": "employee"}, role):
@@ -336,14 +380,63 @@ def person_edit(employee_id: int):
     target = database.employee_by_id(employee_id)
     if target is None:
         abort(404)
-    values = {
+    return _render_person_form(target, _target_values(target), {})
+
+
+def _target_values(target: dict) -> dict:
+    return {
         "name": target["name"],
         "email": target["email"],
         "device_user_id": target["device_user_id"],
         "manager_id": str(target.get("manager_id") or ""),
         "role": target["role"],
     }
-    return _render_person_form(target, values, {})
+
+
+def _extra_id_target(employee_id: int) -> dict:
+    target = database.employee_by_id(employee_id)
+    if target is None:
+        abort(404)
+    if not access.can_modify_employee(g.employee, target, "device_ids"):
+        abort(403)
+    return target
+
+
+@bp.post("/people/<int:employee_id>/device-ids")
+@_role_required("hr", "admin")
+def person_add_device_id(employee_id: int):
+    """Attach another device user ID (KTD2): punches under it count for this person."""
+    _require_csrf()
+    target = _extra_id_target(employee_id)
+    device_user_id = roster.normalize_device_id(request.form.get("extra_device_user_id") or "")
+    error = None
+    if not device_user_id:
+        error = "Type the other device ID."
+    elif roster.is_zero_device_id(device_user_id):
+        error = _sentence(roster.ZERO_DEVICE_ID)
+    elif (holder := database.employee_by_device_user_id(device_user_id)) is not None:
+        error = (f"{target['name']} already has this device ID." if holder["id"] == target["id"]
+                 else f"{_who(holder)} already uses device ID {device_user_id}.")
+    if error is None:
+        try:
+            database.add_extra_device_id(target["id"], device_user_id)
+        except IntegrityError:
+            error = f"Device ID {device_user_id} is already in use."
+    if error is not None:
+        return _render_person_form(target, _target_values(target), {"extra_id": error, "extra_value": device_user_id}, status=400)
+    forget_issue_count()
+    return redirect(url_for("people.person_edit", employee_id=target["id"]))
+
+
+@bp.post("/people/<int:employee_id>/device-ids/remove")
+@_role_required("hr", "admin")
+def person_remove_device_id(employee_id: int):
+    _require_csrf()
+    target = _extra_id_target(employee_id)
+    if not database.remove_extra_device_id(target["id"], (request.form.get("device_user_id") or "").strip()):
+        abort(404)
+    forget_issue_count()
+    return redirect(url_for("people.person_edit", employee_id=target["id"]))
 
 
 @bp.post("/people/<int:employee_id>/edit")
@@ -354,6 +447,7 @@ def person_update(employee_id: int):
     if target is None:
         abort(404)
     values = _person_form_values()
+    values["device_user_id"] = roster.normalize_device_id(values["device_user_id"], str(target["device_user_id"]))
     for field in ("email", "device_user_id"):
         changed = (
             values[field].lower() != str(target[field]).lower()
@@ -369,6 +463,8 @@ def person_update(employee_id: int):
                 status=403,
             )
     errors = _identity_errors(values, target["id"])
+    if errors.get("device_user_id") == _sentence(roster.ZERO_DEVICE_ID) and values["device_user_id"] == str(target["device_user_id"]):
+        del errors["device_user_id"]  # untouched legacy ID; only new IDs are checked
     if errors:
         return _render_person_form(target, values, errors, status=400)
     result = _change_assignment(target, manager_raw=values["manager_id"], role_raw=values["role"])
@@ -384,6 +480,66 @@ def person_update(employee_id: int):
         )
     forget_issue_count()
     return redirect(url_for("people.people_view", q=values["name"]))
+
+
+# --- Archive (KTD6) ----------------------------------------------------
+
+@bp.post("/people/<int:employee_id>/archive")
+@_role_required("hr", "admin")
+def person_archive(employee_id: int):
+    _require_csrf()
+    target = database.employee_by_id(employee_id)
+    if target is None:
+        abort(404)
+    refused = access.can_archive(g.employee, target)
+    if refused is None:
+        reports = database.active_report_count(target["id"])
+        if reports:
+            refused = (reports_message(reports), 400)
+    if refused is None:
+        try:
+            database.archive_employee(target["id"])
+        except RuleViolation as exc:
+            refused = (str(exc), 400)
+    if refused is not None:
+        return _render_person_form(target, _target_values(target), {"form": refused[0]}, status=refused[1])
+    forget_issue_count()
+    return _redirect_with_flash("people.people_archive_view", archived=target["name"])
+
+
+@bp.post("/people/<int:employee_id>/restore")
+@_role_required("hr", "admin")
+def person_restore(employee_id: int):
+    _require_csrf()
+    target = database.employee_by_id(employee_id, include_archived=True)
+    if target is None or not target.get("archived_at"):
+        abort(404)
+    refused = access.can_archive(g.employee, target)
+    if refused is not None:
+        abort(refused[1])
+    database.restore_employee(target["id"])
+    forget_issue_count()
+    manager = (database.employee_by_id(target["manager_id"], include_archived=True)
+               if target.get("manager_id") else None)
+    note = (f"Their manager, {manager['name']}, is archived; pick a new manager on their edit page."
+            if manager is not None and manager.get("archived_at") else "")
+    return _redirect_with_flash("people.people_archive_view", restored=target["name"], note=note)
+
+
+@bp.get("/people/archive")
+@_role_required("hr", "admin")
+def people_archive_view():
+    flash = _take_flash()
+    rows = [
+        {"person": person, "locked": access.can_archive(g.employee, person) is not None}
+        for person in database.archived_employees()
+    ]
+    response = make_response(render_template(
+        "people_archive.html", employee=g.employee, csrf_token=g.csrf_token, rows=rows, flash=flash,
+    ))
+    if request.cookies.get(_FLASH_COOKIE):
+        response.delete_cookie(_FLASH_COOKIE)
+    return response
 
 
 # --- Roster import (U6) ------------------------------------------------
@@ -485,7 +641,7 @@ def _dismissed() -> set[str]:
 
 def _issues(dismissed: set[str] | None = None) -> list[id_issues.Issue]:
     return id_issues.find_issues(
-        database.device_id_summary(), database.employees(), _dismissed() if dismissed is None else dismissed
+        database.device_id_summary(), database.employees(include_archived=True), _dismissed() if dismissed is None else dismissed
     )
 
 
@@ -562,7 +718,8 @@ def id_issues_view():
     issues.sort(key=lambda i: (order[i.severity], i.kind, i.device_user_id))
     counts = {kind: sum(1 for i in issues if i.kind == kind) for kind in ("unknown", "placeholder", "never", "name", "shared")}
     pairs = id_issues.suggestions(issues)
-    twins = id_issues.id_twins(issues)
+    roster_people = database.employees()
+    twins = id_issues.id_twins(issues, database.employees(include_archived=True))
     flash = _take_flash()
     confirm = None
     if request.args.get("confirm"):
@@ -579,7 +736,7 @@ def id_issues_view():
         twins=twins,
         fixes={i.key: id_issues.primary_fix(i, pairs, twins) for i in issues},
         lost_punches=sum(i.punch_count for i in issues if i.kind == "unknown"),
-        roster=database.employees(),
+        roster=roster_people,
         dismissed_count=len(dismissed),
         csrf_token=g.csrf_token,
         flash=flash,
@@ -601,7 +758,19 @@ def _link_preview(device_user_id: str, person: str) -> dict | str:
     clash = database.employee_by_device_user_id(device_user_id)
     if clash is not None and clash["id"] != target["id"]:
         return f"{clash['name']} already uses device ID {device_user_id}."
-    return {"device_user_id": device_user_id, "employee": target, "punches": _punch_count(device_user_id)}
+    if clash is not None:
+        return f"{target['name']} already has device ID {device_user_id}."
+    return {"device_user_id": device_user_id, "employee": target, "punches": _punch_count(device_user_id),
+            "mode": _link_mode(target)}
+
+
+def _link_mode(target: dict) -> str:
+    """KTD4: "extra" adds the ID alongside the main one; "replace" changes
+    the main ID, only when the current one has never punched."""
+    main = str(target["device_user_id"])
+    if "@" in main or _punch_count(main) == 0:
+        return "replace"
+    return "extra"
 
 
 @bp.post("/people/issues/dismiss")
@@ -634,11 +803,16 @@ def id_issues_link():
     clash = database.employee_by_device_user_id(device_user_id)
     if clash is not None and clash["id"] != target["id"]:
         return _issue_error(f"{clash['name']} already uses device ID {device_user_id}.")
+    if clash is not None:
+        return _issue_error(f"{target['name']} already has device ID {device_user_id}.")
     message = roster.identity_error(target["name"], target["email"], device_user_id)
     if message:
         return _issue_error(_sentence(message))
     try:
-        database.update_employee(target["id"], name=target["name"], email=target["email"], device_user_id=device_user_id)
+        if _link_mode(target) == "extra":
+            database.add_extra_device_id(target["id"], device_user_id)
+        else:
+            database.update_employee(target["id"], name=target["name"], email=target["email"], device_user_id=device_user_id)
     except IntegrityError:
         return _issue_error(f"Device ID {device_user_id} is already in use.")
     forget_issue_count()

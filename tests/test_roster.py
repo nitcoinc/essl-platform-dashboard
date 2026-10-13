@@ -29,11 +29,15 @@ class FakeDatabase:
         self.employees[device_user_id] = {"name": name, "email": email}
         return result
 
-    def employee_by_email(self, email: str):
+    def employee_by_email(self, email: str, include_archived: bool = False):
         for device_user_id, row in self.employees.items():
             if row["email"].lower() == email.lower():
                 return {**row, "device_user_id": device_user_id}
         return None
+
+    def employee_by_device_user_id(self, device_user_id: str):
+        row = self.employees.get(device_user_id)
+        return {**row, "device_user_id": device_user_id, "role": "employee"} if row else None
 
 
 VALID_CSV = (
@@ -272,6 +276,44 @@ class ParseXlsxTest(unittest.TestCase):
         with self.assertRaises(RosterFileError) as ctx:
             parse_xlsx(_xlsx_bytes(rows))
         self.assertIn("5000", str(ctx.exception))
+
+
+class DeviceIdRulesTest(unittest.TestCase):
+    def test_typed_ids_are_trimmed_and_upper_cased(self) -> None:
+        database = FakeDatabase()
+        apply_rows(database, [(1, "A", "a@x.com", "np0105"), (2, "B", "b@x.com", " 118 ")])
+        self.assertEqual(set(database.employees), {"NP0105", "118"})
+
+    def test_existing_legacy_id_is_kept_verbatim(self) -> None:
+        database = FakeDatabase()
+        database.employees["np0105"] = {"name": "A", "email": "a@x.com"}
+        outcomes = apply_rows(database, [(1, "A2", "a@x.com", "np0105")])
+        self.assertEqual(outcomes[0].result, "updated")
+        self.assertEqual(set(database.employees), {"np0105"})
+
+    def test_all_zero_ids_are_rejected(self) -> None:
+        for value in ("0", "00", "NP0000", "np0000"):
+            with self.subTest(value=value):
+                outcomes = apply_rows(FakeDatabase(), [(1, "A", "a@x.com", value)])
+                self.assertEqual(outcomes[0].result, "rejected")
+                self.assertEqual(outcomes[0].reason, "device ID can't be zero")
+
+    def test_leading_zeros_kept_when_not_all_zero(self) -> None:
+        database = FakeDatabase()
+        apply_rows(database, [(1, "A", "a@x.com", "0118")])
+        self.assertEqual(set(database.employees), {"0118"})
+
+    def test_xlsx_zero_padded_number_format_restores_leading_zeros(self) -> None:
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.append(["name", "work email", "device user id"])
+        sheet.append(["A", "a@x.com", 118])
+        sheet.append(["B", "b@x.com", 118])
+        sheet["C2"].number_format = "0000"
+        buffer = io.BytesIO()
+        workbook.save(buffer)
+        rows = parse_xlsx(buffer.getvalue())
+        self.assertEqual([row[3] for row in rows], ["0118", "118"])
 
 
 class UpsertConflictTest(unittest.TestCase):

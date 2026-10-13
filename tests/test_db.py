@@ -79,6 +79,7 @@ class DatabaseTest(unittest.TestCase):
                 "settings",
                 "frappe_sync_log",
                 "branding_assets",
+                "employee_device_ids",
             },
         )
 
@@ -347,11 +348,194 @@ class DatabaseTest(unittest.TestCase):
         old.migrate_schema()
         with old.connect() as connection:
             version = connection.execute("PRAGMA user_version").fetchone()["user_version"]
-        self.assertEqual(version, 5)
+        self.assertEqual(version, db_module.SCHEMA_VERSION)
         with old.connect() as connection:
             row = connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='branding_assets'").fetchone()
         self.assertIsNotNone(row)
+
+    def test_v5_to_v6_adds_archive_and_extra_ids_and_reruns_safely(self) -> None:
+        self.database.close()
+        path = os.path.join(self._tmp.name, "v5.db")
+        old = db_module.Database(path)
+        self.addCleanup(old.close)
+        with mock.patch.object(db_module, "SCHEMA_VERSION", 5), \
+                mock.patch.dict(db_module.MIGRATIONS, {}, clear=False):
+            db_module.MIGRATIONS.pop(6)
+            old.initialize(self.devices[:0])
+            old.upsert_employee(device_user_id="118", name="Asha", email="asha@x.com")
+        with old.connect() as connection:
+            columns = {r["name"] for r in connection.execute("PRAGMA table_info(employees)").fetchall()}
+        self.assertNotIn("archived_at", columns)
+        old.migrate_schema()
+        with old.transaction() as connection:  # simulate a re-run of step 6
+            connection.execute("UPDATE settings SET value='5' WHERE key='schema_version'")
+            connection.execute("PRAGMA user_version=5")
+        old.migrate_schema()
+        old.migrate_schema()
+        with old.connect() as connection:
+            columns = {r["name"] for r in connection.execute("PRAGMA table_info(employees)").fetchall()}
+            version = connection.execute("PRAGMA user_version").fetchone()["user_version"]
+            marker = connection.execute(
+                "SELECT value FROM settings WHERE key='schema_version'").fetchone()["value"]
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='employee_device_ids'"
+            ).fetchone()
+        self.assertIn("archived_at", columns)
+        self.assertIsNotNone(table)
+        self.assertEqual((version, marker), (6, "6"))
+        self.assertIsNone(old.employee_by_device_user_id("118")["archived_at"])
+
+    def test_fresh_database_has_v6_schema(self) -> None:
+        with self.database.connect() as connection:
+            columns = {r["name"] for r in connection.execute("PRAGMA table_info(employees)").fetchall()}
+            extra = {r["name"] for r in connection.execute(
+                "PRAGMA table_info(employee_device_ids)").fetchall()}
+        self.assertIn("archived_at", columns)
+        self.assertEqual(extra, {"device_user_id", "employee_id", "created_at"})
+
+    def _employee(self, device_user_id: str, email: str) -> int:
+        self.database.upsert_employee(device_user_id=device_user_id, name=email, email=email)
+        return int(self.database.employee_by_device_user_id(device_user_id)["id"])
+
+    def test_extra_device_ids_add_list_remove_and_owner(self) -> None:
+        asha = self._employee("118", "asha@x.com")
+        self.database.add_extra_device_id(asha, "NP0118")
+        self.assertEqual(self.database.extra_device_ids(asha), ["NP0118"])
+        self.assertEqual(self.database.device_user_id_owner("NP0118")["id"], asha)
+        self.assertEqual(self.database.device_user_id_owner("118")["id"], asha)
+        self.assertIsNone(self.database.device_user_id_owner("999"))
+        self.assertTrue(self.database.remove_extra_device_id(asha, "NP0118"))
+        self.assertEqual(self.database.extra_device_ids(asha), [])
+
+    def test_deleting_employee_cascades_extra_ids(self) -> None:
+        asha = self._employee("118", "asha@x.com")
+        self.database.add_extra_device_id(asha, "NP0118")
+        with self.database.transaction() as connection:
+            connection.execute("DELETE FROM employees WHERE id = ?", (asha,))
+        with self.database.connect() as connection:
+            count = connection.execute("SELECT COUNT(*) AS n FROM employee_device_ids").fetchone()["n"]
+        self.assertEqual(count, 0)
+
+    def test_device_id_unique_across_main_and_extra(self) -> None:
+        asha = self._employee("118", "asha@x.com")
+        ravi = self._employee("200", "ravi@x.com")
+        self.database.add_extra_device_id(asha, "NP0118")
+        with self.assertRaises(db_module.IntegrityError):
+            self.database.add_extra_device_id(ravi, "200")  # someone's main ID
+        with self.assertRaises(db_module.IntegrityError):
+            self.database.add_extra_device_id(ravi, "NP0118")  # someone's extra ID
+        with self.assertRaises(db_module.IntegrityError):
+            self.database.update_employee(ravi, name="Ravi", email="ravi@x.com", device_user_id="NP0118")
+        with self.assertRaises(db_module.IntegrityError):
+            self.database.upsert_employee(device_user_id="NP0118", name="New", email="new@x.com")
+        with self.assertRaises(db_module.IntegrityError):
+            self.database.create_first_admin(name="Boss", email="boss@x.com", device_user_id="NP0118")
+        # Unrelated upsert of an existing main ID still works.
+        self.assertEqual(
+            self.database.upsert_employee(device_user_id="118", name="Asha K", email="asha@x.com"), "updated"
+        )
+
+    def test_extra_ids_resolve_in_lookups_punches_and_unmapped(self) -> None:
+        asha = self._employee("NP0118", "asha@x.com")
+        self.database.insert_punches([
+            self._punch(fingerprint="a", device_user_id="NP0118"),
+            self._punch(fingerprint="b", device_user_id="118", event_timestamp=datetime(2026, 9, 10, 18, 0)),
+        ])
+        self.assertEqual([r["device_user_id"] for r in self.database.unmapped_device_user_ids()], ["118"])
+        self.database.add_extra_device_id(asha, "118")
+        self.assertEqual(self.database.unmapped_device_user_ids(), [])
+        person = self.database.employee_by_device_user_id("118")
+        self.assertEqual((person["id"], person["device_ids"]), (asha, ["NP0118", "118"]))
+        self.assertEqual(self.database.employee_by_id(asha)["device_ids"], ["NP0118", "118"])
+        self.assertEqual(self.database.employees()[0]["device_ids"], ["NP0118", "118"])
+        self.assertEqual(db_module.device_ids_of({"device_user_id": "7"}), ["7"])
+        rows = self.database.punches_for_employee_range(
+            db_module.device_ids_of(person), datetime(2026, 9, 10), datetime(2026, 9, 11)
+        )
+        self.assertEqual(len(rows), 2)
+
+    def test_frappe_and_checkins_send_main_id_and_requeue_skipped_extra_punches(self) -> None:
+        asha = self._employee("NP0118", "asha@x.com")
+        self.database.insert_punches([self._punch(fingerprint="b", device_user_id="118")])
+        punch_id = self.database.frappe_pending_punches(since=None, limit=10)[0]["id"]
+        self.database.record_frappe_sync(punch_id, status="skipped", error="Employee not found")
+        self.assertEqual(self.database.frappe_pending_punches(since=None, limit=10), [])
+        self.database.add_extra_device_id(asha, "118")
+        pending = self.database.frappe_pending_punches(since=None, limit=10)
+        self.assertEqual([(p["id"], p["device_user_id"]) for p in pending], [(punch_id, "NP0118")])
+        self.assertEqual(
+            [r["device_user_id"] for r in self.database.checkins_since(since=None, limit=10)], ["NP0118"]
+        )
+
+    def test_main_id_change_requeues_skipped_punches(self) -> None:
+        asha = self._employee("asha@x.com", "asha@x.com")
+        self.database.insert_punches([self._punch(fingerprint="b", device_user_id="777")])
+        punch_id = self.database.frappe_pending_punches(since=None, limit=10)[0]["id"]
+        self.database.record_frappe_sync(punch_id, status="skipped", error="Employee not found")
+        self.database.update_employee(asha, name="Asha", email="asha@x.com", device_user_id="777")
+        pending = self.database.frappe_pending_punches(since=None, limit=10)
+        self.assertEqual([(p["id"], p["device_user_id"]) for p in pending], [(punch_id, "777")])
+
+    def test_archive_hides_person_and_restore_brings_them_back(self) -> None:
+        asha = self._employee("118", "asha@x.com")
+        self.database.add_extra_device_id(asha, "NP0118")
+        before = self.database.employee_by_id(asha)
+        self.database.archive_employee(asha)
+        self.assertIsNone(self.database.employee_by_id(asha))
+        self.assertIsNone(self.database.employee_by_email("asha@x.com"))
+        self.assertIsNotNone(self.database.employee_by_email("asha@x.com", include_archived=True))
+        self.assertEqual(self.database.employees(), [])
+        self.assertEqual([e["id"] for e in self.database.employees(include_archived=True)], [asha])
+        archived = self.database.archived_employees()
+        self.assertEqual(archived[0]["device_ids"], ["118", "NP0118"])
+        self.assertIsInstance(archived[0]["archived_at"], datetime)
+        # Their IDs stay mapped: punches never resurface as unknown.
+        self.database.insert_punches([self._punch(device_user_id="NP0118")])
+        self.assertEqual(self.database.unmapped_device_user_ids(), [])
+        self.assertEqual(self.database.employee_by_device_user_id("NP0118")["id"], asha)
+        self.assertTrue(self.database.restore_employee(asha))
+        self.assertFalse(self.database.restore_employee(asha))
+        after = self.database.employee_by_id(asha)
+        for row in (before, after):
+            row.pop("archived_at"), row.pop("updated_at")
+        self.assertEqual(before, after)
+
+    def test_archived_with_punches_only_in_range(self) -> None:
+        asha = self._employee("118", "asha@x.com")
+        self.database.insert_punches([self._punch(event_timestamp=datetime(2026, 9, 10, 9, 0))])
+        self.database.archive_employee(asha)
+        inside = self.database.archived_employees_with_punches(datetime(2026, 9, 10), datetime(2026, 9, 11))
+        outside = self.database.archived_employees_with_punches(datetime(2026, 9, 11), datetime(2026, 9, 12))
+        self.assertEqual([e["id"] for e in inside], [asha])
+        self.assertEqual(outside, [])
+        self.assertIsInstance(self.database.archived_employees()[0]["last_punch"], datetime)
+
+    def test_archive_guards_last_admin_and_direct_reports(self) -> None:
+        boss = self._employee("1", "boss@x.com")
+        worker = self._employee("2", "worker@x.com")
+        self.database.set_employee_role(boss, "admin")
+        with self.assertRaisesRegex(db_module.RuleViolation, "last admin"):
+            self.database.archive_employee(boss)
+        self.database.set_employee_role(worker, "admin")
+        self.database.set_employee_manager(worker, boss)
+        with self.assertRaisesRegex(db_module.RuleViolation, "1 person reports"):
+            self.database.archive_employee(boss)
+        self.database.set_employee_manager(worker, None)
+        self.database.archive_employee(boss)
+        # Archived admins don't count: the remaining admin is now the last.
+        self.assertTrue(self.database.has_admin())
+        with self.assertRaises(db_module.RuleViolation):
+            self.database.set_employee_role(worker, "employee")
+
+    def test_archive_ends_sessions(self) -> None:
+        asha = self._employee("118", "asha@x.com")
+        self.database.create_session(employee_id=asha, token_hash="t", csrf_token="c",
+                                     expires_at=datetime.now() + timedelta(days=1))
+        self.assertIsNotNone(self.database.session_employee("t"))
+        self.database.archive_employee(asha)
+        self.database.restore_employee(asha)
+        self.assertIsNone(self.database.session_employee("t"))
 
     def test_record_poll_commits_punches_and_device_row_together(self) -> None:
         inserted = self.database.record_poll(

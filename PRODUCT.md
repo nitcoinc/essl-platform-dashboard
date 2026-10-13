@@ -12,8 +12,10 @@ Four roles:
 
 - **employee** checks their own punches, effective hours and progress against the daily target. Lands on Today.
 - **manager** does the same, plus sees and exports the hours of everyone who reports to them, directly or indirectly. Lands on Team.
-- **hr** sees and exports everyone, manages people (roster import, add and edit, managers, roles up to hr), and reads device health. Nobody takes backups by hand: Turso keeps point-in-time history and a nightly export lands in R2. Lands on Everyone.
+- **hr** sees and exports every employee, manages the Directory (roster file import, add, edit, archive and restore, managers, roles up to hr), and reads device health. Nobody takes backups by hand: Turso keeps point-in-time history and a nightly export lands in R2. Lands on Employees.
 - **admin** has everything hr has, plus grants admin, adds, edits, retires and re-enables devices, and sets the daily target and HRMS API keys.
+
+Vocabulary: **Employees** is the HR/admin hours list (managers see the same page as **Team**); **Directory** is the list of people under People. Never "Everyone" or "Roster" for either; "roster" means only the import file.
 
 Each person has at most one manager. Nobody can see someone outside their scope; such a request looks exactly like a missing record.
 
@@ -39,6 +41,19 @@ One Docker Compose stack on an office Linux host with routes to `192.168.1.201` 
 - Device deletion/clearing/reset operations are out of scope and must never be exposed. Retire is the only way to stop polling a device.
 - Communication passwords can be set by an admin on the Devices page; Turso, R2, tunnel and email credentials come only from the server's `.env` (mode 600), never browser fields or source code.
 - Only the nightly export holds an R2 token, scoped to the one export bucket (R2 has no write-only permission; bucket lock protects old exports). It reads Turso with a read-only token.
+
+## People, device IDs and archive
+
+- Each person has one **main device ID** and any number of **extra IDs** (for example the same person enrolled as `NP0009` on the X990 and `9` on a C3 without zero padding). Punches under any of them count as that person's. An ID belongs to at most one person, main or extra, across both lists.
+- Typed IDs are trimmed and upper-cased. An ID whose digits are all zero (`0`, `00`, `NP0000`) is refused: devices use 0 for "no user", so it would collect unrelated punches.
+- Linking an unknown ID from ID issues adds it as an extra ID when the person's main ID already has punches; otherwise it replaces the main ID.
+- **Archive** is for people who have left. An archived person leaves every working view, is signed out and cannot sign in; their punches, past hours and IDs are kept, exports and the hours API still include them for ranges where they punched, and their IDs never show as unknown. Archiving is refused for the last admin or anyone who still has reports. A roster import never edits or silently restores an archived person. Restore brings them back unchanged.
+
+## Break rules
+
+- A swipe within 60 seconds of the person's previous kept swipe (any device) is a duplicate: stored and shown "not counted", never paired.
+- A gap between two paired stretches is a **break** only when it is a clean out-then-in. A gap holding an unpaired swipe is **unclear**: totalled separately, never counted as break, so gross = effective + breaks + unclear.
+- The C3 records event 20 ("Too Short Punch Interval") when a swipe comes too soon after the previous one at the same door; the door does not open, but the person was there. The collector stores it as attendance with the note "interval too short". Recommend setting the C3 door **Punch Interval** to 1 second or less so real swipes are not denied.
 
 ## Evidence on Hand
 

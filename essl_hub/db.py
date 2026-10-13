@@ -20,7 +20,7 @@ _TZ = ZoneInfo(TIMEZONE_NAME)
 _logger = logging.getLogger(__name__)
 
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Seconds the TCP probe waits before calling the primary unreachable. libsql's
 # own replica connect can block ~134s holding the GIL on a black-holed address
@@ -43,6 +43,8 @@ TIMESTAMP_COLUMNS = frozenset(
         "consumed_at",
         "last_used_at",
         "synced_at",
+        "archived_at",
+        "last_punch",
     }
 )
 JSON_COLUMNS = frozenset({"raw_json"})
@@ -126,6 +128,41 @@ def _dict_row(names: list[str], row: tuple | None) -> dict[str, object] | None:
     if row is None:
         return None
     return {name: _convert(name, value) for name, value in zip(names, row)}
+
+
+def device_ids_of(employee: dict) -> list[str]:
+    """Every device user ID of one employee, main ID first (v6). Rows from
+    Database employee lookups carry ``device_ids``; anything else (a bare
+    dict) falls back to the main ID alone."""
+    ids = employee.get("device_ids")
+    if ids:
+        return list(ids)
+    main = employee.get("device_user_id")
+    return [str(main)] if main else []
+
+
+def _attach_device_ids(connection, rows):
+    """Add ``device_ids`` (main first, then extras oldest first) to employee rows."""
+    rows = [row for row in rows if row is not None]
+    if not rows:
+        return rows
+    extras: dict[object, list[str]] = {}
+    for row in connection.execute(
+        "SELECT employee_id, device_user_id FROM employee_device_ids "
+        "ORDER BY created_at, device_user_id"
+    ).fetchall():
+        extras.setdefault(row["employee_id"], []).append(str(row["device_user_id"]))
+    for row in rows:
+        row["device_ids"] = [str(row["device_user_id"]), *extras.get(row["id"], [])]
+    return rows
+
+
+# Punch device user ID as Frappe knows it: an extra ID becomes its owner's main ID.
+_MAIN_ID_SQL = (
+    "COALESCE((SELECT e.device_user_id FROM employee_device_ids x "
+    "JOIN employees e ON e.id = x.employee_id WHERE x.device_user_id = p.device_user_id), "
+    "p.device_user_id)"
+)
 
 
 def _parse_timestamp(value: object) -> datetime | None:
@@ -405,6 +442,53 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
             sha256 TEXT NOT NULL,
             updated_at TIMESTAMP NOT NULL
         )
+        """,
+    ),
+    # v6: archive instead of delete, and extra device IDs per person. A
+    # device user ID lives in exactly one place: employees.device_user_id or
+    # employee_device_ids. The triggers guard every write path; the message
+    # carries "constraint failed" so classify_error maps it to IntegrityError.
+    6: (
+        "ALTER TABLE employees ADD COLUMN archived_at TIMESTAMP",
+        """
+        CREATE TABLE IF NOT EXISTS employee_device_ids (
+            device_user_id TEXT PRIMARY KEY,
+            employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+            created_at TIMESTAMP NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_employee_device_ids_employee ON employee_device_ids(employee_id)",
+        """
+        CREATE TRIGGER IF NOT EXISTS employees_device_id_insert_unique
+        BEFORE INSERT ON employees
+        WHEN EXISTS (SELECT 1 FROM employee_device_ids WHERE device_user_id = NEW.device_user_id)
+        BEGIN
+            SELECT RAISE(ABORT, 'UNIQUE constraint failed: device user ID is an extra ID');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS employees_device_id_update_unique
+        BEFORE UPDATE OF device_user_id ON employees
+        WHEN EXISTS (SELECT 1 FROM employee_device_ids WHERE device_user_id = NEW.device_user_id)
+        BEGIN
+            SELECT RAISE(ABORT, 'UNIQUE constraint failed: device user ID is an extra ID');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS employee_device_ids_insert_unique
+        BEFORE INSERT ON employee_device_ids
+        WHEN EXISTS (SELECT 1 FROM employees WHERE device_user_id = NEW.device_user_id)
+        BEGIN
+            SELECT RAISE(ABORT, 'UNIQUE constraint failed: device user ID is a main ID');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS employee_device_ids_update_unique
+        BEFORE UPDATE OF device_user_id ON employee_device_ids
+        WHEN EXISTS (SELECT 1 FROM employees WHERE device_user_id = NEW.device_user_id)
+        BEGIN
+            SELECT RAISE(ABORT, 'UNIQUE constraint failed: device user ID is a main ID');
+        END
         """,
     ),
 }
@@ -743,7 +827,7 @@ class Database:
             return
         with self.transaction() as connection:
             existing_admin = connection.execute(
-                "SELECT 1 FROM employees WHERE role = 'admin' LIMIT 1"
+                "SELECT 1 FROM employees WHERE role = 'admin' AND archived_at IS NULL LIMIT 1"
             ).fetchone()
             if existing_admin is not None:
                 return
@@ -958,17 +1042,21 @@ class Database:
         return list(rows)
 
     def punches_for_employee_range(
-        self, device_user_id: str, start: datetime, end: datetime
+        self, device_user_ids: str | Iterable[str], start: datetime, end: datetime
     ) -> list[dict[str, object]]:
+        """One person's punches; pass every ID (``device_ids_of``) so punches
+        under extra IDs count too."""
+        ids = [device_user_ids] if isinstance(device_user_ids, str) else sorted(set(device_user_ids))
         with self.connect() as connection:
             rows = connection.execute(
                 """
                 SELECT event_timestamp, trusted_direction, raw_direction_byte, raw_state
                 FROM punches
-                WHERE device_user_id = ? AND event_timestamp >= ? AND event_timestamp < ?
+                WHERE device_user_id IN (SELECT value FROM json_each(?))
+                  AND event_timestamp >= ? AND event_timestamp < ?
                 ORDER BY event_timestamp ASC
                 """,
-                (device_user_id, start, end),
+                (json.dumps(ids), start, end),
             ).fetchall()
         return list(rows)
 
@@ -1025,28 +1113,180 @@ class Database:
                 """,
                 (name, email, device_user_id, _now(), employee_id),
             )
+            # A new main ID may own punches Frappe skipped (employee not found).
+            connection.execute(
+                "DELETE FROM frappe_sync_log WHERE status = 'skipped' AND punch_id IN "
+                "(SELECT id FROM punches WHERE device_user_id = ?)",
+                (device_user_id,),
+            )
 
-    def employees(self) -> list[dict[str, object]]:
+    def extra_device_ids(self, employee_id: int) -> list[str]:
+        """Extra device user IDs for one employee (v6), oldest first."""
         with self.connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM employees ORDER BY name"
+                "SELECT device_user_id FROM employee_device_ids WHERE employee_id = ? "
+                "ORDER BY created_at, device_user_id",
+                (employee_id,),
             ).fetchall()
-        return list(rows)
+        return [str(row["device_user_id"]) for row in rows]
 
-    def employee_by_email(self, email: str) -> dict[str, object] | None:
+    def add_extra_device_id(self, employee_id: int, device_user_id: str) -> None:
+        """Attach an extra device user ID. Raises IntegrityError when the ID is
+        already anyone's main or extra ID (PRIMARY KEY plus v6 triggers).
+
+        Punches under the ID that Frappe skipped (employee not found) are
+        re-queued: they now push under the owner's main ID."""
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO employee_device_ids (device_user_id, employee_id, created_at) "
+                "VALUES (?, ?, ?)",
+                (device_user_id, employee_id, _now()),
+            )
+            connection.execute(
+                "DELETE FROM frappe_sync_log WHERE status = 'skipped' AND punch_id IN "
+                "(SELECT id FROM punches WHERE device_user_id = ?)",
+                (device_user_id,),
+            )
+
+    def remove_extra_device_id(self, employee_id: int, device_user_id: str) -> bool:
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "DELETE FROM employee_device_ids WHERE employee_id = ? AND device_user_id = ?",
+                (employee_id, device_user_id),
+            )
+        return cursor.rowcount > 0
+
+    def device_user_id_owner(self, device_user_id: str) -> dict[str, object] | None:
+        """The employee holding this ID as main or extra ID, or None."""
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT * FROM employees WHERE lower(email) = lower(?)",
+                """
+                SELECT e.* FROM employees e WHERE e.device_user_id = ?
+                UNION ALL
+                SELECT e.* FROM employee_device_ids x JOIN employees e ON e.id = x.employee_id
+                WHERE x.device_user_id = ?
+                LIMIT 1
+                """,
+                (device_user_id, device_user_id),
+            ).fetchone()
+        return row
+
+    def archive_employee(self, employee_id: int) -> None:
+        """Archive one person (KTD6), guarded in the UPDATE itself: not the
+        last active admin, not someone with active direct reports. Ends every
+        session they hold. Self and HR/admin rules live in access.can_archive."""
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE employees SET archived_at = ?, updated_at = ?
+                WHERE id = ? AND archived_at IS NULL
+                  AND (role <> 'admin' OR (
+                      SELECT COUNT(*) FROM employees WHERE role = 'admin' AND archived_at IS NULL) > 1)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM employees r WHERE r.manager_id = ? AND r.archived_at IS NULL)
+                """,
+                (_now(), _now(), employee_id, employee_id),
+            )
+            if cursor.rowcount:
+                connection.execute("DELETE FROM sessions WHERE employee_id = ?", (employee_id,))
+                return
+            row = connection.execute(
+                "SELECT role, archived_at FROM employees WHERE id = ?", (employee_id,)
+            ).fetchone()
+            if row is None:
+                raise RuleViolation("No such employee.")
+            if row["archived_at"] is not None:
+                raise RuleViolation("Already archived.")
+            reports = connection.execute(
+                "SELECT COUNT(*) AS n FROM employees WHERE manager_id = ? AND archived_at IS NULL",
+                (employee_id,),
+            ).fetchone()["n"]
+            if reports:
+                raise RuleViolation(reports_message(reports))
+            raise RuleViolation("The last admin cannot be archived.")
+
+    def restore_employee(self, employee_id: int) -> bool:
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE employees SET archived_at = NULL, updated_at = ? "
+                "WHERE id = ? AND archived_at IS NOT NULL",
+                (_now(), employee_id),
+            )
+        return cursor.rowcount > 0
+
+    def active_report_count(self, employee_id: int) -> int:
+        with self.connect() as connection:
+            return connection.execute(
+                "SELECT COUNT(*) AS n FROM employees WHERE manager_id = ? AND archived_at IS NULL",
+                (employee_id,),
+            ).fetchone()["n"]
+
+    def employees(self, include_archived: bool = False) -> list[dict[str, object]]:
+        """Active people by default; archived ones only when asked (KTD6)."""
+        where = "" if include_archived else " WHERE archived_at IS NULL"
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM employees{where} ORDER BY name"
+            ).fetchall()
+            return _attach_device_ids(connection, list(rows))
+
+    def archived_employees(self) -> list[dict[str, object]]:
+        """Archived people, most recently archived first, with their last punch."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT e.*, (
+                    SELECT MAX(p.event_timestamp) FROM punches p
+                    WHERE p.device_user_id = e.device_user_id OR p.device_user_id IN (
+                        SELECT x.device_user_id FROM employee_device_ids x WHERE x.employee_id = e.id)
+                ) AS last_punch
+                FROM employees e WHERE e.archived_at IS NOT NULL
+                ORDER BY e.archived_at DESC, e.name
+                """
+            ).fetchall()
+            people = _attach_device_ids(connection, list(rows))
+        for person in people:
+            if isinstance(person.get("last_punch"), str):
+                person["last_punch"] = datetime.fromisoformat(person["last_punch"])
+        return people
+
+    def archived_employees_with_punches(self, start: datetime, end: datetime) -> list[dict[str, object]]:
+        """Archived people with any punch in [start, end), so exports and the
+        hours API keep their past hours (archiving never drops data)."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT e.* FROM employees e
+                WHERE e.archived_at IS NOT NULL AND EXISTS (
+                    SELECT 1 FROM punches p
+                    WHERE p.event_timestamp >= ? AND p.event_timestamp < ?
+                      AND (p.device_user_id = e.device_user_id OR p.device_user_id IN (
+                          SELECT x.device_user_id FROM employee_device_ids x WHERE x.employee_id = e.id))
+                )
+                ORDER BY e.name
+                """,
+                (start, end),
+            ).fetchall()
+            return _attach_device_ids(connection, list(rows))
+
+    def employee_by_email(self, email: str, include_archived: bool = False) -> dict[str, object] | None:
+        archived = "" if include_archived else " AND archived_at IS NULL"
+        with self.connect() as connection:
+            row = connection.execute(
+                f"SELECT * FROM employees WHERE lower(email) = lower(?){archived}",
                 (email,),
             ).fetchone()
-        return row
+            return (_attach_device_ids(connection, [row]) or [None])[0]
 
-    def employee_by_id(self, employee_id: int) -> dict[str, object] | None:
+    def employee_by_id(self, employee_id: int, include_archived: bool = False) -> dict[str, object] | None:
+        """Viewing paths treat archived people as not found; only archive,
+        restore and the Archive tab pass include_archived."""
+        archived = "" if include_archived else " AND archived_at IS NULL"
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT * FROM employees WHERE id = ?", (employee_id,)
+                f"SELECT * FROM employees WHERE id = ?{archived}", (employee_id,)
             ).fetchone()
-        return row
+            return (_attach_device_ids(connection, [row]) or [None])[0]
 
     def set_employee_role(self, employee_id: int, role: str) -> None:
         """Guarded in one statement (KTD7): the admin count is evaluated by the
@@ -1058,7 +1298,7 @@ class Database:
                 UPDATE employees SET role = ?, updated_at = ?
                 WHERE id = ? AND (
                     role <> 'admin' OR ? = 'admin'
-                    OR (SELECT COUNT(*) FROM employees WHERE role = 'admin') > 1
+                    OR (SELECT COUNT(*) FROM employees WHERE role = 'admin' AND archived_at IS NULL) > 1
                 )
                 """,
                 (role, _now(), employee_id, role),
@@ -1134,16 +1374,24 @@ class Database:
             return _manager_chain(connection, employee_id)
 
     def employee_by_device_user_id(self, device_user_id: str) -> dict[str, object] | None:
+        """The holder of a main or extra device user ID (archived included)."""
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT * FROM employees WHERE device_user_id = ?", (device_user_id,)
+                """
+                SELECT e.* FROM employees e WHERE e.device_user_id = ?
+                UNION ALL
+                SELECT e.* FROM employee_device_ids x JOIN employees e ON e.id = x.employee_id
+                WHERE x.device_user_id = ?
+                LIMIT 1
+                """,
+                (device_user_id, device_user_id),
             ).fetchone()
-        return row
+            return (_attach_device_ids(connection, [row]) or [None])[0]
 
     def has_admin(self) -> bool:
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT 1 FROM employees WHERE role = 'admin' LIMIT 1"
+                "SELECT 1 FROM employees WHERE role = 'admin' AND archived_at IS NULL LIMIT 1"
             ).fetchone()
         return row is not None
 
@@ -1181,6 +1429,9 @@ class Database:
                 FROM punches p
                 LEFT JOIN employees e ON e.device_user_id = p.device_user_id
                 WHERE e.id IS NULL AND p.device_user_id IS NOT NULL
+                    AND NOT EXISTS (
+                        SELECT 1 FROM employee_device_ids x WHERE x.device_user_id = p.device_user_id
+                    )
                     AND p.device_user_id <> ''
                 GROUP BY p.device_user_id
                 ORDER BY p.device_user_id
@@ -1290,10 +1541,11 @@ class Database:
                 SELECT e.*, s.csrf_token FROM sessions s
                 JOIN employees e ON e.id = s.employee_id
                 WHERE s.token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > ?
+                  AND e.archived_at IS NULL
                 """,
                 (token_hash, _now()),
             ).fetchone()
-        return row
+            return (_attach_device_ids(connection, [row]) or [None])[0]
 
     def revoke_session(self, token_hash: str) -> None:
         with self.transaction() as connection:
@@ -1353,7 +1605,8 @@ class Database:
     def frappe_pending_punches(self, *, since: datetime | None, limit: int) -> list[dict]:
         """Punches with no frappe_sync_log row, oldest first."""
         sql = (
-            "SELECT p.id, p.device_id, p.device_user_id, p.event_timestamp, p.trusted_direction "
+            f"SELECT p.id, p.device_id, {_MAIN_ID_SQL} AS device_user_id, "
+            "p.event_timestamp, p.trusted_direction "
             "FROM punches p LEFT JOIN frappe_sync_log f ON f.punch_id = p.id "
             "WHERE f.punch_id IS NULL"
         )
@@ -1399,15 +1652,16 @@ class Database:
 
     def checkins_since(self, *, since: datetime | None, limit: int) -> list[dict]:
         sql = (
-            "SELECT id, device_id, device_user_id, event_timestamp, trusted_direction "
-            "FROM punches WHERE event_timestamp IS NOT NULL "
-            "AND device_user_id IS NOT NULL AND device_user_id != ''"
+            f"SELECT p.id, p.device_id, {_MAIN_ID_SQL} AS device_user_id, "
+            "p.event_timestamp, p.trusted_direction "
+            "FROM punches p WHERE p.event_timestamp IS NOT NULL "
+            "AND p.device_user_id IS NOT NULL AND p.device_user_id != ''"
         )
         params: list[object] = []
         if since is not None:
-            sql += " AND event_timestamp > ?"
+            sql += " AND p.event_timestamp > ?"
             params.append(since)
-        sql += " ORDER BY event_timestamp, id LIMIT ?"
+        sql += " ORDER BY p.event_timestamp, p.id LIMIT ?"
         params.append(limit)
         with self.connect() as connection:
             return connection.execute(sql, params).fetchall()
@@ -1436,6 +1690,11 @@ def _manager_chain(connection: _Connection, employee_id: int) -> list[int]:
         (employee_id,),
     ).fetchall()
     return [row["id"] for row in rows]
+
+
+def reports_message(count: int) -> str:
+    people = "person reports" if count == 1 else "people report"
+    return f"{count} {people} to them. Give them another manager first."
 
 
 def _now() -> datetime:

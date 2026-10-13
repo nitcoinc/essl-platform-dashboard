@@ -1,0 +1,50 @@
+{#- Break view (KTD10): summary, day bar, numbered break list, then every
+    stored swipe under a closed <details>. Same partial on Today and in the
+    quick-view drawer; the list is the text alternative for the bar. -#}
+{% import "_ui.html" as ui %}
+{% set bv = breaks %}
+<section class="day-section day-breaks" aria-labelledby="breaks-heading">
+  <h2 id="breaks-heading">Breaks</h2>
+  {% if bv.bar %}
+  <dl class="break-summary">
+    <div><dt>Inside</dt><dd><span class="num"{% if live %} data-tick="{{ bv.inside_seconds }}"{% endif %}>{{ ui.clock(bv.inside_seconds) }}</span></dd></div>
+    <div><dt>Breaks</dt><dd><span class="num">{{ ui.clock(bv.break_seconds) }}</span> · {% if bv.break_count %}<span class="num">{{ bv.break_count }}</span>{% else %}none{% endif %}</dd></div>
+    {% if bv.unclear_seconds %}<div class="is-unclear"><dt>Unclear</dt><dd><span class="num">{{ ui.clock(bv.unclear_seconds) }}</span></dd></div>{% endif %}
+  </dl>
+  <div class="day-bar" role="img" aria-label="{{ bv.bar_label }}">
+    {% for seg in bv.bar %}
+    <span class="bar-seg is-{{ seg.kind }}{{ ' is-open' if seg.open }}" style="flex-grow: {{ seg.percent }}" title="{% if seg.kind == 'break' %}Break {{ seg.number }}{% elif seg.kind == 'unclear' %}Unclear{% else %}Inside{% endif %} · {{ seg.start.strftime('%H:%M') }} → {{ 'now' if seg.open else seg.end.strftime('%H:%M') }}">{% if seg.kind == 'break' %}<span class="bar-num">{{ seg.number }}</span>{% endif %}</span>
+    {% endfor %}
+  </div>
+  <div class="bar-axis num" aria-hidden="true"><span>{{ bv.bar_start.strftime('%H:%M') }}</span><span>{{ 'now' if live else bv.bar_end.strftime('%H:%M') }}</span></div>
+  {% if bv.gaps %}
+  <table class="break-list">
+    <caption class="visually-hidden">Breaks in time order</caption>
+    <thead><tr><th scope="col">#</th><th scope="col">Out at</th><th scope="col">Back at</th><th scope="col" class="num">Duration</th></tr></thead>
+    <tbody>
+      {% for gap in bv.gaps %}
+      <tr class="is-{{ gap.kind }}">
+        <th scope="row">{% if gap.kind == 'break' %}#{{ gap.number }}{% else %}Unclear{% endif %}</th>
+        <td class="num">{{ gap.start.strftime('%H:%M:%S') }}</td>
+        <td class="num break-back">{{ gap.end.strftime('%H:%M:%S') }}</td>
+        <td class="num break-dur">{{ ui.clock(gap.seconds) }}{% if gap.unpaired %}<span class="break-note">swipe at {% for t, d in gap.unpaired %}<span class="num">{{ t.strftime('%H:%M:%S') }}</span> ({{ 'In' if d == 'entry' else 'Out' }}){{ ', ' if not loop.last }}{% endfor %}, not counted as break</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+    <tfoot><tr><th scope="row" colspan="3">Breaks total</th><td class="num">{{ ui.clock(bv.break_seconds) }}</td></tr></tfoot>
+  </table>
+  {% endif %}
+  {% endif %}
+  {% if bv.punches %}
+  <details class="raw-punches">
+    <summary>All punches ({{ bv.punches|length }})</summary>
+    <ol class="punch-list">
+      {% for p in bv.punches %}
+      <li><span class="punch-time num">{{ p.time.strftime('%H:%M:%S') }}{% if p.time.date() > day %}<sup title="Next calendar day">+1</sup>{% endif %}</span><span class="punch-dir">{{ {'entry': 'In', 'exit': 'Out'}.get(p.direction, 'Swipe') }}</span>{% for f in p.flags %}{{ ui.chip(f, 'neutral' if f == 'not counted' else 'warn') }}{% endfor %}</li>
+      {% endfor %}
+      {% if result.status != 'open' and result.segments and result.segments[-1].end is none %}<li class="is-missing"><span class="punch-time">--:--:--</span><span class="punch-dir">No exit recorded</span></li>{% endif %}
+    </ol>
+  </details>
+  {% endif %}
+  <p class="footnote">Hours come only from the door devices. Nobody can add or edit a punch by hand.</p>
+</section>

@@ -7,7 +7,7 @@
 {% block content %}
 <header class="topbar">
   <div>
-    {% if other %}<a class="back-link" href="{{ url_for('team.team_view') }}">{{ ui.icon('arrow-left') }}<span>{{ 'Everyone' if employee.role in ('hr', 'admin') else 'Team' }}</span></a>
+    {% if other %}<a class="back-link" href="{{ url_for('team.team_view') }}">{{ ui.icon('arrow-left') }}<span>{{ 'Employees' if employee.role in ('hr', 'admin') else 'Team' }}</span></a>
     <p class="subject-name">{{ subject.name }}</p>{% endif %}
     <h1>{{ 'Today' if is_today else day.strftime('%A') }}</h1>
     <p>{{ day.strftime('%A %d %B %Y') }} <span class="muted">· work day from {{ day_start }}</span></p>
@@ -20,5 +20,6 @@
   </nav>
 </header>
 
+{% if strip %}{% with drawer=false, strip_from=none %}{% include "_day_strip.html" %}{% endwith %}{% endif %}
 {% include "_day_live.html" %}
 {% endblock %}

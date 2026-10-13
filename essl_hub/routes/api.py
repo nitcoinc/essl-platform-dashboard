@@ -17,6 +17,7 @@ from .common import (
     _day_start_label,
     _parse_date,
     _now_naive,
+    _people_for_range,
     _target_minutes,
     database,
 )
@@ -49,7 +50,7 @@ def api_hours() -> tuple[Response, int] | Response:
     now = _now_naive()
     day_start_hour = _day_start_hour(database)
     rows = []
-    for employee in database.employees():
+    for employee in _people_for_range(database, start, end, day_start_hour):
         for day in _date_range(start, end):
             result = _day_for_employee(
                 database, employee, day, target_minutes, now=now, day_start_hour=day_start_hour

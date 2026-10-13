@@ -10,12 +10,13 @@
     <div><dt>Manager</dt><dd>{% if manager_name %}{{ manager_name }}{% else %}<span class="muted">-</span>{% endif %}</dd></div>
     <div><dt>Role</dt><dd>{{ role_label }}</dd></div>
     <div><dt>Email</dt><dd class="qv-email">{{ subject.email }}</dd></div>
-    <div><dt>Device ID</dt><dd class="num">{{ subject.device_user_id }}</dd></div>
+    <div><dt>Device ID</dt><dd class="num">{{ (subject.device_ids or [subject.device_user_id])|join(', ') }}</dd></div>
   </dl>
+  {% with drawer=true %}{% include "_day_strip.html" %}{% endwith %}
   {% include "_day_live.html" %}
 </div>
 <footer class="qv-foot">
   <a class="button button-primary button-sm" href="{{ url_for('me.day_view', employee=subject.id) }}">Open full day</a>
   <a class="button button-secondary button-sm" href="{{ url_for('me.week_view', employee=subject.id) }}">Week</a>
-  {% if can_edit %}<a class="button button-tertiary button-sm" href="{{ url_for('people.person_edit', employee_id=subject.id) }}">Edit details</a>{% endif %}
+  {% if can_edit %}<a class="button button-secondary button-sm" href="{{ url_for('people.person_edit', employee_id=subject.id) }}">Edit details</a>{% endif %}
 </footer>

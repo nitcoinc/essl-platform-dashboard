@@ -10,6 +10,9 @@
   }
   var opener = null;
   var url = null;
+  // Set by a day-strip click (U8): after the swap, focus the selected chip
+  // instead of the heading. Opener and its from= query stay untouched.
+  var focusDay = false;
 
   function fill(id) {
     body.replaceChildren(document.getElementById(id).content.cloneNode(true));
@@ -36,6 +39,7 @@
   }
 
   function showError(missing) {
+    focusDay = false;
     body.removeAttribute("aria-busy");
     labelStatic();
     fill(missing ? "quick-view-missing" : "quick-view-error");
@@ -67,6 +71,18 @@
   });
 
   dialog.addEventListener("click", function (event) {
+    var day = event.target.closest ? event.target.closest("a[data-qv-day]") : null;
+    if (day) {
+      if (event.defaultPrevented || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || !window.htmx) {
+        return;
+      }
+      event.preventDefault();
+      url = day.dataset.qvDay;
+      focusDay = true;
+      body.setAttribute("aria-busy", "true");
+      window.htmx.ajax("GET", url, { source: day, target: "#quick-view-body", swap: "innerHTML" });
+      return;
+    }
     // The dialog has no padding, so a hit on the dialog itself is the backdrop.
     if (event.target === dialog || event.target.closest("[data-qv-close]")) {
       dialog.close();
@@ -79,6 +95,7 @@
     // Emptying the body removes #day-live, which stops timer.js.
     body.replaceChildren();
     body.removeAttribute("aria-busy");
+    focusDay = false;
     labelStatic();
     var back = opener;
     opener = null;
@@ -94,9 +111,15 @@
     }
     body.removeAttribute("aria-busy");
     var heading = document.getElementById("quick-view-title");
+    var chip = focusDay ? body.querySelector('[data-qv-day][aria-current="date"]') : null;
+    focusDay = false;
     if (heading) {
       dialog.removeAttribute("aria-label");
       dialog.setAttribute("aria-labelledby", "quick-view-title");
+    }
+    if (chip) {
+      chip.focus();
+    } else if (heading) {
       heading.focus();
     }
   });

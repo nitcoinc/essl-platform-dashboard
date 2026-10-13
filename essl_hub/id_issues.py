@@ -62,7 +62,9 @@ class Issue:
 class Fix:
     """The one most likely fix for an issue.
 
-    action: link (give employee_id the device_user_id, via a confirm step),
+    action: link (give employee_id the device_user_id, via a confirm step;
+    the route adds it as an extra ID when their main ID has punches, else
+    replaces the main ID),
     add (new person), set_id (type an ID), same (dismiss a name difference),
     none.
     """
@@ -113,16 +115,33 @@ def suggestions(issues: list[Issue]) -> dict[str, list[Issue]]:
 
 
 def _number(uid: str) -> int | None:
-    """Numeric part of an ID written as optional letters then digits
-    ("NP0128" and "128" both give 128); None for anything else."""
-    match = re.fullmatch(r"[A-Za-z]*0*(\d+)", uid or "")
-    return int(match.group(1)) if match else None
+    """Canonical key of an ID written as optional letters then digits
+    ("NP0128" and "128" both give 128); None for anything else, and for
+    all-zero numbers ("0", "NP0000"), which never pair (KTD4)."""
+    match = re.fullmatch(r"[A-Za-z]*0*(\d+)", (uid or "").strip())
+    number = int(match.group(1)) if match else None
+    return number or None
 
 
-def id_twins(issues: list[Issue]) -> dict[str, Issue]:
+def _is_zero(uid: str) -> bool:
+    digits = [ch for ch in uid if ch.isdigit()]
+    return bool(digits) and all(ch == "0" for ch in digits)
+
+
+def _all_ids(employee: dict) -> list[str]:
+    ids = employee.get("device_ids") or [employee["device_user_id"]]
+    return [str(uid) for uid in ids]
+
+
+def id_twins(issues: list[Issue], employees: list[dict] | None = None) -> dict[str, Issue]:
     """Unknown device IDs that are a roster ID in another format (roster
-    "128", device "NP0128"), keyed by Issue.key both ways. Only unambiguous
-    one-to-one pairs count."""
+    "128", device "NP0128"), keyed by Issue.key. Only unambiguous
+    one-to-one pairs count.
+
+    Without ``employees`` only never-punched roster IDs pair (both ways).
+    With them, any roster person pairs through any of their IDs (KTD4); the
+    twin is their "never" issue when the main ID has never punched (fix:
+    change the ID), else a "roster" stand-in (fix: add another device ID)."""
     unknown: dict[int, list[Issue]] = {}
     for i in issues:
         if i.kind == "unknown" and _number(i.device_user_id) is not None:
@@ -131,12 +150,36 @@ def id_twins(issues: list[Issue]) -> dict[str, Issue]:
     for i in issues:
         if i.kind == "never" and _number(i.device_user_id) is not None:
             never.setdefault(_number(i.device_user_id), []).append(i)
+    holders: dict[int, dict[int, dict]] = {}
+    for employee in employees or []:
+        for uid in _all_ids(employee):
+            if (number := _number(uid)) is not None:
+                holders.setdefault(number, {})[employee["id"]] = employee
     twins: dict[str, Issue] = {}
     for number, found in unknown.items():
-        roster = never.get(number, [])
-        if len(found) == 1 and len(roster) == 1:
-            twins[found[0].key] = roster[0]
-            twins[roster[0].key] = found[0]
+        if len(found) != 1:
+            continue
+        if employees is None:
+            roster = never.get(number, [])
+            if len(roster) == 1:
+                twins[found[0].key] = roster[0]
+                twins[roster[0].key] = found[0]
+            continue
+        people = list(holders.get(number, {}).values())
+        if len(people) != 1:
+            continue
+        person = people[0]
+        if person.get("archived_at"):
+            continue  # archived holders keep the number taken but are never suggested
+        match = next((i for i in never.get(number, []) if i.employee_id == person["id"]), None)
+        if match is not None:
+            twins[found[0].key] = match
+            twins[match.key] = found[0]
+        else:
+            twins[found[0].key] = Issue(
+                "roster", "info", device_user_id=str(person["device_user_id"]), title="", detail="",
+                employee_id=person["id"], employee_name=person["name"],
+            )
     return twins
 
 
@@ -145,6 +188,10 @@ def primary_fix(issue: Issue, pairs: dict[str, list[Issue]], twins: dict[str, Is
     twin = twins.get(issue.key)
     matches = pairs.get(issue.key, [])
     if issue.kind == "unknown":
+        if _is_zero(issue.device_user_id):
+            return Fix("none", "Nothing to do")  # devices use 0 for "no user"; never assignable
+        if twin and twin.kind == "roster":
+            return Fix("link", f"Add as another device ID for {twin.employee_name}", issue.device_user_id, twin.employee_id)
         if twin:
             return Fix("link", f"Change ID to {issue.device_user_id}", issue.device_user_id, twin.employee_id)
         if matches:
@@ -163,7 +210,9 @@ def primary_fix(issue: Issue, pairs: dict[str, list[Issue]], twins: dict[str, Is
 
 def find_issues(summary: list[dict], employees: list[dict], dismissed: set[str] | frozenset = frozenset()) -> list[Issue]:
     by_id = {str(row["device_user_id"]): row for row in summary}
-    roster = {str(e["device_user_id"]): e for e in employees}
+    # Every main and extra ID maps to its holder (archived people included,
+    # so their punches never resurface as unknown).
+    roster = {uid: e for e in employees for uid in _all_ids(e)}
     issues: list[Issue] = []
 
     for uid, row in sorted(by_id.items()):
@@ -175,9 +224,15 @@ def find_issues(summary: list[dict], employees: list[dict], dismissed: set[str] 
         if uid.startswith("C3-"):
             issues.append(Issue("shared", "info", title="Shared card, not counted",
                                 detail="Listed in ESSL_C3_UNLINKED_PINS, so these swipes never count for anyone.", **common))
+        elif employee is None and _is_zero(uid):
+            issues.append(Issue("unknown", "bad", title="Punches under ID 0",
+                                detail="Devices use an all-zero ID for “no user”, so it can't be given to anyone. "
+                                       "Fix the enrolment on the device.", **common))
         elif employee is None:
             issues.append(Issue("unknown", "bad", title="Punches but nobody on the roster",
                                 detail="Hours are not counted until someone with this device ID is added.", **common))
+        elif employee.get("archived_at"):
+            continue  # archived: mapped, so not unknown, but no other rule applies
         elif not names_agree(common["device_name"], employee["name"]):
             issues.append(Issue("name", "warn", title="Device name differs from the roster",
                                 detail=(f"The device calls {uid} “{common['device_name']}”; the roster says “{employee['name']}”. "
@@ -185,12 +240,13 @@ def find_issues(summary: list[dict], employees: list[dict], dismissed: set[str] 
                                         "If it is someone else, change the roster ID here."),
                                 employee_id=employee["id"], employee_name=employee["name"], **common))
 
-    for uid, employee in sorted(roster.items(), key=lambda kv: kv[1]["name"]):
+    mains = {str(e["device_user_id"]): e for e in employees if not e.get("archived_at")}
+    for uid, employee in sorted(mains.items(), key=lambda kv: kv[1]["name"]):
         common = dict(device_user_id=uid, employee_id=employee["id"], employee_name=employee["name"])
         if "@" in uid:
             issues.append(Issue("placeholder", "warn", title="No device ID yet",
                                 detail="The ID is the work email, so no door punch can ever match. Set the ID enrolled on the device.", **common))
-        elif uid not in by_id:
+        elif not any(i in by_id for i in _all_ids(employee)):
             issues.append(Issue("never", "warn", title="No punches on any device",
                                 detail="Nobody has scanned with this ID. Check it matches the device enrolment.", **common))
 

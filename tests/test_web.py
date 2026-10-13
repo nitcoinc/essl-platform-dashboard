@@ -47,6 +47,7 @@ class FakeDatabase:
         self.devices_by_id: dict[str, dict] = {}
         self.punches: list[dict] = []
         self.employees_by_id: dict[int, dict] = {}
+        self.extra_ids: dict[str, int] = {}  # extra device user ID -> employee id
         self._next_employee_id = 1
         self.settings: dict[str, str] = {}
         self.login_codes: list[dict] = []
@@ -172,11 +173,12 @@ class FakeDatabase:
             inserted += 1
         return inserted
 
-    def punches_for_employee_range(self, device_user_id: str, start: datetime, end: datetime):
+    def punches_for_employee_range(self, device_user_ids, start: datetime, end: datetime):
+        wanted = {device_user_ids} if isinstance(device_user_ids, str) else set(device_user_ids)
         rows = [
             p
             for p in self.punches
-            if p.get("device_user_id") == device_user_id and start <= p["event_timestamp"] < end
+            if p.get("device_user_id") in wanted and start <= p["event_timestamp"] < end
         ]
         rows.sort(key=lambda p: p["event_timestamp"])
         return [
@@ -207,7 +209,7 @@ class FakeDatabase:
         ]
 
     def unmapped_device_user_ids(self):
-        mapped = {e["device_user_id"] for e in self.employees_by_id.values()}
+        mapped = {e["device_user_id"] for e in self.employees_by_id.values()} | set(self.extra_ids)
         counts: dict[str, int] = {}
         for p in self.punches:
             uid = p.get("device_user_id")
@@ -239,25 +241,60 @@ class FakeDatabase:
 
     def update_employee(self, employee_id: int, *, name: str, email: str, device_user_id: str) -> None:
         self.employees_by_id[employee_id].update(name=name, email=email, device_user_id=device_user_id)
+        self._ids(self.employees_by_id[employee_id])
 
-    def employees(self):
+    def _ids(self, employee):
+        if employee is not None:
+            employee["device_ids"] = [employee["device_user_id"]] + sorted(
+                uid for uid, owner in self.extra_ids.items() if owner == employee["id"]
+            )
+        return employee
+
+    def extra_device_ids(self, employee_id: int) -> list[str]:
+        return sorted(uid for uid, owner in self.extra_ids.items() if owner == employee_id)
+
+    def add_extra_device_id(self, employee_id: int, device_user_id: str) -> None:
+        from essl_hub.db import IntegrityError
+
+        if self.employee_by_device_user_id(device_user_id) is not None:
+            raise IntegrityError("device user ID in use")
+        self.extra_ids[device_user_id] = employee_id
+
+    def remove_extra_device_id(self, employee_id: int, device_user_id: str) -> bool:
+        if self.extra_ids.get(device_user_id) != employee_id:
+            return False
+        del self.extra_ids[device_user_id]
+        return True
+
+    def device_user_id_owner(self, device_user_id: str):
+        return self.employee_by_device_user_id(device_user_id)
+
+    def employees(self, include_archived: bool = False):
         return sorted(
-            self.employees_by_id.values(),
+            (self._ids(e) for e in self.employees_by_id.values()
+             if include_archived or not e.get("archived_at")),
             key=lambda e: e["name"],
         )
 
-    def employee_by_email(self, email: str):
-        return next(
+    def archived_employees_with_punches(self, start, end):
+        return []
+
+    def employee_by_email(self, email: str, include_archived: bool = False):
+        return self._ids(next(
             (
                 e
                 for e in self.employees_by_id.values()
                 if e["email"].lower() == email.strip().lower()
+                and (include_archived or not e.get("archived_at"))
             ),
             None,
-        )
+        ))
 
-    def employee_by_id(self, employee_id: int):
-        return self.employees_by_id.get(employee_id)
+    def employee_by_id(self, employee_id: int, include_archived: bool = False):
+        employee = self.employees_by_id.get(employee_id)
+        if employee is not None and employee.get("archived_at") and not include_archived:
+            return None
+        return self._ids(employee)
 
     def set_employee_role(self, employee_id: int, role: str) -> None:
         self._check_online()
@@ -288,14 +325,16 @@ class FakeDatabase:
         return chain
 
     def employee_by_device_user_id(self, device_user_id: str):
-        return next(
+        if device_user_id in self.extra_ids:
+            return self._ids(self.employees_by_id.get(self.extra_ids[device_user_id]))
+        return self._ids(next(
             (
                 e
                 for e in self.employees_by_id.values()
                 if e["device_user_id"] == device_user_id
             ),
             None,
-        )
+        ))
 
     def has_admin(self) -> bool:
         return any(e["role"] == "admin" for e in self.employees_by_id.values())
@@ -389,7 +428,7 @@ class FakeDatabase:
         employee = self.employees_by_id.get(session["employee_id"])
         if employee is None:
             return None
-        return {**employee, "csrf_token": session["csrf_token"]}
+        return {**self._ids(employee), "csrf_token": session["csrf_token"]}
 
     def revoke_session(self, token_hash: str) -> None:
         if token_hash in self.sessions:
@@ -651,7 +690,7 @@ class WebFlowTest(unittest.TestCase):
         page = self.client.get("/team")
         self.assertEqual(page.status_code, 200)
         self.assertIn('href="/team"', page.text)
-        self.assertIn("<span>Everyone</span>", page.text)
+        self.assertIn("<span>Employees</span>", page.text)
         self.assertNotIn('href="/admin"', page.text)
 
     def test_hr_cannot_view_admin_route(self) -> None:
@@ -792,6 +831,23 @@ class HoursRenderingTest(unittest.TestCase):
         self.assertIn("Missing exit punch", response.text)
         self.assertIn("No exit recorded", response.text)
 
+    def test_past_day_has_no_break_row_before_missing_exit(self) -> None:
+        # U10/KTD9: the trailing entry's gap is not a break.
+        self._sign_in()
+        day = _ist_today() - timedelta(days=1)
+        while day.weekday() >= 5:
+            day -= timedelta(days=1)
+        base = datetime.combine(day, datetime.min.time())
+        self.database.insert_punches([
+            {"fingerprint": f"fp-u10-{h}", "device_id": DEVICES[1].id, "site": "Gachibowli",
+             "device_user_id": "118", "event_timestamp": base + timedelta(hours=h), "trusted_direction": d}
+            for h, d in ((9, "entry"), (13, "exit"), (14, "entry"))
+        ])
+        response = self.client.get(f"/day?date={day.isoformat()}")
+        self.assertIn("No exit recorded", response.text)
+        self.assertNotIn('class="bar-seg is-break', response.text)
+        self.assertIn("Breaks</dt><dd><span class=\"num\">0:00:00</span> · none", response.text)
+
     def _at(self, at: datetime):
         common, me = _fixed_now(at)
         common.start()
@@ -808,8 +864,8 @@ class HoursRenderingTest(unittest.TestCase):
         self.assertIn("<h1>Today</h1>", response.text)
         self.assertIn("Wednesday 09 September 2026", response.text)
         self.assertIn("work day from 06:00", response.text)
-        self.assertIn("Now, inside", response.text)
-        self.assertIn("+1</sup>", response.text)  # the 03:00 "now" node
+        self.assertIn('class="bar-seg is-inside is-open"', response.text)
+        self.assertIn("<span>now</span>", response.text)  # bar axis ends at now
 
     def test_day_view_reads_one_clock_instant_per_request(self) -> None:
         # U10: a clock that ticks on every read must still yield one stretch
@@ -952,7 +1008,7 @@ class LiveTodayTest(unittest.TestCase):
         self.assertEqual(self._attr(page, "data-state"), "inside")
         expected = int((self.DAY + timedelta(hours=11, seconds=5)).replace(tzinfo=_IST).timestamp() * 1000)
         self.assertEqual(self._attr(page, "data-server-epoch-ms"), str(expected))
-        # ring digits, this stretch, the open log stretch and gross (inside
+        # ring digits, this stretch, the break-view Inside figure and gross (inside
         # since first in) all agree to the second
         self.assertEqual(page.count('data-tick="7205"'), 4)
         self.assertIn(">2:00:05<", page)
@@ -1036,7 +1092,7 @@ class LiveTodayTest(unittest.TestCase):
         )
         self.assertTrue(partial.lstrip().startswith("<div id=\"day-live\""))
         self.assertNotIn("<html", partial)
-        self.assertIn('<ol class="day-log">', partial)
+        self.assertIn('class="day-bar" role="img"', partial)
         self.assertNotIn("live-status", partial)
         restore = self.client.get("/day", headers={"HX-Request": "true", "HX-History-Restore-Request": "true"})
         self.assertIn("<html", restore.text)
@@ -1089,12 +1145,39 @@ class LiveTodayTest(unittest.TestCase):
             (timedelta(hours=12, minutes=30, seconds=41), "exit"),
             (timedelta(hours=13, minutes=2, seconds=3), "entry"),
         )
-        self.assertIn('log-time num">09:00:12</span>', page)
-        self.assertIn('log-time num">12:30:41</span>', page)
-        stretches = [int(v) for v in re.findall(r'data-log-stretch="(\d+)"', page)]
-        self.assertEqual(len(stretches), 2)
-        self.assertEqual(sum(stretches), int(self._attr(page, "data-base-seconds")))
-        self.assertIn("Break <span class=\"num\">0:31:22</span>", page)
+        self.assertIn('punch-time num">09:00:12</span>', page)
+        self.assertIn('punch-time num">12:30:41</span>', page)
+        inside = re.search(r'<dt>Inside</dt><dd><span class="num" data-tick="(\d+)"', page).group(1)
+        self.assertEqual(inside, self._attr(page, "data-base-seconds"))
+        self.assertIn('<th scope="row">#1</th>', page)
+        self.assertIn('break-dur">0:31:22', page)
+
+    def test_three_break_day_lists_numbered_breaks_and_total(self) -> None:
+        page = self._today(
+            timedelta(hours=18),
+            (timedelta(hours=9), "entry"), (timedelta(hours=11), "exit"),
+            (timedelta(hours=11, minutes=20), "entry"), (timedelta(hours=13), "exit"),
+            (timedelta(hours=13, minutes=40), "entry"), (timedelta(hours=15), "exit"),
+            (timedelta(hours=15, minutes=20), "entry"), (timedelta(hours=16, minutes=32), "exit"),
+        )
+        self.assertIn('<dt>Breaks</dt><dd><span class="num">1:20:00</span> · <span class="num">3</span>', page)
+        self.assertIn('role="img" aria-label="Inside 6:12, 3 breaks totalling 1:20"', page)
+        for n in (1, 2, 3):
+            self.assertIn(f'<span class="bar-num">{n}</span>', page)
+            self.assertIn(f'<th scope="row">#{n}</th>', page)
+        self.assertIn('Breaks total</th><td class="num">1:20:00</td>', page)
+        self.assertNotIn("log-gap", page)
+
+    def test_unclear_gap_reads_unclear_with_the_swipe_time(self) -> None:
+        page = self._today(
+            timedelta(hours=19),
+            (timedelta(hours=9), "entry"), (timedelta(hours=12), "exit"),
+            (timedelta(hours=13), "exit"), (timedelta(hours=14), "entry"), (timedelta(hours=18), "exit"),
+        )
+        self.assertIn('<div class="is-unclear"><dt>Unclear</dt>', page)
+        self.assertIn('<th scope="row">Unclear</th>', page)
+        self.assertIn('class="bar-seg is-unclear"', page)
+        self.assertIn("swipe at <span class=\"num\">", page)
 
     def test_week_table_keeps_hours_and_minutes(self) -> None:
         self._sign_in()
@@ -1165,10 +1248,25 @@ class QuickViewTest(_QuickViewBase):
         self.assertIn('data-live="true"', page)
         self.assertIn(f'data-poll="/day?employee={self.ravi["id"]}&amp;date=2026-09-09"', page)
 
+    def test_drawer_renders_the_break_view_with_punches_closed(self) -> None:
+        # U11: same partial as Today; raw punches stay closed by default.
+        rows = [(9, 0, "entry"), (12, 40, "exit"), (13, 10, "entry")]
+        self.database.insert_punches([
+            _punch_row(f"qv-b{i}", self.DAY + timedelta(hours=h, minutes=m), d) for i, (h, m, d) in enumerate(rows)
+        ])
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        page = self._quick(self.ravi["id"]).text
+        self.assertIn('class="day-bar" role="img" aria-label="Inside', page)
+        self.assertIn('<th scope="row">#1</th>', page)
+        self.assertIn('<details class="raw-punches">', page)
+        self.assertNotIn('<details class="raw-punches" open', page)
+        self.assertIn("<summary>All punches (3)</summary>", page)
+
     def test_edit_details_only_from_people_for_editors(self) -> None:
         self._sign_in(self._person("1", "Hema HR", "hr"))
         self.assertIn("Edit details", self._quick(self.ravi["id"], "?from=people").text)
         self.assertNotIn("Edit details", self._quick(self.ravi["id"]).text)
+        self.assertIn('class="button button-secondary button-sm" href="/people/', self._quick(self.ravi["id"], "?from=people").text)
 
     def test_manager_sees_subtree_only_and_unknown_is_404(self) -> None:
         boss = self._person("900", "Boss", "manager")
@@ -1194,6 +1292,82 @@ class QuickViewTest(_QuickViewBase):
         response = self.client.get(f"/quick/{self.ravi['id']}")
         self.assertEqual(response.status_code, 302)
         self.assertTrue(response.headers["Location"].endswith(f"/day?employee={self.ravi['id']}"))
+
+
+class DayStripTest(_QuickViewBase):
+    """U8: last-7-days strip in the drawer and on /day (KTD7)."""
+
+    def _chips(self, page: str) -> list[str]:
+        return re.findall(r'<a class="day-chip[^>]*>', page)
+
+    def test_drawer_strip_lists_seven_days_ending_today(self) -> None:
+        self.database.insert_punches([_punch_row("ds-1", self.DAY - timedelta(days=2) + timedelta(hours=9), "entry")])
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        page = self._quick(self.ravi["id"]).text
+        chips = self._chips(page)
+        self.assertEqual(len(chips), 7)
+        self.assertIn("date=2026-09-03", chips[0])
+        self.assertIn("date=2026-09-09", chips[-1])
+        self.assertIn('aria-current="date"', chips[-1])
+        self.assertIn("Wednesday 09 September, Today", page)
+        self.assertIn("Monday 07 September, Punched", page)
+        self.assertIn("Sunday 06 September, No punches", page)
+
+    def test_strip_respects_day_start_hour(self) -> None:
+        common, me = _fixed_now(datetime(2026, 9, 10, 5, 30))
+        common.start()
+        me.start()
+        self.addCleanup(common.stop)
+        self.addCleanup(me.stop)
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        chips = self._chips(self._quick(self.ravi["id"]).text)
+        self.assertIn("date=2026-09-09", chips[-1])
+        self.assertIn('aria-current="date"', chips[-1])
+
+    def test_past_day_in_window_renders_without_poll(self) -> None:
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        response = self._quick(self.ravi["id"], "?date=2026-09-06")
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("data-poll", response.text)
+        selected = [c for c in self._chips(response.text) if 'aria-current="date"' in c]
+        self.assertEqual(len(selected), 1)
+        self.assertIn("date=2026-09-06", selected[0])
+
+    def test_out_of_window_and_malformed_dates_are_400(self) -> None:
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        for value in ("2026-09-02", "2026-09-10", "nope"):
+            self.assertEqual(self._quick(self.ravi["id"], f"?date={value}").status_code, 400, value)
+        self.assertEqual(self._quick(self.ravi["id"], "?date=2026-09-03").status_code, 200)
+
+    def test_from_people_carried_in_strip_targets(self) -> None:
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        rid = self.ravi["id"]
+        page = self._quick(rid, "?from=people&date=2026-09-08").text
+        self.assertIn(f'data-qv-day="/quick/{rid}?date=2026-09-07&amp;from=people"', page)
+        self.assertIn("Edit details", page)
+        plain = self._quick(rid).text
+        self.assertNotIn("from=people", plain)
+
+    def test_no_access_is_404(self) -> None:
+        boss = self._person("900", "Boss", "manager")
+        other = self._person("901", "Other")
+        self._sign_in(boss)
+        self.assertEqual(self._quick(other["id"], "?date=2026-09-08").status_code, 404)
+
+    def test_day_page_strip_keeps_employee_and_marks_selected(self) -> None:
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        rid = self.ravi["id"]
+        page = self.client.get(f"/day?employee={rid}&date=2026-09-07").text
+        chips = self._chips(page)
+        self.assertEqual(len(chips), 7)
+        self.assertTrue(all(f"employee={rid}" in c for c in chips))
+        self.assertNotIn("data-qv-day", page)
+        selected = [c for c in chips if 'aria-current="date"' in c]
+        self.assertEqual(len(selected), 1)
+        self.assertIn("date=2026-09-07", selected[0])
+        # Older days keep the pager and simply have no selected chip.
+        old = self.client.get(f"/day?employee={rid}&date=2026-08-01").text
+        self.assertNotIn('aria-current="date"', old)
 
 
 class QuickViewDrawerTest(_QuickViewBase):
@@ -1341,7 +1515,7 @@ class AdminViewTest(unittest.TestCase):
         self.assertIn('class="subtab-count"', people)
         page = self.client.get("/people/issues").text
         self.assertIn("231", page)
-        self.assertIn("Not on roster", page)
+        self.assertIn("Not in Directory", page)
         self.assertIn('href="/people/new?device_user_id=231', page)
 
     def test_name_mismatch_can_be_marked_same_person(self) -> None:
@@ -1426,7 +1600,7 @@ class AdminViewTest(unittest.TestCase):
         # The flash shows once.
         self.assertNotIn("Linked NP0231", self.client.get("/people/issues").text)
         self.assertEqual(self.database.employee_by_id(sita["id"])["device_user_id"], "NP0231")
-        self.assertNotIn("Not on roster", response.text)
+        self.assertNotIn("Not in Directory", response.text)
 
     def test_link_refuses_an_id_someone_else_has(self) -> None:
         self.database.upsert_employee(device_user_id="NP0005", name="Owner", email="owner@example.com")
@@ -1442,8 +1616,13 @@ class AdminViewTest(unittest.TestCase):
         self.assertIn('value="NP0231"', page)
         self.assertIn('value="New Joiner"', page)
 
+    def test_people_subtab_reads_directory(self) -> None:
+        page = self.client.get("/people").text
+        self.assertIn('href="/people" aria-current="page">Directory</a>', page)
+        self.assertNotIn(">Roster</a>", page)
+
     def test_admin_navigation_links_to_the_employee_data(self) -> None:
-        # An admin is authorised for Everyone, so the nav must offer it.
+        # An admin is authorised for Employees, so the nav must offer it.
         page = self.client.get("/settings")
         self.assertIn('href="/team"', page.text)
 
@@ -2148,6 +2327,17 @@ class SetupPageTest(unittest.TestCase):
         self.assertIn("Enter your name", response.text)
         self.assertIsNone(database.employee_by_email("boss@example.com"))
 
+    def test_zero_device_id_is_rejected_on_setup(self) -> None:
+        database = FakeDatabase()
+        app = self._make_app_with(database, self.TOKEN)
+        response = app.test_client().post(
+            "/setup",
+            data={"setup_token": self.TOKEN, "name": "Boss", "email": "boss@example.com",
+                  "device_user_id": "NP0000"},
+        )
+        self.assertIn("Device ID can&#39;t be zero", response.text)
+        self.assertFalse(database.has_admin())
+
     def test_device_id_clash_is_reported(self) -> None:
         database = FakeDatabase()
         database.upsert_employee(device_user_id="5", name="Other", email="other@example.com")
@@ -2333,8 +2523,8 @@ class AppShellTest(unittest.TestCase):
         # The manager role arrives with U5.
         expected = {
             "employee": ["Today", "Week"],
-            "hr": ["Today", "Week", "Everyone", "People"],
-            "admin": ["Today", "Week", "Everyone", "People", "Devices", "Settings"],
+            "hr": ["Today", "Week", "Employees", "People"],
+            "admin": ["Today", "Week", "Employees", "People", "Devices", "Settings"],
         }
         for role, labels in expected.items():
             with self.subTest(role=role):
@@ -2548,6 +2738,8 @@ class RolesAndVisibilityTest(unittest.TestCase):
         page = self.client.get("/team")
         self.assertEqual(page.status_code, 200)
         self.assertIn("<h1>Team</h1>", page.text)
+        self.assertIn("<span>Team</span>", page.text)
+        self.assertNotIn("Employees", page.text)
         for name in ("P40", "P41", "P42"):
             self.assertIn(f">{name}</a>", page.text)
         self.assertNotIn(">P43</a>", page.text)
@@ -2558,7 +2750,9 @@ class RolesAndVisibilityTest(unittest.TestCase):
             person = self._person(uid, role)
             self._sign_in(person)
             page = self.client.get("/team")
-            self.assertIn("<h1>Everyone</h1>", page.text)
+            self.assertIn("<h1>Employees</h1>", page.text)
+            self.assertIn("<span>Employees</span>", page.text)
+            self.assertNotIn("Everyone", page.text)
             self.assertIn(">P43</a>", page.text)
 
     def test_team_search_filters_and_htmx_returns_the_results_region(self) -> None:
@@ -2653,7 +2847,7 @@ class RolesAndVisibilityTest(unittest.TestCase):
         expected = {
             "employee": ["Today", "Week"],
             "manager": ["Today", "Week", "Team"],
-            "hr": ["Today", "Week", "Everyone", "People"],
+            "hr": ["Today", "Week", "Employees", "People"],
         }
         for i, (role, labels) in enumerate(expected.items()):
             self._sign_in(self._person(f"5{i}", role))
@@ -3096,6 +3290,140 @@ class PeopleManagementTest(unittest.TestCase):
         self.assertEqual(calls["n"], small)
         self.assertLessEqual(small, 3)
 
+    # --- extra device IDs (U5) ---
+
+    def _punches(self, *items) -> None:
+        self.database.initialize(DEVICES)
+        self.database.insert_punches([
+            {"fingerprint": f"x-{uid}-{at.isoformat()}", "device_id": DEVICES[0].id, "site": "Uppal",
+             "device_user_id": uid, "employee_name": name, "event_timestamp": at, "trusted_direction": way}
+            for uid, name, at, way in items
+        ])
+
+    def _two_format_day(self):
+        kiran = self._person("NP0128", "Kiran Kumar")
+        day = (_ist_now() - timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0)
+        self._punches(("NP0128", "Kiran", day.replace(hour=9), "entry"),
+                      ("NP128", "Kiran", day.replace(hour=17), "exit"))
+        return kiran, day.date()
+
+    def test_two_format_ids_link_as_extra_and_count_everywhere(self) -> None:
+        kiran, day = self._two_format_day()
+        self._sign_in(self.hr)
+        page = self.client.get("/people/issues").text
+        self.assertIn("Add as another device ID for Kiran Kumar", page)
+        confirm = self.client.get(f"/people/issues?confirm=1&device_user_id=NP128&person={kiran['id']}").text
+        self.assertIn("added as another device ID", confirm)
+        response = self.client.post("/people/issues/link", data={
+            "csrf": self._csrf(), "device_user_id": "NP128", "employee_id": kiran["id"]})
+        self.assertEqual(response.status_code, 302)
+        after = self.database.employee_by_id(kiran["id"])
+        self.assertEqual((after["device_user_id"], after["device_ids"]), ("NP0128", ["NP0128", "NP128"]))
+        self.assertNotIn("Not in Directory", self.client.get("/people/issues").text)
+        self.assertIn("8h 00m", self.client.get(f"/day?date={day.isoformat()}&employee={kiran['id']}").text)
+        self.assertIn("8h 00m", self.client.get(f"/week?date={day.isoformat()}&employee={kiran['id']}").text)
+        self.assertIn("NP0128, NP128", self.client.get(f"/quick/{kiran['id']}", headers={"HX-Request": "true"}).text)
+        csv_text = self.client.get(f"/export.csv?from={day.isoformat()}&to={day.isoformat()}").text
+        row = next(line for line in csv_text.splitlines() if "Kiran Kumar" in line)
+        self.assertIn("09:00,17:00,2,8:00", row)
+
+    def test_twin_of_never_punched_id_replaces_the_main_id(self) -> None:
+        kiran = self._person("128", "Kiran Kumar")
+        self._punches(("NP0128", "Someone", _ist_now() - timedelta(days=1), "entry"))
+        self._sign_in(self.hr)
+        self.assertIn("Change ID to NP0128", self.client.get("/people/issues").text)
+        self.client.post("/people/issues/link", data={
+            "csrf": self._csrf(), "device_user_id": "NP0128", "employee_id": kiran["id"]})
+        after = self.database.employee_by_id(kiran["id"])
+        self.assertEqual(after["device_ids"], ["NP0128"])
+
+    def test_zero_unknown_id_gets_no_add_or_link_button(self) -> None:
+        self._punches(("0", "Nobody", _ist_now() - timedelta(days=1), "entry"))
+        self._sign_in(self.hr)
+        page = self.client.get("/people/issues").text
+        self.assertIn("all-zero ID", page)
+        self.assertNotIn("Add as new person", page)
+        self.assertNotIn("people/new?device_user_id=0", page)
+
+    def _add_extra(self, person, value):
+        return self.client.post(f"/people/{person['id']}/device-ids",
+                                data={"csrf": self._csrf(), "extra_device_user_id": value})
+
+    def test_extra_id_add_clash_and_remove_on_the_form(self) -> None:
+        self._sign_in(self.hr)
+        response = self._add_extra(self.ravi, "3")  # Ramesh's main ID
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Ramesh already uses device ID 3", response.text)
+        self.database.add_extra_device_id(self.sita["id"], "NP0004")
+        response = self._add_extra(self.ravi, "np0004")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Sita already uses device ID NP0004", response.text)
+        self.assertEqual(self._add_extra(self.ravi, "0").status_code, 400)
+        self.assertEqual(self._add_extra(self.ravi, " np0005 ").status_code, 302)
+        page = self.client.get(f"/people/{self.ravi['id']}/edit").text
+        self.assertIn("Other device IDs", page)
+        self.assertIn("NP0005", page)
+        self._punches(("NP0005", "Ravi", _ist_now() - timedelta(days=1), "entry"))
+        self.assertNotIn("Not in Directory", self.client.get("/people/issues").text)
+        response = self.client.post(f"/people/{self.ravi['id']}/device-ids/remove",
+                                    data={"csrf": self._csrf(), "device_user_id": "NP0005"})
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(self.database.extra_device_ids(self.ravi["id"]), [])
+        self.assertIn("Not in Directory", self.client.get("/people/issues").text)
+
+    def test_hr_cannot_change_an_admins_extra_ids(self) -> None:
+        self.database.add_extra_device_id(self.admin["id"], "A2")
+        self._sign_in(self.hr)
+        self.assertEqual(self._add_extra(self.admin, "A3").status_code, 403)
+        response = self.client.post(f"/people/{self.admin['id']}/device-ids/remove",
+                                    data={"csrf": self._csrf(), "device_user_id": "A2"})
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.database.extra_device_ids(self.admin["id"]), ["A2"])
+        self.assertNotIn("Add device ID", self.client.get(f"/people/{self.admin['id']}/edit").text)
+        self.client.post("/signout", data={"csrf": self._csrf()})
+        self._sign_in(self.admin)
+        self.assertEqual(self._add_extra(self.admin, "A3").status_code, 302)
+        self.assertEqual(self.database.extra_device_ids(self.admin["id"]), ["A2", "A3"])
+
+
+    # --- inline Device ID (U6) ---
+
+    def test_hr_edits_device_id_inline_and_hours_follow(self) -> None:
+        self._sign_in(self.hr)
+        row = self._edit_row(self.ravi)
+        self.assertIn('name="device_user_id"', row)
+        self.assertIn(f'aria-label="Edit {self.ravi["name"]}"', self.client.get(f"/people/{self.ravi['id']}/row", headers={"HX-Request": "true"}).text)
+        day = (_ist_now() - timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0)
+        self._punches(("NP0005", "Ravi", day.replace(hour=9), "entry"), ("NP0005", "Ravi", day.replace(hour=17), "exit"))
+        response = self._assign(self.ravi, device_user_id=" np0005 ", manager_id="", role="employee")
+        self.assertIn("NP0005", response.text)
+        self.assertNotIn('name="device_user_id"', response.text)
+        self.assertEqual(self.database.employee_by_id(self.ravi["id"])["device_user_id"], "NP0005")
+        csv_text = self.client.get(f"/export.csv?from={day.date().isoformat()}&to={day.date().isoformat()}").text
+        self.assertIn("09:00,17:00,2,8:00", next(line for line in csv_text.splitlines() if ",Ravi," in line))
+
+    def test_hr_inline_edit_on_admin_locks_device_id_and_refuses_forgery(self) -> None:
+        self._sign_in(self.hr)
+        row = self._edit_row(self.admin)
+        self.assertNotIn('name="device_user_id"', row)
+        self.assertIn("locked", row)
+        response = self._assign(self.admin, htmx=False, device_user_id="NP9999", manager_id="", role="admin")
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.database.employee_by_id(self.admin["id"])["device_user_id"], "2")
+
+    def test_duplicate_and_zero_inline_ids_show_errors_and_keep_other_fields(self) -> None:
+        self._sign_in(self.hr)
+        response = self._assign(self.ravi, device_user_id="3", manager_id=str(self.sita["id"]), role="manager")
+        self.assertIn("Ramesh already uses device ID 3", response.text)
+        self.assertIn('value="3"', response.text)
+        self.assertIn(f'<option value="{self.sita["id"]}" selected>', response.text)
+        self.assertIn('<option value="manager" selected>', response.text)
+        after = self.database.employee_by_id(self.ravi["id"])
+        self.assertEqual((after["device_user_id"], after["manager_id"], after["role"]), ("5", None, "employee"))
+        response = self._assign(self.ravi, device_user_id="NP0000", manager_id="", role="employee")
+        self.assertIn("Device ID can&#39;t be zero", response.text)
+        self.assertEqual(self.database.employee_by_id(self.ravi["id"])["device_user_id"], "5")
+
 
 class ScreensTest(unittest.TestCase):
     """U11: devices split, settings, Today and sign-in screens."""
@@ -3160,7 +3488,7 @@ class ScreensTest(unittest.TestCase):
     def test_day_without_punches_renders_the_empty_state_not_a_chart(self) -> None:
         page = self._client_as("employee").get("/day")
         self.assertIn("No punches yet today", page.text)
-        self.assertNotIn('class="day-log"', page.text)
+        self.assertNotIn('class="day-bar"', page.text)
         self.assertNotIn("GROSS HOURS", page.text)
 
     def test_day_with_punches_renders_the_attendance_log(self) -> None:
@@ -3174,9 +3502,11 @@ class ScreensTest(unittest.TestCase):
             ]
         )
         page = client.get(f"/day?date={day.isoformat()}").text
-        self.assertIn('<ol class="day-log">', page)
-        self.assertIn('log-time num">09:00:00</span><span class="log-label">In</span><span class="log-meta">Inside <span class="num" data-log-stretch="30600">8:30:00', page)
-        self.assertIn('log-time num">17:30:00</span><span class="log-label">Out', page)
+        self.assertIn('<details class="raw-punches">', page)
+        self.assertIn('<summary>All punches (2)</summary>', page)
+        self.assertIn('punch-time num">09:00:00</span><span class="punch-dir">In</span>', page)
+        self.assertIn('punch-time num">17:30:00</span><span class="punch-dir">Out</span>', page)
+        self.assertIn('<dt>Inside</dt><dd><span class="num">8:30:00</span>', page)
         self.assertIn('role="img" aria-label="8h 30m effective, 100% of the', page)
         self.assertNotIn("data-poll=", page)  # past days never poll
 

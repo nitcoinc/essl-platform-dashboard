@@ -5,7 +5,7 @@
 <header class="topbar">
   <div>
     <h1>People</h1>
-    <p>Hours only count when the ID on the door device matches a person on the roster. Fix mismatches here.</p>
+    <p>Hours only count when the ID on the door device matches a person in the Directory. Fix mismatches here.</p>
   </div>
 </header>
 {% include "_people_tabs.html" %}
@@ -22,23 +22,24 @@
 <section class="issue-confirm" aria-labelledby="confirm-heading">
   <h2 id="confirm-heading">Link {{ confirm.device_user_id }} to {{ confirm.employee.name }}?</h2>
   <p><strong>{{ n }} {{ 'punch' if n == 1 else 'punches' }}</strong> will start counting for {{ confirm.employee.name }}.
-    {% if confirm.employee.device_user_id != confirm.device_user_id %}Their device ID changes from {{ confirm.employee.device_user_id }} to {{ confirm.device_user_id }}.{% endif %}</p>
+    {% if confirm.mode == 'extra' %}{{ confirm.device_user_id }} is added as another device ID; their main ID {{ confirm.employee.device_user_id }} stays.
+    {%- else %}Their main device ID changes from {{ confirm.employee.device_user_id }} to {{ confirm.device_user_id }}.{% endif %}</p>
   <form method="post" action="{{ url_for('people.id_issues_link') }}" class="issue-confirm-actions">
     <input type="hidden" name="csrf" value="{{ csrf_token }}">
     <input type="hidden" name="device_user_id" value="{{ confirm.device_user_id }}">
     <input type="hidden" name="employee_id" value="{{ confirm.employee.id }}">
-    {{ ui.button('Link ' ~ confirm.device_user_id, 'primary', type='submit') }}
+    {{ ui.button(('Add ' if confirm.mode == 'extra' else 'Link ') ~ confirm.device_user_id, 'primary', type='submit') }}
     {{ ui.button('Cancel', 'tertiary', href=url_for('people.id_issues_view')) }}
   </form>
 </section>
 {% endif %}
 
-{% set labels = {'unknown': 'Not on roster', 'placeholder': 'No device ID', 'never': 'Never punched', 'name': 'Name differs', 'shared': 'Shared card'} %}
+{% set labels = {'unknown': 'Not in Directory', 'placeholder': 'No device ID', 'never': 'Never punched', 'name': 'Name differs', 'shared': 'Shared card'} %}
 {% set help = {
-  'unknown': 'Someone punches with this ID but nobody on the roster has it.',
+  'unknown': 'Someone punches with this ID but nobody in the Directory has it.',
   'placeholder': 'This person has no door ID yet, so none of their punches can match.',
   'never': 'Nobody has punched with this person\'s ID.',
-  'name': 'The device and the roster use different names for the same ID.',
+  'name': 'The device and the Directory use different names for the same ID.',
 } %}
 {% set to_fix = counts.unknown + counts.placeholder + counts.never + counts.name %}
 
@@ -50,7 +51,7 @@
     <li>{{ ui.chip(labels[kind], 'bad' if kind == 'unknown' else 'warn') }} <strong>{{ counts[kind] }}</strong> · {{ help[kind] }}</li>
     {% endfor %}
   </ul>
-  <p class="footnote">This list updates by itself: once the roster is right (here, on the person form or by import), the item disappears and past punches count.</p>
+  <p class="footnote">This list updates by itself: once the Directory is right (here, on the person form or by import), the item disappears and past punches count.</p>
 </section>
 {% endif %}
 
@@ -83,7 +84,7 @@
 
 {% if issues %}
 <datalist id="unknown-ids">
-  {% for i in issues if i.kind == 'unknown' %}<option value="{{ i.device_user_id }}">{{ i.device_name }}</option>{% endfor %}
+  {% for i in issues if i.kind == 'unknown' and fixes[i.key].action != 'none' %}<option value="{{ i.device_user_id }}">{{ i.device_name }}</option>{% endfor %}
 </datalist>
 <datalist id="roster-people">
   {% for p in roster %}<option value="{{ p.email }}">{{ p.name }} ({{ p.device_user_id }})</option>{% endfor %}
@@ -103,7 +104,7 @@
     </header>
     <p class="issue-impact">{{ issue.impact }}</p>
     <p class="issue-detail">
-      {%- if issue.employee_name %}Roster: <strong>{{ issue.employee_name }}</strong>{% endif %}
+      {%- if issue.employee_name %}Directory: <strong>{{ issue.employee_name }}</strong>{% endif %}
       {%- if issue.employee_name and issue.device_name %} · {% endif %}
       {%- if issue.device_name %}On device: <strong>{{ issue.device_name }}</strong>{% if issue.sites %} ({{ issue.sites|replace(',', ', ') }}){% endif %}{% endif %}
       {%- if issue.kind == 'name' %}<br>{{ issue.detail }}{% elif not issue.employee_name and not issue.device_name %}{{ issue.detail }}{% endif %}
@@ -125,8 +126,8 @@
         <form method="get" action="{{ url_for('people.id_issues_view') }}" class="issue-link-form">
           <input type="hidden" name="confirm" value="1">
           <input type="hidden" name="device_user_id" value="{{ issue.device_user_id }}">
-          <label class="visually-hidden" for="link-{{ loop.index }}">Link {{ issue.device_user_id }} to someone on the roster</label>
-          <input id="link-{{ loop.index }}" name="person" list="roster-people" placeholder="Search the roster by name or email" required autocomplete="off">
+          <label class="visually-hidden" for="link-{{ loop.index }}">Link {{ issue.device_user_id }} to someone in the Directory</label>
+          <input id="link-{{ loop.index }}" name="person" list="roster-people" placeholder="Search the Directory by name or email" required autocomplete="off">
           {{ ui.button('Link', 'tertiary', type='submit', size='sm') }}
         </form>
       {% elif issue.kind in ('placeholder', 'never') %}
@@ -135,7 +136,7 @@
         {% if issue.kind == 'never' %}{{ dismiss_form(issue.key, "Doesn't use the door", 'secondary') }}{% endif %}
         {{ ui.button('Edit person', 'tertiary', href=url_for('people.person_edit', employee_id=issue.employee_id), size='sm') }}
       {% elif issue.kind == 'name' %}
-        <p class="issue-help">Wrong name on the device: rename the user on the device; the roster stays as it is. Wrong person on the roster ID: change the ID here.</p>
+        <p class="issue-help">Wrong name on the device: rename the user on the device; the Directory stays as it is. Wrong person on the Directory ID: change the ID here.</p>
         {{ ui.button('Fix ID', 'tertiary', href=url_for('people.person_edit', employee_id=issue.employee_id), size='sm') }}
       {% endif %}
       </div>
@@ -145,7 +146,7 @@
   {% endfor %}
 </div>
 {% else %}
-{% call ui.empty_state('No ID issues', 'Every device ID with punches is on the roster, and every roster entry has punched.', 'check') %}
+{% call ui.empty_state('No ID issues', 'Every device ID with punches is in the Directory, and everyone in it has punched.', 'check') %}
 <p class="footnote">Last checked <time datetime="{{ checked_at.isoformat(timespec='seconds') }}">{{ checked_at.strftime('%d %b %Y, %H:%M:%S') }}</time>.</p>
 {% endcall %}
 {% endif %}

@@ -53,6 +53,12 @@ class C3UserIdTest(unittest.TestCase):
             self.assertEqual(c3_user_id("173"), "NP0173")
             self.assertEqual(c3_user_id("1001"), "NP1001")
 
+    def test_pin_zero_is_unlinked(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(c3_user_id("0"), "C3-0")
+            self.assertEqual(c3_user_id("000"), "C3-000")
+            self.assertEqual(c3_user_id("128"), "NP0128")
+
     def test_shared_cards_stay_unlinked(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(c3_user_id("2"), "C3-2")
@@ -165,11 +171,12 @@ class C3TableDownloadTest(unittest.TestCase):
         with self.assertRaises(ConnectionError):
             read_c3_table(_FakePanel(_table_buffer(self.RECORDS), bad_crc=True), "transaction")
 
-    def test_only_granted_punches_count(self) -> None:
+    def test_granted_and_interval_too_short_punches_count(self) -> None:
         from essl_hub.collectors import _c3_is_punch
 
         self.assertTrue(_c3_is_punch("0"))
-        for denied in ("20", "27", "202", "206", "220"):
+        self.assertTrue(_c3_is_punch("20"))  # KTD11
+        for denied in ("27", "24", "202", "206", "220"):
             self.assertFalse(_c3_is_punch(denied))
 
     def test_history_due_at_start_then_every_interval(self) -> None:
@@ -181,6 +188,91 @@ class C3TableDownloadTest(unittest.TestCase):
         self.assertFalse(collectors._c3_history_due("t"))
         with patch.dict(os.environ, {"ESSL_C3_HISTORY_HOURS": "0"}):
             self.assertTrue(collectors._c3_history_due("t"))
+
+
+class _RtRecord:
+    def __init__(self, event_type, pin, in_out, when, card="0", door=1):
+        self.event_type, self.pin, self.card_no = event_type, pin, card
+        self.in_out_state, self.time_second, self.port_nr, self.verified = in_out, when, door, 1
+
+    def is_event(self):
+        return True
+
+
+class _FakeC3:
+    rt_batches: list = []
+
+    def __init__(self, *a, **k):
+        self._batches = list(type(self).rt_batches)
+
+    def connect(self, password=None):
+        return True
+
+    def disconnect(self):
+        pass
+
+    def get_device_param(self, names):
+        return {}
+
+    def get_device_data(self, table):
+        return []
+
+    def get_rt_log(self):
+        return self._batches.pop(0) if self._batches else []
+
+
+class C3IntervalTooShortTest(unittest.TestCase):
+    """U12/KTD11: event 20 is stored as a flagged swipe."""
+
+    def setUp(self) -> None:
+        self.device = next(d for d in DEVICES if d.protocol == "c3-pullsdk")
+
+    def _history(self, rows):
+        from essl_hub import collectors
+
+        with patch("c3.C3", _FakeC3), patch.object(collectors, "read_c3_table", return_value=rows), \
+                patch.dict(os.environ, {"ESSL_C3_MODE": "history"}):
+            return collectors.collect_c3(self.device).events
+
+    def _realtime(self, records):
+        from essl_hub import collectors
+
+        _FakeC3.rt_batches = [records]
+        with patch("c3.C3", _FakeC3), patch.dict(os.environ, {"ESSL_C3_MODE": "realtime"}):
+            return collectors.collect_c3(self.device).events
+
+    @staticmethod
+    def _row(event, pin="173", card="0", in_out="1", second=800000000):
+        return {"Pin": pin, "Cardno": card, "Time_second": str(second), "EventType": event,
+                "InOutState": in_out, "DoorID": "1", "ReaderID": "1"}
+
+    def test_history_event_20_with_pin_is_a_flagged_exit(self) -> None:
+        [event] = self._history([self._row("20")])
+        self.assertEqual(event["trusted_direction"], "exit")
+        self.assertIn("interval too short", event["raw_state"])
+        self.assertEqual(event["device_user_id"], c3_user_id("173"))
+
+    def test_realtime_event_20_dedupes_with_history_read(self) -> None:
+        from c3.utils import C3DateTime
+
+        when = C3DateTime.from_value(800000000)
+        [rt] = self._realtime([_RtRecord(20, "173", 15, when)])
+        [hist] = self._history([self._row("20")])
+        self.assertEqual(rt["fingerprint"], hist["fingerprint"])
+        self.assertIn("interval too short", rt["raw_state"])
+        # 15 -> exit is evidence from granted events only; 20 alternates.
+        self.assertIsNone(rt["trusted_direction"])
+
+    def test_event_20_without_pin_or_card_is_dropped(self) -> None:
+        self.assertEqual(self._history([self._row("20", pin="", card="0")]), [])
+        self.assertEqual(self._history([self._row("20", pin="0", card="")]), [])
+
+    def test_other_denied_events_still_dropped(self) -> None:
+        self.assertEqual(self._history([self._row(e) for e in ("27", "24", "202", "206")]), [])
+
+    def test_two_people_back_to_back_both_stored(self) -> None:
+        events = self._history([self._row("0", pin="173"), self._row("20", pin="39", second=800000001)])
+        self.assertEqual({e["device_user_id"] for e in events}, {c3_user_id("173"), c3_user_id("39")})
 
 
 class C3TrustedDirectionTest(unittest.TestCase):
