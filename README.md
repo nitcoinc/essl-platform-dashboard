@@ -26,8 +26,9 @@ A small, self-hosted attendance dashboard for eSSL X990 and C3-400 devices, back
   - Uppal: eSSL X990 at `192.168.1.201`
   - Gachibowli: eSSL C3-400 at `192.168.1.202`
 - **Computes** gross and effective hours, breaks and target status per person per day. Hours are recomputed from stored punches on every read.
-- **Shows** each person their day and week; managers see their reports, HR and admins see everyone, with CSV/Excel export.
-- **Flags ID problems** (punches nobody on the roster owns, people with no device ID) and fixes them in one click.
+- **Shows** each person their day and week; managers see their reports, HR and admins see all employees, with CSV/Excel export.
+- **Flags ID problems** (punches nobody in the Directory owns, people with no device ID) and fixes them in one click, including adding a second device ID to the same person.
+- **Archives** people who have left: they drop out of every working view and cannot sign in, while their punches and past hours stay.
 - **Feeds Frappe HR** (Employee Checkin push) and offers a read-only HRMS API.
 - **Signs in** by emailed one-time code; no passwords. Cloudflare Turnstile guards the sign-in form.
 
@@ -38,8 +39,8 @@ Punches come only from the devices. No screen, role or API creates, edits or del
 | Today (live, inside) | Week |
 | --- | --- |
 | <img src="docs/screenshots/today.png" width="420" alt="Today"> | <img src="docs/screenshots/week.png" width="420" alt="Week"> |
-| **Everyone** (HR, admin) | **ID issues** (HR, admin) |
-| <img src="docs/screenshots/everyone.png" width="420" alt="Everyone"> | <img src="docs/screenshots/id-issues.png" width="420" alt="ID issues"> |
+| **Employees** (HR, admin) | **ID issues** (HR, admin) |
+| <img src="docs/screenshots/employees.png" width="420" alt="Employees"> | <img src="docs/screenshots/id-issues.png" width="420" alt="ID issues"> |
 | **Devices** (admin) | **Sign in** |
 | <img src="docs/screenshots/devices.png" width="420" alt="Devices"> | <img src="docs/screenshots/signin.png" width="420" alt="Sign in"> |
 | **Dark mode** | **Phone** |
@@ -122,6 +123,8 @@ No Python is needed on the host: the installer and the device test run inside th
 4. [Install on the Linux host](#install-on-the-linux-host)
 5. [First administrator](#first-administrator)
 6. [Fixing ID issues](#fixing-id-issues)
+   - [Archiving people](#archiving-people)
+   - [Breaks and duplicate swipes](#breaks-and-duplicate-swipes)
 7. [Fix the Uppal address](#fix-the-uppal-address)
    - [Add, retire or re-enable a device](#add-retire-or-re-enable-a-device)
    - [Sign-in branding](#sign-in-branding)
@@ -251,7 +254,7 @@ Codes go out through **Cloudflare Email Sending** by default, with **Resend** as
 - Cloudflare Email Sending needs the **Workers Paid** plan ($5/month) and is in beta. Onboard the sending domain under **Email → Email Sending** (it adds SPF/DKIM records on Cloudflare DNS). Create an API token with the Email Sending permission. Set `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_FROM_ADDRESS`.
 - Resend fallback: verify the domain in Resend, then set `RESEND_API_KEY` and `RESEND_FROM_ADDRESS`.
 
-With both configured, Cloudflare wins unless `ESSL_MAIL_PROVIDER=resend`. Switching is an env change plus `docker compose up -d web`. A send failure is logged, never shown to the person signing in, so the sign-in page cannot reveal who is on the roster.
+With both configured, Cloudflare wins unless `ESSL_MAIL_PROVIDER=resend`. Switching is an env change plus `docker compose up -d web`. A send failure is logged, never shown to the person signing in, so the sign-in page cannot reveal who is in the Directory.
 
 ### 4. Protection (bots and DDoS)
 
@@ -303,23 +306,37 @@ Open `https://attendance.yourcompany.com`.
 An empty database has no one to email a code to. Pick one way:
 
 - **Setup page (default).** The installer generates `ESSL_SETUP_TOKEN` and prints it. Open `/setup`, enter the token, your name and work email (and badge number if you scan in). The page returns 404 once any admin exists. Unset the token afterwards.
-- **Env only.** Set `ESSL_BOOTSTRAP_ADMIN_EMAIL` to an address already on the roster. While no admin exists, the web service promotes that row on boot.
+- **Env only.** Set `ESSL_BOOTSTRAP_ADMIN_EMAIL` to an address already in the Directory. While no admin exists, the web service promotes that row on boot.
 
 Then sign in, open **People → Import roster** and upload the roster. Everyone else is managed from **People**.
 
 ## Fixing ID issues
 
-Hours count only when the ID on the door device matches a person on the roster. **People → ID issues** (HR and admin; the People menu shows a red count) lists every mismatch in plain words and fixes it in place:
+Hours count only when the ID on the door device matches a person's main or extra device ID in the Directory. **People → ID issues** (HR and admin; the People menu shows a red count) lists every mismatch in plain words and fixes it in place:
 
 | Issue | Means | One-click fix |
 | --- | --- | --- |
-| **Not on roster** | Someone punches with an ID nobody on the roster has; their hours are lost | **Link to *name*** (suggested when names match), **Add as new person** (prefilled), or pick anyone from the dropdown |
+| **Not in Directory** | Someone punches with an ID nobody in the Directory has; their hours are lost | **Link to *name*** (suggested when names match), **Add as new person** (prefilled), or pick anyone from the dropdown. Linking adds the ID as an extra ID when the person's main ID already has punches, otherwise it replaces the main ID; the preview says which |
 | **No device ID** | A person's ID is still their email, so no punch can match | **Use NP0xxx** (suggested) or type it in **Set ID** |
 | **Never punched** | Nobody has scanned with this person's ID | Same as above: correct the ID |
-| **Name differs** | Device and roster name the same ID differently | **Same person** (hides it) or **Fix ID** |
+| **Name differs** | Device and Directory name the same ID differently | **Same person** (hides it) or **Fix ID** |
 | **Shared card** | Temporary cards in `ESSL_C3_UNLINKED_PINS` | Nothing; never counted |
 
-Nothing is stored about an issue: the list is rebuilt from the roster and the punches on every load. Fix the roster (here, on the person form, or by re-importing) and the row disappears; that person's past punches count immediately, no re-collection needed. Linking an ID shows how many past punches it brought in.
+Nothing is stored about an issue: the list is rebuilt from the Directory and the punches on every load. Archived people's IDs stay mapped, so their old punches never show as unknown. Fix the Directory (here, on the person form, or by re-importing) and the row disappears; that person's past punches count immediately, no re-collection needed. Linking an ID shows how many past punches it brought in.
+
+**Device IDs.** Each person has one main device ID and any number of extra IDs (People → *name* → Other device IDs, or edit the main ID inline on the Directory row). Punches under any of them count. An ID belongs to one person only. Typed IDs are trimmed and upper-cased, and an all-zero ID (`0`, `NP0000`) is refused because devices use 0 for "no user".
+
+### Archiving people
+
+For someone who has left, open their person page and use **Archive person** at the bottom. They leave Employees, Team and the Directory, are signed out and cannot sign in. Punches, past hours and device IDs are kept; exports and the hours API still include them for ranges where they punched. Archiving is refused for the last admin and for anyone who still has reports (reassign them first). **People → Archive** lists archived people with **Restore**. A roster import rejects rows that match an archived person; restore them first.
+
+### Breaks and duplicate swipes
+
+- A swipe within 60 seconds of the person's previous swipe (any device) is a duplicate: kept in **All punches** as *not counted*, never paired.
+- A gap between paired stretches is a **break** only when it is a clean out then in. A gap holding an unpaired swipe is **unclear**: shown dotted on the day bar and totalled apart, never counted as break.
+- C3 event 20 swipes (*interval too short*) count as attendance; see [C3-400](#c3-400-gachibowli).
+
+**Release note.** Hours are computed on read, so after this release hours on past days change for days with duplicate or unpaired swipes (exports, Week, the hours API and statuses included), and again once the next C3 history pull backfills event 20 swipes. Punches themselves are untouched; clean days are unchanged.
 
 ## Fix the Uppal address
 
@@ -403,7 +420,7 @@ The page also lists the last 14 exports. A local-database instance (dev) shows a
 ### When the internet or Turso is down
 
 - **Reads keep working.** Every page and the `/api/v1` pulls are served from the web replica, at most one sync interval stale when the outage began.
-- **Writes show an offline page (HTTP 503)**, never an error: sign-in code requests, roster edits, role changes, device and settings edits. Already signed-in people stay signed in. Retry once the indicator is green.
+- **Writes show an offline page (HTTP 503)**, never an error: sign-in code requests, Directory edits, role changes, device and settings edits. Already signed-in people stay signed in. Retry once the indicator is green.
 - **The collector keeps polling.** Punches go to `/data/collector-spool.db` and replay oldest-first once Turso is back; duplicates are ignored. A punch that keeps failing while syncs succeed moves to the spool's `dead` table (indicator red); it is kept, never dropped. Device-status, heartbeat and Frappe writes are skipped and recomputed next cycle.
 - **The export** records a failed night and retries the next night.
 - **First boot with no internet and no replica:** every page shows the offline page until the first sync.
@@ -491,10 +508,10 @@ Set a **usage alert** in the Turso dashboard well below your plan's limits, and 
 | Capability | employee | manager | hr | admin |
 | --- | --- | --- | --- | --- |
 | Own Today and Week | yes | yes | yes | yes |
-| See others' hours | - | own reports, direct and indirect | everyone | everyone |
-| Export CSV / Excel | - | own reports | everyone | everyone |
+| See others' hours | - | own reports, direct and indirect | all employees | all employees |
+| Export CSV / Excel | - | own reports | all employees | all employees |
 | Roster template and import | - | - | yes | yes |
-| Add or edit a person, set manager | - | - | yes, except an admin's email or device user ID | yes |
+| Add, edit, archive or restore a person, set manager | - | - | yes, except an admin's email or device user ID | yes |
 | Set role employee / manager / hr | - | - | yes, not on admins | yes |
 | Grant or revoke admin | - | - | - | yes, never the last admin |
 | Devices | - | - | - | yes |
@@ -507,14 +524,14 @@ Set a **usage alert** in the Turso dashboard well below your plan's limits, and 
 | --- | --- | --- |
 | employee | Today | Today, Week |
 | manager | Team | Today, Week, Team |
-| hr | Everyone | Today, Week, Everyone, People (with ID issues) |
-| admin | Everyone | Today, Week, Everyone, People (with ID issues), Devices, Settings (plus the sync-health indicator) |
+| hr | Employees | Today, Week, Employees, People (Directory, ID issues, Archive) |
+| admin | Employees | Today, Week, Employees, People (Directory, ID issues, Archive), Devices, Settings (plus the sync-health indicator) |
 
 Asking for someone you may not see returns 404, the same as an id that does not exist. `/admin` redirects to **Devices**; `/devices/ids` redirects to **People → ID issues**.
 
 ## Attendance export
 
-**Team / Everyone → Export hours** downloads up to 93 days for the people you can see (everyone, or only those ticked). Every sheet starts with the range and the work-day window (e.g. 06:00 to 06:00 next day, IST), and the whole export comes from one punch query.
+**Team / Employees → Export hours** downloads up to 93 days for the people you can see (all of them, or only those ticked). Archived people are included for ranges where they punched. Every sheet starts with the range and the work-day window (e.g. 06:00 to 06:00 next day, IST), and the whole export comes from one punch query.
 
 Excel (`/export.xlsx`) has three sheets:
 
@@ -561,9 +578,9 @@ If it stops reporting:
 2. In ZKAccess/eSSL software confirm IP `192.168.1.202`, port `4370` and the communication password. Put it in `ESSL_C3_PASSWORD`.
 3. Pause other access-control software during the first test, then `diagnose.py gachibowli-c3-400`.
 
-The C3 sends big tables in chunks, which the bundled library cannot read, so the collector downloads them itself (`read_c3_table` in `essl_hub/collectors.py`, checked against the panel's CRC). With `ESSL_C3_MODE=auto` it pulls the full history (about 30,000 events, 80 seconds on the tested `AC Ver 18.1.2`) at start and every `ESSL_C3_HISTORY_HOURS`, and reads the live queue on the polls between. Only access-granted swipes count; denied swipes, the exit button and door alarms are skipped. The panel allows one session at a time, so pause ZKAccess or other tools while the collector runs.
+The C3 sends big tables in chunks, which the bundled library cannot read, so the collector downloads them itself (`read_c3_table` in `essl_hub/collectors.py`, checked against the panel's CRC). With `ESSL_C3_MODE=auto` it pulls the full history (about 30,000 events, 80 seconds on the tested `AC Ver 18.1.2`) at start and every `ESSL_C3_HISTORY_HOURS`, and reads the live queue on the polls between. Only access-granted swipes count, plus event 20 ("Too Short Punch Interval"): the door refused to reopen but the person was there, so it is stored as attendance noted *interval too short*. Other denied swipes, the exit button and door alarms are skipped. Set the door's **Punch Interval** in ZKAccess to 1 second or less so real swipes are not denied. The panel allows one session at a time, so pause ZKAccess or other tools while the collector runs.
 
-**IDs.** The C3 stores bare PINs (`9`); the X990 and the roster use `NP0009`. `ESSL_C3_ID_FORMAT` (default `NP{pin:04d}`) maps one to the other. Shared cards listed in `ESSL_C3_UNLINKED_PINS` (default `1,2`, the Temporary cards) are stored as `C3-1`, `C3-2` and never count for anyone. Punches stored before this mapping are fixed with `python scripts/remap_c3_ids.py --apply`.
+**IDs.** The C3 stores bare PINs (`9`); the X990 and the Directory use `NP0009`. `ESSL_C3_ID_FORMAT` (default `NP{pin:04d}`) maps one to the other. Shared cards listed in `ESSL_C3_UNLINKED_PINS` (default `1,2`, the Temporary cards) are stored as `C3-1`, `C3-2` and never count for anyone. Punches stored before this mapping are fixed with `python scripts/remap_c3_ids.py --apply`. If your X990 IDs are not zero-padded (`NP9`, or bare `9`), set `ESSL_C3_ID_FORMAT` to match (`NP{pin}`, `{pin}`) so both devices produce the same ID. Where the two spellings already differ for someone, add the other one as an extra device ID on their person page (or link it from ID issues) instead.
 
 Never factory-reset a device to test connectivity.
 
@@ -610,7 +627,7 @@ All settings live in `.env`; `.env.example` documents each one. The daily target
 | `ESSL_X990_IP` / `_PORT` / `_PASSWORD` | `192.168.1.201` / `4370` / `0` | collector (seeds the row once) |
 | `ESSL_C3_IP` / `_PORT` / `_PASSWORD` | `192.168.1.202` / `4370` / blank | collector (seeds the row once) |
 | `ESSL_C3_MODE`, `ESSL_C3_HISTORY_HOURS`, `ESSL_C3_RTLOG_BATCH` | `auto`, `6`, `250` | collector |
-| `ESSL_C3_ID_FORMAT`, `ESSL_C3_UNLINKED_PINS` | `NP{pin:04d}`, `1,2` | collector: C3 PIN to roster ID |
+| `ESSL_C3_ID_FORMAT`, `ESSL_C3_UNLINKED_PINS` | `NP{pin:04d}`, `1,2` | collector: C3 PIN to device ID |
 | `ESSL_MAIL_PROVIDER` | auto | web: `cloudflare`, `resend`, or `console` (local testing only: prints the code to the server log) |
 | `CLOUDFLARE_API_TOKEN` / `_ACCOUNT_ID` / `_FROM_ADDRESS` | | web |
 | `RESEND_API_KEY` / `RESEND_FROM_ADDRESS` | | web |

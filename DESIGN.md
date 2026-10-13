@@ -60,7 +60,11 @@ Markup helpers are Jinja macros in `templates/_ui.html`; icons are a Lucide spri
 - **Tables** (`ui.table`, `.hours-table`): one bordered container, sticky muted header, 1px row dividers, numeric columns `.num` right-aligned with tabular numerals. Under 768px rows stack into label/value pairs.
 - **Fields** (`ui.field`): label above input, hint below, `aria-invalid` plus `ui.inline_error` on failure. Errors say what went wrong and how to fix it.
 - **Empty state** (`ui.empty_state`): icon, one line on what is missing, one on what to do, optional action.
-- **Quick-view drawer** (`dialog#quick-view` in `base.html`, `static/quick-view.js`): a right-side sheet (full width under 768px) opened by plain clicks on a person's name on Everyone and People; modified clicks and no-JS fall through to the full page. Sticky header with name and Close, identity facts, today's `_day_live` region, footer actions pinned at the bottom. Neutral `--shadow-card`, slide-in of 150ms or less, none under reduced motion. Esc, Close and backdrop close it; focus returns to the name.
+- **Quick-view drawer** (`dialog#quick-view` in `base.html`, `static/quick-view.js`): a right-side sheet (full width under 768px) opened by plain clicks on a person's name on Employees and People › Directory; modified clicks and no-JS fall through to the full page. Sticky header with name and Close, identity facts, the Day strip, today's `_day_live` region, footer actions pinned at the bottom. Neutral `--shadow-card`, slide-in of 150ms or less, none under reduced motion. Esc, Close and backdrop close it; focus returns to the name.
+- **Day strip** (`.day-strip`): the last 7 work days as a row of `.day-chip` links (weekday, date number, status dot plus word), on Today and in the drawer. Chips shrink to fit the drawer and 375px; the list scrolls sideways rather than wrap. The selected day carries `aria-current="date"`.
+- **Day bar** (`_day_breaks.html`, `.day-bar`): a CSS-flex bar of one day, segment widths proportional to time. Inside stretches are solid `--chart-met`; breaks are hatched (45deg `--bar-break-stripe` stripes on `--surface-sunken`, 1px `--border-strong` inset); unclear gaps are a 2px dotted `--bar-unclear-edge` outline on `--surface`; an open stretch runs to now. Breaks and unclear gaps carry a small `.bar-num` badge, numbered from 1 within their kind, matching the list below. Start and end times sit under it in `.bar-axis`. Pattern, not just color, separates the kinds.
+- **Break list** (`.break-list`): a summary line (Inside, Breaks, Unclear in `--warn-text`), then a table of numbered breaks and unclear gaps (From, To, Length) with a total row. Unclear rows say why in a `.break-note`. Every stored swipe sits under a closed **All punches** `<details>`, with chips for *not counted* (a duplicate within 60s), *unpaired* and *interval too short*.
+- **Archive tab** (`people_archive.html`, `_people_tabs.html`): People has subtabs Directory, ID issues, Archive. Archive is a plain table (name, device IDs, archived date, last punch) with **Restore** per row; archiving lives as a tertiary action at the bottom of the person form behind a confirm, never in a row. Empty state: "No one is archived".
 - **Hours** (`ui.hours`): always `7h 42m`.
 
 ## Shell
@@ -69,7 +73,7 @@ Sidebar (232px) with brand, role-aware navigation and the signed-in person (init
 
 ## Rules (anti-slop)
 
-- No gradients, glows, glass, blur or colored shadows. (Exceptions: the legend's hatch swatch, a repeating stripe that mirrors the chart's incomplete pattern; and the brand surface below.)
+- No gradients, glows, glass, blur or colored shadows. (Exceptions: the legend's hatch swatch and the day bar's break segments, repeating stripes that mirror the chart's incomplete pattern; and the brand surface below.)
 - No cards inside cards. A section is a heading plus content, separated by space or a 1px rule.
 - No emoji, no unicode glyphs as icons. Icons are Lucide, 16px, 1.75 stroke.
 - No metric tiles unless a decision hangs on the number.
