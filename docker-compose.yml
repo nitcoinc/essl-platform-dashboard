@@ -1,14 +1,15 @@
-# Single-host stack: the database lives in Turso (libSQL); each app service
-# keeps its own embedded replica file on the essl-data volume (KTD1) and syncs
-# it on its own loop (KTD4). Users reach the web app through a Cloudflare
-# Tunnel. All settings come from .env (see .env.example); deploy/install.sh
-# sets it up.
+# Single-host stack: the database is one local SQLite file (WAL) on the data
+# folder, shared by web and collector. The backup service snapshots it to
+# Cloudflare R2 every ESSL_BACKUP_MINUTES. Users reach the web app through a
+# Cloudflare Tunnel. All settings come from .env (see .env.example);
+# deploy/install.sh sets it up.
 #
-# Tokens: collector and web use the read-write TURSO_AUTH_TOKEN; the nightly
-# export uses the read-only TURSO_EXPORT_AUTH_TOKEN (KTD14).
+# Data folder: ESSL_DATA_DIR (absolute host path) bind-mounts at /data; unset
+# uses the named volume essl-data. Owner 10001:10001, mode 700.
+# Only the backup service holds cloud credentials (R2; Turso for import-turso).
 
 x-app-env: &app-env
-  TURSO_DATABASE_URL: ${TURSO_DATABASE_URL:?set TURSO_DATABASE_URL in .env}
+  ESSL_DB_PATH: /data/essl.db
   ESSL_COLLECTOR_INTERVAL_SECONDS: ${ESSL_COLLECTOR_INTERVAL_SECONDS:-60}
   ESSL_HEARTBEAT_WRITE_SECONDS: ${ESSL_HEARTBEAT_WRITE_SECONDS:-900}
 
@@ -18,10 +19,7 @@ services:
     restart: unless-stopped
     environment:
       <<: *app-env
-      ESSL_DB_PATH: /data/collector-replica.db
       ESSL_SPOOL_PATH: /data/collector-spool.db
-      TURSO_AUTH_TOKEN: ${TURSO_AUTH_TOKEN:?set TURSO_AUTH_TOKEN in .env}
-      TURSO_SYNC_SECONDS: ${TURSO_COLLECTOR_SYNC_SECONDS:-300}
       ESSL_X990_IP: ${ESSL_X990_IP:-192.168.1.201}
       ESSL_X990_PORT: ${ESSL_X990_PORT:-4370}
       ESSL_X990_PASSWORD: ${ESSL_X990_PASSWORD:-0}
@@ -43,7 +41,7 @@ services:
       FRAPPE_SHIFT_TYPES: ${FRAPPE_SHIFT_TYPES:-}
       FRAPPE_SYNC_SINCE: ${FRAPPE_SYNC_SINCE:-}
     volumes:
-      - essl-data:/data
+      - ${ESSL_DATA_DIR:-essl-data}:/data
     command: ["python", "-m", "essl_hub.collector_main"]
 
   web:
@@ -51,9 +49,6 @@ services:
     restart: unless-stopped
     environment:
       <<: *app-env
-      ESSL_DB_PATH: /data/web-replica.db
-      TURSO_AUTH_TOKEN: ${TURSO_AUTH_TOKEN:?set TURSO_AUTH_TOKEN in .env}
-      TURSO_SYNC_SECONDS: ${TURSO_WEB_SYNC_SECONDS:-300}
       # Trust CF-Connecting-IP: only a Cloudflare Tunnel (bundled or on the host)
       # can reach this container. Set 0 if you put a different proxy in front.
       ESSL_BEHIND_TUNNEL: ${ESSL_BEHIND_TUNNEL:-1}
@@ -71,7 +66,7 @@ services:
       TURNSTILE_SITE_KEY: ${TURNSTILE_SITE_KEY:-}
       TURNSTILE_SECRET_KEY: ${TURNSTILE_SECRET_KEY:-}
     volumes:
-      - essl-data:/data
+      - ${ESSL_DATA_DIR:-essl-data}:/data
     command: ["gunicorn", "-w", "1", "--threads", "4", "-b", "0.0.0.0:8000", "essl_hub.web:create_app()"]
     # Loopback by default, for a cloudflared (or proxy) already running on the
     # host: point its public hostname at http://localhost:${ESSL_WEB_PORT}.
@@ -79,23 +74,27 @@ services:
     ports:
       - "${ESSL_WEB_BIND:-127.0.0.1}:${ESSL_WEB_PORT:-8080}:8000"
 
-  nightly-export:
+  backup:
     build: .
     restart: unless-stopped
     environment:
-      ESSL_DB_PATH: /data/export-replica.db
+      ESSL_DB_PATH: /data/essl.db
+      ESSL_BACKUP_MINUTES: ${ESSL_BACKUP_MINUTES:-15}
+      ESSL_BACKUP_KEEP_HOURS: ${ESSL_BACKUP_KEEP_HOURS:-48}
+      ESSL_BACKUP_KEEP_DAYS: ${ESSL_BACKUP_KEEP_DAYS:-30}
       ESSL_EXPORT_HOUR: ${ESSL_EXPORT_HOUR:-2}
-      TURSO_DATABASE_URL: ${TURSO_DATABASE_URL:?set TURSO_DATABASE_URL in .env}
-      # Read-only token (turso db tokens create --read-only), KTD14.
-      TURSO_EXPORT_AUTH_TOKEN: ${TURSO_EXPORT_AUTH_TOKEN:?set TURSO_EXPORT_AUTH_TOKEN in .env}
-      # R2 token scoped to this one bucket (Object Read & Write; R2 has no write-only), KTD15.
-      R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:?set R2_ACCOUNT_ID in .env}
-      R2_BUCKET: ${R2_BUCKET:?set R2_BUCKET in .env}
-      R2_EXPORT_ACCESS_KEY_ID: ${R2_EXPORT_ACCESS_KEY_ID:?set R2_EXPORT_ACCESS_KEY_ID in .env}
-      R2_EXPORT_SECRET_ACCESS_KEY: ${R2_EXPORT_SECRET_ACCESS_KEY:?set R2_EXPORT_SECRET_ACCESS_KEY in .env}
+      # R2 token scoped to this one bucket (Object Read & Write). Unset = backups
+      # Off (health page says so); the app keeps working.
+      R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-}
+      R2_BUCKET: ${R2_BUCKET:-}
+      R2_EXPORT_ACCESS_KEY_ID: ${R2_EXPORT_ACCESS_KEY_ID:-}
+      R2_EXPORT_SECRET_ACCESS_KEY: ${R2_EXPORT_SECRET_ACCESS_KEY:-}
+      # Only for the one-time `python -m essl_hub.backup import-turso` cutover.
+      TURSO_DATABASE_URL: ${TURSO_DATABASE_URL:-}
+      TURSO_AUTH_TOKEN: ${TURSO_AUTH_TOKEN:-}
     volumes:
-      - essl-data:/data
-    command: ["python", "-m", "essl_hub.nightly_export"]
+      - ${ESSL_DATA_DIR:-essl-data}:/data
+    command: ["python", "-m", "essl_hub.backup"]
 
   # Optional bundled tunnel. Off unless COMPOSE_PROFILES=tunnel in .env; skip it
   # when the host already runs cloudflared.
