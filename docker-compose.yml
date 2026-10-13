@@ -10,7 +10,7 @@
 x-app-env: &app-env
   TURSO_DATABASE_URL: ${TURSO_DATABASE_URL:?set TURSO_DATABASE_URL in .env}
   ESSL_COLLECTOR_INTERVAL_SECONDS: ${ESSL_COLLECTOR_INTERVAL_SECONDS:-60}
-  ESSL_HEARTBEAT_WRITE_SECONDS: ${ESSL_HEARTBEAT_WRITE_SECONDS:-300}
+  ESSL_HEARTBEAT_WRITE_SECONDS: ${ESSL_HEARTBEAT_WRITE_SECONDS:-900}
 
 services:
   collector:
@@ -53,7 +53,7 @@ services:
       <<: *app-env
       ESSL_DB_PATH: /data/web-replica.db
       TURSO_AUTH_TOKEN: ${TURSO_AUTH_TOKEN:?set TURSO_AUTH_TOKEN in .env}
-      TURSO_SYNC_SECONDS: ${TURSO_WEB_SYNC_SECONDS:-60}
+      TURSO_SYNC_SECONDS: ${TURSO_WEB_SYNC_SECONDS:-300}
       # Trust CF-Connecting-IP: only a Cloudflare Tunnel (bundled or on the host)
       # can reach this container. Set 0 if you put a different proxy in front.
       ESSL_BEHIND_TUNNEL: ${ESSL_BEHIND_TUNNEL:-1}

@@ -122,6 +122,18 @@ class FrappeSyncTest(unittest.TestCase):
         self.assertFalse(status["ok"])
         self.assertEqual(self.sync().run_once().synced, 1)
 
+    def test_unchanged_status_is_written_once_per_heartbeat(self):
+        sync = self.sync()
+        sync.run_once()
+        writes = []
+        original = self.database.set_setting
+        self.database.set_setting = lambda k, v: (writes.append(k), original(k, v))
+        sync.run_once()
+        self.assertEqual(writes, [])
+        sync._status_at -= frappe_sync.STATUS_HEARTBEAT_SECONDS
+        sync.run_once()
+        self.assertEqual(writes, [frappe_sync.STATUS_SETTING])
+
     def test_server_error_retries(self):
         self.add(punch("a", "101", "2026-03-02 09:00:00", "entry"))
         self.transport.responses = [frappe_sync.HttpResult(502, "bad gateway")]

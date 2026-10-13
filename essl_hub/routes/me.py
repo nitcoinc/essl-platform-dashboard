@@ -6,7 +6,7 @@ from datetime import timedelta
 
 from flask import Blueprint, abort, g, make_response, redirect, render_template, request, url_for
 
-from .. import access, charts, day_story, export
+from .. import access, charts, config, day_story, export
 from ..db import device_ids_of
 from ..hours import work_day, work_day_window
 from .common import (
@@ -65,7 +65,9 @@ def _day_context(subject: dict, day, today, request_now, target_minutes: int, da
     previous_entry = None
     if is_today:
         last_synced = database.min_device_last_success()
-        stale_sync = last_synced is not None and request_now - last_synced > timedelta(minutes=5)
+        stale_sync = last_synced is not None and request_now - last_synced > timedelta(
+            seconds=config.heartbeat_write_seconds() + config.turso_sync_seconds(config.WEB_SYNC_SECONDS) + 60
+        )
         if not result.segments:
             # Rollover while inside: say where the open stretch went.
             previous = _day_for_employee(

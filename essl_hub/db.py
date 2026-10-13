@@ -920,6 +920,10 @@ class Database:
                     config.port,
                 )
 
+    def unseen_punches(self, punches: Iterable[dict[str, object]]) -> list[dict[str, object]]:
+        """Public read of _unseen for the collector's skip-unchanged check."""
+        return self._unseen(punches)
+
     def _unseen(self, punches: Iterable[dict[str, object]]) -> list[dict[str, object]]:
         """Drop punches the replica already holds. Devices return their whole
         history every poll; this read is local, so only new rows go to Turso.

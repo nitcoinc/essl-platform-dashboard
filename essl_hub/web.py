@@ -6,14 +6,13 @@ from pathlib import Path
 from flask import Flask, Response, g, render_template, request
 
 from . import access, auth, config, turnstile
-from .config import DEVICES
+from .config import DEVICES, WEB_SYNC_SECONDS
 from .db import Database, OfflineError
 from .routes import BLUEPRINTS
 from .routes import people as people_routes
 from .routes.common import SESSION_COOKIE, _htmx_partial, _theme, current_sync_health
 
 _logger = logging.getLogger(__name__)
-WEB_SYNC_SECONDS = 60
 
 
 def _prepare_database(database: Database) -> None:

@@ -104,12 +104,21 @@ class PollState:
     poll writes nothing. ``ready`` turns True once the Turso boot work (initial
     sync, schema, seed) has succeeded (KTD10)."""
 
-    heartbeat_seconds: float = 300
+    heartbeat_seconds: float = 900
     clock: Callable[[], float] = time.monotonic
     written: dict[str, _Written] = dataclasses.field(default_factory=dict)
     connection_versions: dict[str, object] = dataclasses.field(default_factory=dict)
     ready: bool = False
     last_poll: str | None = None
+
+
+def _has_unseen(database: Database, events) -> bool:
+    if not events:
+        return False
+    try:
+        return bool(database.unseen_punches(events))
+    except Exception:  # noqa: BLE001 - unsure means write, as before
+        return True
 
 
 def collect_once(
@@ -154,9 +163,12 @@ def collect_once(
     now = state.clock()
     version = state.connection_versions.get(device.id)
     last = state.written.get(device.id)
+    # Devices return their whole history every poll, so "no events" never
+    # held; skip on "nothing new" (a local replica read) instead.
     if (
         last is not None
-        and not events
+        and write.get("transport") != "TCP history"
+        and not _has_unseen(database, events)
         and last.status == status_key
         and last.connection_version == version
         and now - last.at < state.heartbeat_seconds

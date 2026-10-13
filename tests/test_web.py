@@ -2633,7 +2633,7 @@ class StartupTest(unittest.TestCase):
         replica.replica = True
         with patch.dict(os.environ, {"TURSO_SYNC_SECONDS": ""}):
             create_app(database=replica)
-        self.assertEqual(replica.sync_loop_interval, 60)
+        self.assertEqual(replica.sync_loop_interval, 300)
 
 
 if __name__ == "__main__":

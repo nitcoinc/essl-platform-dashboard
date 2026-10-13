@@ -258,6 +258,32 @@ class WriteReductionTest(unittest.TestCase):
     def _poll_real(self, database) -> None:
         collect_once(database, self.device, collector=self._idle, state=self.state)
 
+    def test_full_history_polls_with_nothing_new_issue_zero_updates(self) -> None:
+        """Devices return their whole log every poll; already-stored punches
+        must not count as a change (Turso sync quota)."""
+        import tempfile
+
+        from essl_hub.db import Database
+
+        device = DEVICES[0]
+        history = lambda d: CollectionResult([_punch("fp-old", device)], "TCP realtime", "SN-1", "FW-1")  # noqa: E731
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Database(f"{tmp}/essl.db")
+            database.initialize(DEVICES)
+            collect_once(database, device, collector=history, state=self.state)
+            statements: list[str] = []
+            database._connection().set_trace_callback(statements.append)
+            for _ in range(3):
+                self.clock.now += 60
+                collect_once(database, device, collector=history, state=self.state)
+            self.assertFalse([s for s in statements if "UPDATE" in s.upper() or "INSERT" in s.upper()])
+            fresh = lambda d: CollectionResult(  # noqa: E731
+                [_punch("fp-old", device), _punch("fp-new", device)], "TCP realtime", "SN-1", "FW-1"
+            )
+            self.clock.now += 60
+            collect_once(database, device, collector=fresh, state=self.state)
+            self.assertTrue([s for s in statements if "INSERT" in s.upper()])
+
     def test_heartbeat_interval_forces_one_write(self) -> None:
         self._poll(self._idle)
         self.clock.now += 299
