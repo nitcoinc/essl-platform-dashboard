@@ -20,5 +20,6 @@
   </nav>
 </header>
 
+{% if strip %}{% with drawer=false, strip_from=none %}{% include "_day_strip.html" %}{% endwith %}{% endif %}
 {% include "_day_live.html" %}
 {% endblock %}

@@ -6,7 +6,7 @@ from datetime import timedelta
 
 from flask import Blueprint, abort, g, make_response, redirect, render_template, request, url_for
 
-from .. import access, charts, day_story
+from .. import access, charts, day_story, export
 from ..hours import work_day
 from .common import (
     ROLE_LABELS,
@@ -99,6 +99,30 @@ def _day_context(subject: dict, day, today, request_now, target_minutes: int, da
     )
 
 
+STRIP_DAYS = 7
+
+
+def _day_strip(subject: dict, selected, today, request_now, target_minutes: int, day_start_hour: int) -> list[dict]:
+    """The last STRIP_DAYS work days ending today (KTD7), oldest first, from
+    one day_results call; each entry says whether the person punched."""
+    start = today - timedelta(days=STRIP_DAYS - 1)
+    results = export.day_results(
+        database, [subject], start, today, target_minutes=target_minutes, today=today,
+        now=request_now, day_start_hour=day_start_hour,
+    )
+    strip = []
+    for i in range(STRIP_DAYS):
+        day = start + timedelta(days=i)
+        result = results.get((subject["id"], day))
+        strip.append({
+            "date": day,
+            "is_today": day == today,
+            "punched": result is not None and result.status != "empty",
+            "selected": day == selected,
+        })
+    return strip
+
+
 @bp.get("/week")
 @_login_required
 def week_view() -> str:
@@ -163,6 +187,7 @@ def day_view():
         employee=g.employee,
         prev_date=day - timedelta(days=1),
         next_date=day + timedelta(days=1),
+        strip=None if partial else _day_strip(subject, day, today, request_now, target_minutes, day_start_hour),
     )
     template = "_day_live.html" if partial else "day.html"
     return _vary_htmx(make_response(render_template(template, **context)))
@@ -184,13 +209,22 @@ def quick_view(employee_id: int):
     day_start_hour = _day_start_hour(database)
     request_now = _now_naive()
     today = work_day(request_now, day_start_hour)
-    context = _day_context(subject, today, today, request_now, target_minutes, day_start_hour)
+    day = today
+    raw_date = request.args.get("date")
+    if raw_date:
+        day = _parse_date(raw_date)
+        if day is None or not today - timedelta(days=STRIP_DAYS - 1) <= day <= today:
+            abort(400)
+    context = _day_context(subject, day, today, request_now, target_minutes, day_start_hour)
+    from_people = request.args.get("from") == "people"
     manager = database.employee_by_id(subject["manager_id"]) if subject.get("manager_id") else None
     context.update(
         employee=g.employee,
         manager_name=manager["name"] if manager else None,
         role_label=ROLE_LABELS.get(subject["role"], subject["role"]),
         # Mirrors person_edit's guard, and only offered from People.
-        can_edit=request.args.get("from") == "people" and g.employee["role"] in access.EDITOR_ROLES,
+        can_edit=from_people and g.employee["role"] in access.EDITOR_ROLES,
+        strip=_day_strip(subject, day, today, request_now, target_minutes, day_start_hour),
+        strip_from="people" if from_people else None,
     )
     return _vary_htmx(make_response(render_template("_quick_view.html", **context)))

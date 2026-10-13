@@ -1236,6 +1236,82 @@ class QuickViewTest(_QuickViewBase):
         self.assertTrue(response.headers["Location"].endswith(f"/day?employee={self.ravi['id']}"))
 
 
+class DayStripTest(_QuickViewBase):
+    """U8: last-7-days strip in the drawer and on /day (KTD7)."""
+
+    def _chips(self, page: str) -> list[str]:
+        return re.findall(r'<a class="day-chip[^>]*>', page)
+
+    def test_drawer_strip_lists_seven_days_ending_today(self) -> None:
+        self.database.insert_punches([_punch_row("ds-1", self.DAY - timedelta(days=2) + timedelta(hours=9), "entry")])
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        page = self._quick(self.ravi["id"]).text
+        chips = self._chips(page)
+        self.assertEqual(len(chips), 7)
+        self.assertIn("date=2026-09-03", chips[0])
+        self.assertIn("date=2026-09-09", chips[-1])
+        self.assertIn('aria-current="date"', chips[-1])
+        self.assertIn("Wednesday 09 September, Today", page)
+        self.assertIn("Monday 07 September, Punched", page)
+        self.assertIn("Sunday 06 September, No punches", page)
+
+    def test_strip_respects_day_start_hour(self) -> None:
+        common, me = _fixed_now(datetime(2026, 9, 10, 5, 30))
+        common.start()
+        me.start()
+        self.addCleanup(common.stop)
+        self.addCleanup(me.stop)
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        chips = self._chips(self._quick(self.ravi["id"]).text)
+        self.assertIn("date=2026-09-09", chips[-1])
+        self.assertIn('aria-current="date"', chips[-1])
+
+    def test_past_day_in_window_renders_without_poll(self) -> None:
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        response = self._quick(self.ravi["id"], "?date=2026-09-06")
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("data-poll", response.text)
+        selected = [c for c in self._chips(response.text) if 'aria-current="date"' in c]
+        self.assertEqual(len(selected), 1)
+        self.assertIn("date=2026-09-06", selected[0])
+
+    def test_out_of_window_and_malformed_dates_are_400(self) -> None:
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        for value in ("2026-09-02", "2026-09-10", "nope"):
+            self.assertEqual(self._quick(self.ravi["id"], f"?date={value}").status_code, 400, value)
+        self.assertEqual(self._quick(self.ravi["id"], "?date=2026-09-03").status_code, 200)
+
+    def test_from_people_carried_in_strip_targets(self) -> None:
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        rid = self.ravi["id"]
+        page = self._quick(rid, "?from=people&date=2026-09-08").text
+        self.assertIn(f'data-qv-day="/quick/{rid}?date=2026-09-07&amp;from=people"', page)
+        self.assertIn("Edit details", page)
+        plain = self._quick(rid).text
+        self.assertNotIn("from=people", plain)
+
+    def test_no_access_is_404(self) -> None:
+        boss = self._person("900", "Boss", "manager")
+        other = self._person("901", "Other")
+        self._sign_in(boss)
+        self.assertEqual(self._quick(other["id"], "?date=2026-09-08").status_code, 404)
+
+    def test_day_page_strip_keeps_employee_and_marks_selected(self) -> None:
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        rid = self.ravi["id"]
+        page = self.client.get(f"/day?employee={rid}&date=2026-09-07").text
+        chips = self._chips(page)
+        self.assertEqual(len(chips), 7)
+        self.assertTrue(all(f"employee={rid}" in c for c in chips))
+        self.assertNotIn("data-qv-day", page)
+        selected = [c for c in chips if 'aria-current="date"' in c]
+        self.assertEqual(len(selected), 1)
+        self.assertIn("date=2026-09-07", selected[0])
+        # Older days keep the pager and simply have no selected chip.
+        old = self.client.get(f"/day?employee={rid}&date=2026-08-01").text
+        self.assertNotIn('aria-current="date"', old)
+
+
 class QuickViewDrawerTest(_QuickViewBase):
     """U6: one drawer in the shell, name links carry data-quick-view."""
 

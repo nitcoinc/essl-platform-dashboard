@@ -12,6 +12,7 @@
     <div><dt>Email</dt><dd class="qv-email">{{ subject.email }}</dd></div>
     <div><dt>Device ID</dt><dd class="num">{{ (subject.device_ids or [subject.device_user_id])|join(', ') }}</dd></div>
   </dl>
+  {% with drawer=true %}{% include "_day_strip.html" %}{% endwith %}
   {% include "_day_live.html" %}
 </div>
 <footer class="qv-foot">
