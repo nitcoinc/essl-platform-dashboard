@@ -108,6 +108,112 @@ def punch_flags(raw_state: str | None) -> tuple[str, ...]:
     return ("interval too short",) if "interval too short" in (raw_state or "") else ()
 
 
+@dataclass(frozen=True)
+class BarSegment:
+    kind: str  # "inside" | "break" | "unclear"
+    number: int | None
+    start: datetime
+    end: datetime
+    seconds: int
+    percent: float
+    open: bool = False  # the live stretch, ending at now
+
+
+@dataclass(frozen=True)
+class RawPunch:
+    time: datetime
+    direction: str  # "entry" | "exit" | ""
+    flags: tuple[str, ...]  # "not counted", "unpaired", "interval too short"
+
+
+@dataclass(frozen=True)
+class BreakView:
+    """KTD10: summary, day bar, numbered break list and every stored swipe."""
+
+    inside_seconds: int
+    break_seconds: int
+    break_count: int
+    unclear_seconds: int
+    bar: tuple[BarSegment, ...]
+    bar_start: datetime | None
+    bar_end: datetime | None
+    bar_label: str
+    gaps: tuple  # result.gaps, time-ordered (breaks and unclear)
+    punches: tuple[RawPunch, ...]
+
+
+def _hm(seconds: int) -> str:
+    return f"{seconds // 3600}:{seconds % 3600 // 60:02d}"
+
+
+def break_view(result: DayResult, now: datetime | None, raw_rows=()) -> BreakView:
+    """The break view for one day. ``raw_rows`` are the stored swipes
+    (``event_timestamp``, ``raw_state``) so the raw list shows every one."""
+    open_day = result.status == "open" and now is not None
+    pieces: list[tuple[str, int | None, datetime, datetime, bool]] = []
+    for seg in result.segments:
+        if seg.end is not None:
+            pieces.append(("inside", None, seg.start, seg.end, False))
+        elif open_day and seg is result.segments[-1]:
+            pieces.append(("inside", None, seg.start, max(now, seg.start), True))
+    for gap in result.gaps:
+        pieces.append((gap.kind, gap.number, gap.start, gap.end, False))
+    pieces.sort(key=lambda p: p[2])
+    bar: list[BarSegment] = []
+    bar_start = pieces[0][2] if pieces else None
+    bar_end = max(p[3] for p in pieces) if pieces else None
+    if pieces:
+        total = _seconds(bar_start, bar_end) or 1
+        for kind, number, a, b, is_open in pieces:
+            secs = _seconds(a, b)
+            bar.append(BarSegment(kind, number, a, b, secs, round(secs * 100 / total, 3), is_open))
+    breaks = [g for g in result.gaps if g.kind == "break"]
+    if breaks:
+        label = f"Inside {_hm(result.effective_seconds)}, {len(breaks)} break{'s' if len(breaks) != 1 else ''} totalling {_hm(result.break_seconds)}"
+    else:
+        label = f"Inside {_hm(result.effective_seconds)}, no breaks"
+    if result.unclear_seconds:
+        label += f", {_hm(result.unclear_seconds)} unclear"
+
+    starts = {s.start for s in result.segments}
+    ends = {s.end for s in result.segments if s.end is not None}
+    unpaired = {t: d for t, d in result.unpaired}
+    for gap in result.gaps:
+        unpaired.update({t: d for t, d in gap.unpaired})
+    collapsed = [p.timestamp for p in result.collapsed]
+    punches: list[RawPunch] = []
+    for row in raw_rows:
+        t = row["event_timestamp"]
+        flags: list[str] = []
+        if t in collapsed:
+            collapsed.remove(t)
+            direction = ""
+            flags.append("not counted")
+        elif t in starts:
+            direction = "entry"
+        elif t in ends:
+            direction = "exit"
+        elif t in unpaired:
+            direction = unpaired[t]
+            flags.append("unpaired")
+        else:
+            direction = row.get("trusted_direction") or ""
+        flags.extend(punch_flags(row.get("raw_state")))
+        punches.append(RawPunch(t, direction, tuple(flags)))
+    return BreakView(
+        inside_seconds=result.effective_seconds,
+        break_seconds=result.break_seconds,
+        break_count=len(breaks),
+        unclear_seconds=result.unclear_seconds,
+        bar=tuple(bar),
+        bar_start=bar_start,
+        bar_end=bar_end,
+        bar_label=label,
+        gaps=result.gaps,
+        punches=tuple(punches),
+    )
+
+
 def ring_percent(result: DayResult, target_minutes: int) -> int:
     if target_minutes <= 0:
         return 100

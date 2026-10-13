@@ -7,7 +7,8 @@ from datetime import timedelta
 from flask import Blueprint, abort, g, make_response, redirect, render_template, request, url_for
 
 from .. import access, charts, day_story, export
-from ..hours import work_day
+from ..db import device_ids_of
+from ..hours import work_day, work_day_window
 from .common import (
     ROLE_LABELS,
     _TZ,
@@ -85,7 +86,10 @@ def _day_context(subject: dict, day, today, request_now, target_minutes: int, da
         review_label=day_story.review_label(result),
         live_state=day_story.live_state(result, target_minutes),
         left_text=day_story.left_text(result.effective_seconds, target_minutes * 60),
-        log=day_story.log_items(result, now),
+        breaks=day_story.break_view(
+            result, now,
+            database.punches_for_employee_range(device_ids_of(subject), *work_day_window(day, day_start_hour)),
+        ),
         ring_percent=day_story.ring_percent(result, target_minutes),
         finish_at=reached if result.status == "open" else None,
         last_synced=last_synced,

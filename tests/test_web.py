@@ -845,7 +845,8 @@ class HoursRenderingTest(unittest.TestCase):
         ])
         response = self.client.get(f"/day?date={day.isoformat()}")
         self.assertIn("No exit recorded", response.text)
-        self.assertNotIn('class="log-gap"', response.text)
+        self.assertNotIn('class="bar-seg is-break', response.text)
+        self.assertIn("Breaks</dt><dd><span class=\"num\">0:00:00</span> · none", response.text)
 
     def _at(self, at: datetime):
         common, me = _fixed_now(at)
@@ -863,8 +864,8 @@ class HoursRenderingTest(unittest.TestCase):
         self.assertIn("<h1>Today</h1>", response.text)
         self.assertIn("Wednesday 09 September 2026", response.text)
         self.assertIn("work day from 06:00", response.text)
-        self.assertIn("Now, inside", response.text)
-        self.assertIn("+1</sup>", response.text)  # the 03:00 "now" node
+        self.assertIn('class="bar-seg is-inside is-open"', response.text)
+        self.assertIn("<span>now</span>", response.text)  # bar axis ends at now
 
     def test_day_view_reads_one_clock_instant_per_request(self) -> None:
         # U10: a clock that ticks on every read must still yield one stretch
@@ -1007,7 +1008,7 @@ class LiveTodayTest(unittest.TestCase):
         self.assertEqual(self._attr(page, "data-state"), "inside")
         expected = int((self.DAY + timedelta(hours=11, seconds=5)).replace(tzinfo=_IST).timestamp() * 1000)
         self.assertEqual(self._attr(page, "data-server-epoch-ms"), str(expected))
-        # ring digits, this stretch, the open log stretch and gross (inside
+        # ring digits, this stretch, the break-view Inside figure and gross (inside
         # since first in) all agree to the second
         self.assertEqual(page.count('data-tick="7205"'), 4)
         self.assertIn(">2:00:05<", page)
@@ -1091,7 +1092,7 @@ class LiveTodayTest(unittest.TestCase):
         )
         self.assertTrue(partial.lstrip().startswith("<div id=\"day-live\""))
         self.assertNotIn("<html", partial)
-        self.assertIn('<ol class="day-log">', partial)
+        self.assertIn('class="day-bar" role="img"', partial)
         self.assertNotIn("live-status", partial)
         restore = self.client.get("/day", headers={"HX-Request": "true", "HX-History-Restore-Request": "true"})
         self.assertIn("<html", restore.text)
@@ -1144,12 +1145,39 @@ class LiveTodayTest(unittest.TestCase):
             (timedelta(hours=12, minutes=30, seconds=41), "exit"),
             (timedelta(hours=13, minutes=2, seconds=3), "entry"),
         )
-        self.assertIn('log-time num">09:00:12</span>', page)
-        self.assertIn('log-time num">12:30:41</span>', page)
-        stretches = [int(v) for v in re.findall(r'data-log-stretch="(\d+)"', page)]
-        self.assertEqual(len(stretches), 2)
-        self.assertEqual(sum(stretches), int(self._attr(page, "data-base-seconds")))
-        self.assertIn("Break <span class=\"num\">0:31:22</span>", page)
+        self.assertIn('punch-time num">09:00:12</span>', page)
+        self.assertIn('punch-time num">12:30:41</span>', page)
+        inside = re.search(r'<dt>Inside</dt><dd><span class="num" data-tick="(\d+)"', page).group(1)
+        self.assertEqual(inside, self._attr(page, "data-base-seconds"))
+        self.assertIn('<th scope="row">#1</th>', page)
+        self.assertIn('break-dur">0:31:22', page)
+
+    def test_three_break_day_lists_numbered_breaks_and_total(self) -> None:
+        page = self._today(
+            timedelta(hours=18),
+            (timedelta(hours=9), "entry"), (timedelta(hours=11), "exit"),
+            (timedelta(hours=11, minutes=20), "entry"), (timedelta(hours=13), "exit"),
+            (timedelta(hours=13, minutes=40), "entry"), (timedelta(hours=15), "exit"),
+            (timedelta(hours=15, minutes=20), "entry"), (timedelta(hours=16, minutes=32), "exit"),
+        )
+        self.assertIn('<dt>Breaks</dt><dd><span class="num">1:20:00</span> · <span class="num">3</span>', page)
+        self.assertIn('role="img" aria-label="Inside 6:12, 3 breaks totalling 1:20"', page)
+        for n in (1, 2, 3):
+            self.assertIn(f'<span class="bar-num">{n}</span>', page)
+            self.assertIn(f'<th scope="row">#{n}</th>', page)
+        self.assertIn('Breaks total</th><td class="num">1:20:00</td>', page)
+        self.assertNotIn("log-gap", page)
+
+    def test_unclear_gap_reads_unclear_with_the_swipe_time(self) -> None:
+        page = self._today(
+            timedelta(hours=19),
+            (timedelta(hours=9), "entry"), (timedelta(hours=12), "exit"),
+            (timedelta(hours=13), "exit"), (timedelta(hours=14), "entry"), (timedelta(hours=18), "exit"),
+        )
+        self.assertIn('<div class="is-unclear"><dt>Unclear</dt>', page)
+        self.assertIn('<th scope="row">Unclear</th>', page)
+        self.assertIn('class="bar-seg is-unclear"', page)
+        self.assertIn("swipe at <span class=\"num\">", page)
 
     def test_week_table_keeps_hours_and_minutes(self) -> None:
         self._sign_in()
@@ -1219,6 +1247,20 @@ class QuickViewTest(_QuickViewBase):
         page = self._quick(self.ravi["id"]).text
         self.assertIn('data-live="true"', page)
         self.assertIn(f'data-poll="/day?employee={self.ravi["id"]}&amp;date=2026-09-09"', page)
+
+    def test_drawer_renders_the_break_view_with_punches_closed(self) -> None:
+        # U11: same partial as Today; raw punches stay closed by default.
+        rows = [(9, 0, "entry"), (12, 40, "exit"), (13, 10, "entry")]
+        self.database.insert_punches([
+            _punch_row(f"qv-b{i}", self.DAY + timedelta(hours=h, minutes=m), d) for i, (h, m, d) in enumerate(rows)
+        ])
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        page = self._quick(self.ravi["id"]).text
+        self.assertIn('class="day-bar" role="img" aria-label="Inside', page)
+        self.assertIn('<th scope="row">#1</th>', page)
+        self.assertIn('<details class="raw-punches">', page)
+        self.assertNotIn('<details class="raw-punches" open', page)
+        self.assertIn("<summary>All punches (3)</summary>", page)
 
     def test_edit_details_only_from_people_for_editors(self) -> None:
         self._sign_in(self._person("1", "Hema HR", "hr"))
@@ -3446,7 +3488,7 @@ class ScreensTest(unittest.TestCase):
     def test_day_without_punches_renders_the_empty_state_not_a_chart(self) -> None:
         page = self._client_as("employee").get("/day")
         self.assertIn("No punches yet today", page.text)
-        self.assertNotIn('class="day-log"', page.text)
+        self.assertNotIn('class="day-bar"', page.text)
         self.assertNotIn("GROSS HOURS", page.text)
 
     def test_day_with_punches_renders_the_attendance_log(self) -> None:
@@ -3460,9 +3502,11 @@ class ScreensTest(unittest.TestCase):
             ]
         )
         page = client.get(f"/day?date={day.isoformat()}").text
-        self.assertIn('<ol class="day-log">', page)
-        self.assertIn('log-time num">09:00:00</span><span class="log-label">In</span><span class="log-meta">Inside <span class="num" data-log-stretch="30600">8:30:00', page)
-        self.assertIn('log-time num">17:30:00</span><span class="log-label">Out', page)
+        self.assertIn('<details class="raw-punches">', page)
+        self.assertIn('<summary>All punches (2)</summary>', page)
+        self.assertIn('punch-time num">09:00:00</span><span class="punch-dir">In</span>', page)
+        self.assertIn('punch-time num">17:30:00</span><span class="punch-dir">Out</span>', page)
+        self.assertIn('<dt>Inside</dt><dd><span class="num">8:30:00</span>', page)
         self.assertIn('role="img" aria-label="8h 30m effective, 100% of the', page)
         self.assertNotIn("data-poll=", page)  # past days never poll
 

@@ -136,3 +136,63 @@ class PunchFlagsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BreakViewTest(unittest.TestCase):
+    """U11/KTD10: summary figures, bar segments, break rows, raw punches."""
+
+    def _day(self, *swipes, now=None):
+        from essl_hub.hours import Punch, compute_day
+        punches = [Punch(t, d) for t, d in swipes]
+        return compute_day(punches, target_minutes=480, now=now, is_today=now is not None)
+
+    @staticmethod
+    def _rows(*swipes, states=None):
+        states = states or {}
+        return [{"event_timestamp": t, "trusted_direction": d, "raw_state": states.get(t)} for t, d in swipes]
+
+    def test_three_breaks_number_the_bar_and_sum_to_the_total(self) -> None:
+        swipes = [(_at(9), "entry"), (_at(11), "exit"), (_at(11, 20), "entry"), (_at(13), "exit"),
+                  (_at(13, 40), "entry"), (_at(15), "exit"), (_at(15, 20), "entry"), (_at(16, 32), "exit")]
+        view = day_story.break_view(self._day(*swipes), None, self._rows(*swipes))
+        self.assertEqual(view.break_seconds, 4800)
+        self.assertEqual(view.break_count, 3)
+        self.assertEqual([s.number for s in view.bar if s.kind == "break"], [1, 2, 3])
+        self.assertEqual(view.bar_label, "Inside 6:12, 3 breaks totalling 1:20")
+        self.assertAlmostEqual(sum(s.percent for s in view.bar), 100, places=1)
+        self.assertEqual(sum(g.seconds for g in view.gaps if g.kind == "break"), view.break_seconds)
+        self.assertEqual([p.direction for p in view.punches][:2], ["entry", "exit"])
+
+    def test_clean_day_is_one_solid_segment_with_no_breaks(self) -> None:
+        swipes = [(_at(9), "entry"), (_at(17, 30), "exit")]
+        view = day_story.break_view(self._day(*swipes), None, self._rows(*swipes))
+        self.assertEqual([s.kind for s in view.bar], ["inside"])
+        self.assertEqual(view.bar_label, "Inside 8:30, no breaks")
+        self.assertEqual(view.gaps, ())
+
+    def test_unclear_gap_is_its_own_kind_and_excluded_from_breaks(self) -> None:
+        swipes = [(_at(9), "entry"), (_at(12), "exit"), (_at(13), "exit"), (_at(14), "entry"), (_at(18), "exit")]
+        result = self._day(*swipes)
+        view = day_story.break_view(result, None, self._rows(*swipes))
+        kinds = [s.kind for s in view.bar]
+        self.assertIn("unclear", kinds)
+        self.assertEqual(view.break_seconds, result.break_seconds)
+        self.assertGreater(view.unclear_seconds, 0)
+        self.assertIn("unclear", view.bar_label)
+        self.assertIn("unpaired", [f for p in view.punches for f in p.flags])
+
+    def test_open_day_bar_ends_at_now(self) -> None:
+        swipes = [(_at(9), "entry"), (_at(12), "exit"), (_at(12, 30), "entry")]
+        view = day_story.break_view(self._day(*swipes, now=_at(14)), _at(14), self._rows(*swipes))
+        self.assertTrue(view.bar[-1].open)
+        self.assertEqual(view.bar[-1].end, _at(14))
+        self.assertEqual(view.bar_end, _at(14))
+
+    def test_duplicates_are_not_counted_and_interval_flag_is_shown(self) -> None:
+        dup = D.replace(hour=9, second=20)
+        swipes = [(_at(9), "entry"), (dup, "entry"), (_at(17), "exit")]
+        rows = self._rows(*swipes, states={_at(17): "event 20 · in/out 1 · interval too short"})
+        view = day_story.break_view(self._day(*swipes), None, rows)
+        self.assertEqual(len(view.punches), 3)
+        self.assertEqual(view.punches[1].flags, ("not counted",))
+        self.assertEqual(view.punches[2].flags, ("interval too short",))

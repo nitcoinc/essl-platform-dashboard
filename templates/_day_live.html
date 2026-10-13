@@ -67,7 +67,6 @@
   </div>
   <dl class="day-facts-quiet">
     <div><dt>Gross</dt><dd>{% if result.gross_seconds is not none %}<span class="num"{% if live %} data-tick="{{ result.gross_seconds }}"{% endif %}>{{ ui.clock(result.gross_seconds) }}</span>{% else %}<span class="muted">Incomplete</span>{% endif %}</dd></div>
-    <div><dt>Breaks</dt><dd><span class="num">{{ ui.clock(result.break_seconds) }}</span></dd></div>
   </dl>
   {% endif %}
 </section>
@@ -79,28 +78,8 @@
 <div class="notice">{{ ui.icon('circle-alert') }}<p>A punch on this day has no matching entry or exit, so it counts zero effective hours. Ask HR to record an explanation.</p></div>
 {% endif %}
 
-{% if log %}
-<section class="day-section" aria-labelledby="log-heading">
-  <h2 id="log-heading">Attendance log</h2>
-  <ol class="day-log">
-    {% for item in log %}
-    {% if item.kind == 'break' %}
-    <li class="log-gap"><span class="log-gap-text">Break <span class="num">{{ ui.clock(item.seconds) }}</span></span></li>
-    {% elif item.kind == 'unclear' %}
-    <li class="log-gap"><span class="log-gap-text">Unclear <span class="num">{{ ui.clock(item.seconds) }}</span></span></li>
-    {% elif item.kind == 'in' %}
-    <li class="log-node is-in"><span class="log-dot" aria-hidden="true"></span><span class="log-time num">{{ item.time.strftime('%H:%M:%S') }}{% if item.time.date() > day %}<sup title="Next calendar day">+1</sup>{% endif %}</span><span class="log-label">In</span>{% if item.seconds is not none %}<span class="log-meta">Inside <span class="num" data-log-stretch="{{ item.seconds }}"{% if live and loop.revindex == 2 %} data-tick="{{ item.seconds }}"{% endif %}>{{ ui.clock(item.seconds) }}</span></span>{% endif %}</li>
-    {% elif item.kind == 'out' %}
-    <li class="log-node is-out"><span class="log-dot" aria-hidden="true"></span><span class="log-time num">{{ item.time.strftime('%H:%M:%S') }}{% if item.time.date() > day %}<sup title="Next calendar day">+1</sup>{% endif %}</span><span class="log-label">Out</span></li>
-    {% elif item.kind == 'now' %}
-    <li class="log-node is-now"><span class="log-dot" aria-hidden="true"></span><span class="log-time num">{{ item.time.strftime('%H:%M:%S') }}{% if item.time.date() > day %}<sup title="Next calendar day">+1</sup>{% endif %}</span><span class="log-label">Now, inside</span></li>
-    {% else %}
-    <li class="log-node is-missing"><span class="log-dot" aria-hidden="true"></span><span class="log-time">--:--:--</span><span class="log-label">No exit recorded</span></li>
-    {% endif %}
-    {% endfor %}
-  </ol>
-  <p class="footnote">Hours come only from the door devices. Nobody can add or edit a punch by hand.</p>
-</section>
+{% if breaks.punches %}
+{% include "_day_breaks.html" %}
 {% elif not lone_today %}
 <div class="day-empty">
 {% if day.weekday() >= 5 and not is_today %}
