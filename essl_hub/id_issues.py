@@ -169,6 +169,8 @@ def id_twins(issues: list[Issue], employees: list[dict] | None = None) -> dict[s
         if len(people) != 1:
             continue
         person = people[0]
+        if person.get("archived_at"):
+            continue  # archived holders keep the number taken but are never suggested
         match = next((i for i in never.get(number, []) if i.employee_id == person["id"]), None)
         if match is not None:
             twins[found[0].key] = match
@@ -229,6 +231,8 @@ def find_issues(summary: list[dict], employees: list[dict], dismissed: set[str] 
         elif employee is None:
             issues.append(Issue("unknown", "bad", title="Punches but nobody on the roster",
                                 detail="Hours are not counted until someone with this device ID is added.", **common))
+        elif employee.get("archived_at"):
+            continue  # archived: mapped, so not unknown, but no other rule applies
         elif not names_agree(common["device_name"], employee["name"]):
             issues.append(Issue("name", "warn", title="Device name differs from the roster",
                                 detail=(f"The device calls {uid} “{common['device_name']}”; the roster says “{employee['name']}”. "
@@ -236,7 +240,7 @@ def find_issues(summary: list[dict], employees: list[dict], dismissed: set[str] 
                                         "If it is someone else, change the roster ID here."),
                                 employee_id=employee["id"], employee_name=employee["name"], **common))
 
-    mains = {str(e["device_user_id"]): e for e in employees}
+    mains = {str(e["device_user_id"]): e for e in employees if not e.get("archived_at")}
     for uid, employee in sorted(mains.items(), key=lambda kv: kv[1]["name"]):
         common = dict(device_user_id=uid, employee_id=employee["id"], employee_name=employee["name"])
         if "@" in uid:

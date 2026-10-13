@@ -21,7 +21,9 @@ def visible_employee_ids(database, viewer: dict) -> set[int]:
     role grants nothing (KTD7)."""
     role = viewer["role"]
     if role in EVERYONE_ROLES:
-        return {row["id"] for row in database.employees()}
+        # Archived people stay visible here so exports keep their past hours;
+        # live views list only database.employees() (active).
+        return {row["id"] for row in database.employees(include_archived=True)}
     if role == "manager":
         return set(database.subtree_ids(viewer["id"]))
     return {viewer["id"]}
@@ -61,3 +63,16 @@ def would_create_cycle(database, employee_id: int, manager_id: int | None) -> bo
     if manager_id is None:
         return False
     return employee_id in database.manager_chain(manager_id)
+
+
+def can_archive(actor: dict, target: dict) -> tuple[str, int] | None:
+    """Archive/restore pre-check (KTD6): (message, status) when refused. The
+    last-admin and direct-report rules need counts, so the guarded
+    Database.archive_employee enforces them in its UPDATE."""
+    if actor["role"] not in EDITOR_ROLES:
+        return "Only HR and admins can archive people.", 403
+    if target["id"] == actor["id"]:
+        return "You cannot archive yourself.", 400
+    if target["role"] == "admin" and actor["role"] != "admin":
+        return "Only an admin can archive or restore an admin.", 403
+    return None

@@ -468,12 +468,65 @@ class DatabaseTest(unittest.TestCase):
             [r["device_user_id"] for r in self.database.checkins_since(since=None, limit=10)], ["NP0118"]
         )
 
-    def test_set_employee_archived_sets_and_clears(self) -> None:
+    def test_archive_hides_person_and_restore_brings_them_back(self) -> None:
         asha = self._employee("118", "asha@x.com")
-        self.database.set_employee_archived(asha, True)
-        self.assertIsNotNone(self.database.employee_by_id(asha)["archived_at"])
-        self.database.set_employee_archived(asha, False)
-        self.assertIsNone(self.database.employee_by_id(asha)["archived_at"])
+        self.database.add_extra_device_id(asha, "NP0118")
+        before = self.database.employee_by_id(asha)
+        self.database.archive_employee(asha)
+        self.assertIsNone(self.database.employee_by_id(asha))
+        self.assertIsNone(self.database.employee_by_email("asha@x.com"))
+        self.assertIsNotNone(self.database.employee_by_email("asha@x.com", include_archived=True))
+        self.assertEqual(self.database.employees(), [])
+        self.assertEqual([e["id"] for e in self.database.employees(include_archived=True)], [asha])
+        archived = self.database.archived_employees()
+        self.assertEqual(archived[0]["device_ids"], ["118", "NP0118"])
+        self.assertIsInstance(archived[0]["archived_at"], datetime)
+        # Their IDs stay mapped: punches never resurface as unknown.
+        self.database.insert_punches([self._punch(device_user_id="NP0118")])
+        self.assertEqual(self.database.unmapped_device_user_ids(), [])
+        self.assertEqual(self.database.employee_by_device_user_id("NP0118")["id"], asha)
+        self.assertTrue(self.database.restore_employee(asha))
+        self.assertFalse(self.database.restore_employee(asha))
+        after = self.database.employee_by_id(asha)
+        for row in (before, after):
+            row.pop("archived_at"), row.pop("updated_at")
+        self.assertEqual(before, after)
+
+    def test_archived_with_punches_only_in_range(self) -> None:
+        asha = self._employee("118", "asha@x.com")
+        self.database.insert_punches([self._punch(event_timestamp=datetime(2026, 9, 10, 9, 0))])
+        self.database.archive_employee(asha)
+        inside = self.database.archived_employees_with_punches(datetime(2026, 9, 10), datetime(2026, 9, 11))
+        outside = self.database.archived_employees_with_punches(datetime(2026, 9, 11), datetime(2026, 9, 12))
+        self.assertEqual([e["id"] for e in inside], [asha])
+        self.assertEqual(outside, [])
+        self.assertIsInstance(self.database.archived_employees()[0]["last_punch"], datetime)
+
+    def test_archive_guards_last_admin_and_direct_reports(self) -> None:
+        boss = self._employee("1", "boss@x.com")
+        worker = self._employee("2", "worker@x.com")
+        self.database.set_employee_role(boss, "admin")
+        with self.assertRaisesRegex(db_module.RuleViolation, "last admin"):
+            self.database.archive_employee(boss)
+        self.database.set_employee_role(worker, "admin")
+        self.database.set_employee_manager(worker, boss)
+        with self.assertRaisesRegex(db_module.RuleViolation, "1 person reports"):
+            self.database.archive_employee(boss)
+        self.database.set_employee_manager(worker, None)
+        self.database.archive_employee(boss)
+        # Archived admins don't count: the remaining admin is now the last.
+        self.assertTrue(self.database.has_admin())
+        with self.assertRaises(db_module.RuleViolation):
+            self.database.set_employee_role(worker, "employee")
+
+    def test_archive_ends_sessions(self) -> None:
+        asha = self._employee("118", "asha@x.com")
+        self.database.create_session(employee_id=asha, token_hash="t", csrf_token="c",
+                                     expires_at=datetime.now() + timedelta(days=1))
+        self.assertIsNotNone(self.database.session_employee("t"))
+        self.database.archive_employee(asha)
+        self.database.restore_employee(asha)
+        self.assertIsNone(self.database.session_employee("t"))
 
     def test_record_poll_commits_punches_and_device_row_together(self) -> None:
         inserted = self.database.record_poll(

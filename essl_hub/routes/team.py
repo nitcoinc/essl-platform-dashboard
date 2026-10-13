@@ -16,6 +16,7 @@ from .common import (
     _int_list,
     _login_required,
     _now_naive,
+    _people_for_range,
     _role_required,
     _target_minutes,
     _today,
@@ -130,9 +131,11 @@ def _export(kind: str):
         wanted = visible & set(requested)  # outside ids drop silently
     else:
         wanted = visible
-    everyone = database.employees()
-    names = {person["id"]: person["name"] for person in everyone}
-    people = [person for person in everyone if person["id"] in wanted]
+    names = {person["id"]: person["name"] for person in database.employees(include_archived=True)}
+    people = [
+        person for person in _people_for_range(database, start, end, day_start_hour)
+        if person["id"] in wanted
+    ]
     report = export.build_report(
         database, people, start, end,
         manager_names=names, target_minutes=_target_minutes(database),

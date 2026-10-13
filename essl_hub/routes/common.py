@@ -232,6 +232,14 @@ def _today(day_start_hour: int | None = None) -> date:
     return work_day(_now_naive(), day_start_hour)
 
 
+def _people_for_range(database, start: date, end: date, day_start_hour: int) -> list[dict]:
+    """Active people plus archived people with punches in the range, so
+    exports and the hours API never drop past hours (KTD6)."""
+    window = (work_day_window(start, day_start_hour)[0], work_day_window(end, day_start_hour)[1])
+    people = database.employees() + database.archived_employees_with_punches(*window)
+    return sorted(people, key=lambda person: person["name"])
+
+
 def _parse_date(value: str | None) -> date | None:
     if not value:
         return None

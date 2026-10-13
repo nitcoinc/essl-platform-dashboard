@@ -43,6 +43,8 @@ TIMESTAMP_COLUMNS = frozenset(
         "consumed_at",
         "last_used_at",
         "synced_at",
+        "archived_at",
+        "last_punch",
     }
 )
 JSON_COLUMNS = frozenset({"raw_json"})
@@ -825,7 +827,7 @@ class Database:
             return
         with self.transaction() as connection:
             existing_admin = connection.execute(
-                "SELECT 1 FROM employees WHERE role = 'admin' LIMIT 1"
+                "SELECT 1 FROM employees WHERE role = 'admin' AND archived_at IS NULL LIMIT 1"
             ).fetchone()
             if existing_admin is not None:
                 return
@@ -1163,34 +1165,120 @@ class Database:
             ).fetchone()
         return row
 
-    def set_employee_archived(self, employee_id: int, archived: bool) -> None:
-        """Set or clear employees.archived_at (v6). Callers check access and
-        last-admin rules first."""
+    def archive_employee(self, employee_id: int) -> None:
+        """Archive one person (KTD6), guarded in the UPDATE itself: not the
+        last active admin, not someone with active direct reports. Ends every
+        session they hold. Self and HR/admin rules live in access.can_archive."""
         with self.transaction() as connection:
-            connection.execute(
-                "UPDATE employees SET archived_at = ?, updated_at = ? WHERE id = ?",
-                (_now() if archived else None, _now(), employee_id),
+            cursor = connection.execute(
+                """
+                UPDATE employees SET archived_at = ?, updated_at = ?
+                WHERE id = ? AND archived_at IS NULL
+                  AND (role <> 'admin' OR (
+                      SELECT COUNT(*) FROM employees WHERE role = 'admin' AND archived_at IS NULL) > 1)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM employees r WHERE r.manager_id = ? AND r.archived_at IS NULL)
+                """,
+                (_now(), _now(), employee_id, employee_id),
             )
+            if cursor.rowcount:
+                connection.execute("DELETE FROM sessions WHERE employee_id = ?", (employee_id,))
+                return
+            row = connection.execute(
+                "SELECT role, archived_at FROM employees WHERE id = ?", (employee_id,)
+            ).fetchone()
+            if row is None:
+                raise RuleViolation("No such employee.")
+            if row["archived_at"] is not None:
+                raise RuleViolation("Already archived.")
+            reports = connection.execute(
+                "SELECT COUNT(*) AS n FROM employees WHERE manager_id = ? AND archived_at IS NULL",
+                (employee_id,),
+            ).fetchone()["n"]
+            if reports:
+                raise RuleViolation(reports_message(reports))
+            raise RuleViolation("The last admin cannot be archived.")
 
-    def employees(self) -> list[dict[str, object]]:
+    def restore_employee(self, employee_id: int) -> bool:
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE employees SET archived_at = NULL, updated_at = ? "
+                "WHERE id = ? AND archived_at IS NOT NULL",
+                (_now(), employee_id),
+            )
+        return cursor.rowcount > 0
+
+    def active_report_count(self, employee_id: int) -> int:
+        with self.connect() as connection:
+            return connection.execute(
+                "SELECT COUNT(*) AS n FROM employees WHERE manager_id = ? AND archived_at IS NULL",
+                (employee_id,),
+            ).fetchone()["n"]
+
+    def employees(self, include_archived: bool = False) -> list[dict[str, object]]:
+        """Active people by default; archived ones only when asked (KTD6)."""
+        where = "" if include_archived else " WHERE archived_at IS NULL"
         with self.connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM employees ORDER BY name"
+                f"SELECT * FROM employees{where} ORDER BY name"
             ).fetchall()
             return _attach_device_ids(connection, list(rows))
 
-    def employee_by_email(self, email: str) -> dict[str, object] | None:
+    def archived_employees(self) -> list[dict[str, object]]:
+        """Archived people, most recently archived first, with their last punch."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT e.*, (
+                    SELECT MAX(p.event_timestamp) FROM punches p
+                    WHERE p.device_user_id = e.device_user_id OR p.device_user_id IN (
+                        SELECT x.device_user_id FROM employee_device_ids x WHERE x.employee_id = e.id)
+                ) AS last_punch
+                FROM employees e WHERE e.archived_at IS NOT NULL
+                ORDER BY e.archived_at DESC, e.name
+                """
+            ).fetchall()
+            people = _attach_device_ids(connection, list(rows))
+        for person in people:
+            if isinstance(person.get("last_punch"), str):
+                person["last_punch"] = datetime.fromisoformat(person["last_punch"])
+        return people
+
+    def archived_employees_with_punches(self, start: datetime, end: datetime) -> list[dict[str, object]]:
+        """Archived people with any punch in [start, end), so exports and the
+        hours API keep their past hours (archiving never drops data)."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT e.* FROM employees e
+                WHERE e.archived_at IS NOT NULL AND EXISTS (
+                    SELECT 1 FROM punches p
+                    WHERE p.event_timestamp >= ? AND p.event_timestamp < ?
+                      AND (p.device_user_id = e.device_user_id OR p.device_user_id IN (
+                          SELECT x.device_user_id FROM employee_device_ids x WHERE x.employee_id = e.id))
+                )
+                ORDER BY e.name
+                """,
+                (start, end),
+            ).fetchall()
+            return _attach_device_ids(connection, list(rows))
+
+    def employee_by_email(self, email: str, include_archived: bool = False) -> dict[str, object] | None:
+        archived = "" if include_archived else " AND archived_at IS NULL"
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT * FROM employees WHERE lower(email) = lower(?)",
+                f"SELECT * FROM employees WHERE lower(email) = lower(?){archived}",
                 (email,),
             ).fetchone()
             return (_attach_device_ids(connection, [row]) or [None])[0]
 
-    def employee_by_id(self, employee_id: int) -> dict[str, object] | None:
+    def employee_by_id(self, employee_id: int, include_archived: bool = False) -> dict[str, object] | None:
+        """Viewing paths treat archived people as not found; only archive,
+        restore and the Archive tab pass include_archived."""
+        archived = "" if include_archived else " AND archived_at IS NULL"
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT * FROM employees WHERE id = ?", (employee_id,)
+                f"SELECT * FROM employees WHERE id = ?{archived}", (employee_id,)
             ).fetchone()
             return (_attach_device_ids(connection, [row]) or [None])[0]
 
@@ -1204,7 +1292,7 @@ class Database:
                 UPDATE employees SET role = ?, updated_at = ?
                 WHERE id = ? AND (
                     role <> 'admin' OR ? = 'admin'
-                    OR (SELECT COUNT(*) FROM employees WHERE role = 'admin') > 1
+                    OR (SELECT COUNT(*) FROM employees WHERE role = 'admin' AND archived_at IS NULL) > 1
                 )
                 """,
                 (role, _now(), employee_id, role),
@@ -1297,7 +1385,7 @@ class Database:
     def has_admin(self) -> bool:
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT 1 FROM employees WHERE role = 'admin' LIMIT 1"
+                "SELECT 1 FROM employees WHERE role = 'admin' AND archived_at IS NULL LIMIT 1"
             ).fetchone()
         return row is not None
 
@@ -1447,6 +1535,7 @@ class Database:
                 SELECT e.*, s.csrf_token FROM sessions s
                 JOIN employees e ON e.id = s.employee_id
                 WHERE s.token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > ?
+                  AND e.archived_at IS NULL
                 """,
                 (token_hash, _now()),
             ).fetchone()
@@ -1595,6 +1684,11 @@ def _manager_chain(connection: _Connection, employee_id: int) -> list[int]:
         (employee_id,),
     ).fetchall()
     return [row["id"] for row in rows]
+
+
+def reports_message(count: int) -> str:
+    people = "person reports" if count == 1 else "people report"
+    return f"{count} {people} to them. Give them another manager first."
 
 
 def _now() -> datetime:

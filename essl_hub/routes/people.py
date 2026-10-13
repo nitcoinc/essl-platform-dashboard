@@ -14,7 +14,7 @@ import openpyxl
 from flask import Blueprint, Response, abort, g, make_response, redirect, render_template, request, url_for
 
 from .. import access, export, id_issues, roster
-from ..db import IntegrityError, RuleViolation
+from ..db import IntegrityError, RuleViolation, reports_message
 from .common import (
     ROLE_LABELS,
     ROSTER_EXAMPLE_ROW,
@@ -215,7 +215,7 @@ def _device_id_change(target: dict, raw: str | None):
         return None, (_sentence(message), 400)
     holder = database.employee_by_device_user_id(value)
     if holder is not None and holder["id"] != target["id"]:
-        return None, (f"{holder['name']} already uses device ID {value}.", 400)
+        return None, (f"{_who(holder)} already uses device ID {value}.", 400)
     if holder is not None:
         return None, (f"{value} is already one of {target['name']}'s other device IDs. Remove it there first.", 400)
     return value, None
@@ -275,6 +275,11 @@ def people_set_role(employee_id: int):
     return _assignment_response(employee_id, result)
 
 
+def _who(person: dict) -> str:
+    """A clash message's name; archived people keep their IDs and email (KTD6)."""
+    return f"{person['name']} (archived)" if person.get("archived_at") else person["name"]
+
+
 def _render_person_form(target: dict | None, values: dict, errors: dict, status: int = 200):
     actor = g.employee
     locked = target is not None and not access.can_modify_employee(actor, target, "email")
@@ -319,12 +324,12 @@ def _identity_errors(values: dict, target_id: int | None) -> dict:
         field = {"name": "name", "email": "email", "device": "device_user_id"}[message.split()[0]]
         return {field: _sentence(message)}
     errors = {}
-    clash = database.employee_by_email(values["email"])
+    clash = database.employee_by_email(values["email"], include_archived=True)
     if clash is not None and clash["id"] != target_id:
-        errors["email"] = f"{clash['name']} already uses this work email."
+        errors["email"] = f"{_who(clash)} already uses this work email."
     clash = database.employee_by_device_user_id(values["device_user_id"])
     if clash is not None and clash["id"] != target_id:
-        errors["device_user_id"] = f"{clash['name']} already uses this device user ID."
+        errors["device_user_id"] = f"{_who(clash)} already uses this device user ID."
     return errors
 
 
@@ -411,7 +416,7 @@ def person_add_device_id(employee_id: int):
         error = _sentence(roster.ZERO_DEVICE_ID)
     elif (holder := database.employee_by_device_user_id(device_user_id)) is not None:
         error = (f"{target['name']} already has this device ID." if holder["id"] == target["id"]
-                 else f"{holder['name']} already uses device ID {device_user_id}.")
+                 else f"{_who(holder)} already uses device ID {device_user_id}.")
     if error is None:
         try:
             database.add_extra_device_id(target["id"], device_user_id)
@@ -475,6 +480,66 @@ def person_update(employee_id: int):
         )
     forget_issue_count()
     return redirect(url_for("people.people_view", q=values["name"]))
+
+
+# --- Archive (KTD6) ----------------------------------------------------
+
+@bp.post("/people/<int:employee_id>/archive")
+@_role_required("hr", "admin")
+def person_archive(employee_id: int):
+    _require_csrf()
+    target = database.employee_by_id(employee_id)
+    if target is None:
+        abort(404)
+    refused = access.can_archive(g.employee, target)
+    if refused is None:
+        reports = database.active_report_count(target["id"])
+        if reports:
+            refused = (reports_message(reports), 400)
+    if refused is None:
+        try:
+            database.archive_employee(target["id"])
+        except RuleViolation as exc:
+            refused = (str(exc), 400)
+    if refused is not None:
+        return _render_person_form(target, _target_values(target), {"form": refused[0]}, status=refused[1])
+    forget_issue_count()
+    return _redirect_with_flash("people.people_archive_view", archived=target["name"])
+
+
+@bp.post("/people/<int:employee_id>/restore")
+@_role_required("hr", "admin")
+def person_restore(employee_id: int):
+    _require_csrf()
+    target = database.employee_by_id(employee_id, include_archived=True)
+    if target is None or not target.get("archived_at"):
+        abort(404)
+    refused = access.can_archive(g.employee, target)
+    if refused is not None:
+        abort(refused[1])
+    database.restore_employee(target["id"])
+    forget_issue_count()
+    manager = (database.employee_by_id(target["manager_id"], include_archived=True)
+               if target.get("manager_id") else None)
+    note = (f"Their manager, {manager['name']}, is archived; pick a new manager on their edit page."
+            if manager is not None and manager.get("archived_at") else "")
+    return _redirect_with_flash("people.people_archive_view", restored=target["name"], note=note)
+
+
+@bp.get("/people/archive")
+@_role_required("hr", "admin")
+def people_archive_view():
+    flash = _take_flash()
+    rows = [
+        {"person": person, "locked": access.can_archive(g.employee, person) is not None}
+        for person in database.archived_employees()
+    ]
+    response = make_response(render_template(
+        "people_archive.html", employee=g.employee, csrf_token=g.csrf_token, rows=rows, flash=flash,
+    ))
+    if request.cookies.get(_FLASH_COOKIE):
+        response.delete_cookie(_FLASH_COOKIE)
+    return response
 
 
 # --- Roster import (U6) ------------------------------------------------
@@ -576,7 +641,7 @@ def _dismissed() -> set[str]:
 
 def _issues(dismissed: set[str] | None = None) -> list[id_issues.Issue]:
     return id_issues.find_issues(
-        database.device_id_summary(), database.employees(), _dismissed() if dismissed is None else dismissed
+        database.device_id_summary(), database.employees(include_archived=True), _dismissed() if dismissed is None else dismissed
     )
 
 
@@ -654,7 +719,7 @@ def id_issues_view():
     counts = {kind: sum(1 for i in issues if i.kind == kind) for kind in ("unknown", "placeholder", "never", "name", "shared")}
     pairs = id_issues.suggestions(issues)
     roster_people = database.employees()
-    twins = id_issues.id_twins(issues, roster_people)
+    twins = id_issues.id_twins(issues, database.employees(include_archived=True))
     flash = _take_flash()
     confirm = None
     if request.args.get("confirm"):

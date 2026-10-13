@@ -96,6 +96,12 @@ def apply_rows(database, rows, actor: dict | None = None) -> list[RosterOutcome]
         if row.device_user_id in duplicate_ids:
             outcomes[row.row_number] = _outcome(row, "rejected", "duplicate device user ID in this file")
             continue
+        archived = _archived_match(database, row)
+        if archived is not None:
+            outcomes[row.row_number] = _outcome(
+                row, "rejected", f"matches archived person {archived['name']}; restore them first"
+            )
+            continue
         if actor is not None and _touches_protected_admin(database, actor, row):
             outcomes[row.row_number] = _outcome(row, "rejected", _ADMIN_ROW)
             continue
@@ -196,6 +202,18 @@ def _import_device_id(database, raw: str) -> str:
 
 def _outcome(row: RosterRow, result: str, reason: str | None = None) -> RosterOutcome:
     return RosterOutcome(row.row_number, row.name, row.email, row.device_user_id, result, reason)
+
+
+def _archived_match(database, row: RosterRow) -> dict | None:
+    """The archived person this row's device ID or email belongs to (KTD6):
+    an import never edits or silently restores an archived record."""
+    for existing in (
+        database.employee_by_device_user_id(row.device_user_id),
+        database.employee_by_email(row.email, include_archived=True),
+    ):
+        if existing is not None and existing.get("archived_at"):
+            return existing
+    return None
 
 
 def _touches_protected_admin(database, actor: dict, row: RosterRow) -> bool:

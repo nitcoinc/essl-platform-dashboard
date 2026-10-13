@@ -129,5 +129,20 @@ class SuggestionsTest(unittest.TestCase):
         self.assertEqual(suggestions(issues), {})
 
 
+class ArchivedPeopleTest(unittest.TestCase):
+    def test_archived_ids_stay_mapped_but_no_rule_applies(self) -> None:
+        gone = {**_emp(7, "NP0007", "Ravi"), "archived_at": datetime(2026, 10, 1), "device_ids": ["NP0007", "7"]}
+        never = {**_emp(8, "NP0008", "Old"), "archived_at": datetime(2026, 10, 1)}
+        issues = find_issues([_seen("7", "Someone Else"), _seen("NP0007", "Ravi")], [gone, never])
+        self.assertEqual(issues, [])
+
+    def test_archived_holder_is_never_a_twin_suggestion(self) -> None:
+        from essl_hub.id_issues import id_twins
+
+        gone = {**_emp(7, "128", "Kiran"), "archived_at": datetime(2026, 10, 1)}
+        issues = find_issues([_seen("NP0128", "Kiran")], [gone])
+        self.assertEqual(id_twins(issues, [gone]), {})
+
+
 if __name__ == "__main__":
     unittest.main()

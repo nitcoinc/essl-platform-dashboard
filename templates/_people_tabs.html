@@ -2,4 +2,5 @@
 <nav class="subtabs" aria-label="People sections">
   <a class="subtab" href="{{ url_for('people.people_view') }}"{% if request.endpoint == 'people.people_view' %} aria-current="page"{% endif %}>Directory</a>
   <a class="subtab" href="{{ url_for('people.id_issues_view') }}"{% if request.endpoint == 'people.id_issues_view' %} aria-current="page"{% endif %}>ID issues{% if nav_issue_count %} <span class="subtab-count" aria-label="{{ nav_issue_count }} to check">{{ nav_issue_count }}</span>{% endif %}</a>
+  <a class="subtab" href="{{ url_for('people.people_archive_view') }}"{% if request.endpoint == 'people.people_archive_view' %} aria-current="page"{% endif %}>Archive</a>
 </nav>

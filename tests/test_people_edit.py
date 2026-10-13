@@ -103,5 +103,157 @@ class PersonEditRealDatabaseTest(unittest.TestCase):
         self.assertRegex(page, r'class="button button-tertiary button-sm"[^>]*>Edit</a>')
 
 
+class ArchiveTest(unittest.TestCase):
+    """Archive and restore people (KTD6) against the real Database."""
+
+    setUp = PersonEditRealDatabaseTest.setUp
+    _csrf = PersonEditRealDatabaseTest._csrf
+
+    def _person(self, device_user_id: str, name: str, role: str = "employee") -> dict:
+        email = f"{name.lower()}@example.com"
+        self.database.upsert_employee(device_user_id=device_user_id, name=name, email=email)
+        person = self.database.employee_by_email(email)
+        if role != "employee":
+            self.database.set_employee_role(person["id"], role)
+        return self.database.employee_by_id(person["id"])
+
+    def _punch(self, device_user_id: str, when) -> None:
+        self.database.insert_punches([{
+            "fingerprint": f"fp-{device_user_id}-{when.isoformat()}", "device_id": "uppal-x990", "site": "Uppal",
+            "device_user_id": device_user_id, "employee_name": "Device Name", "event_timestamp": when,
+        }])
+
+    def _client_for(self, email: str):
+        client = self.app.test_client()
+        captured = {}
+        original = mail_module.send_login_code
+        mail_module.send_login_code = lambda to, code: captured.update(code=code)
+        try:
+            client.post("/signin", data={"email": email})
+            if "code" in captured:
+                client.post("/signin/verify", data={"code": captured["code"]})
+        finally:
+            mail_module.send_login_code = original
+        return client, captured
+
+    def _archive(self, person: dict, client=None):
+        client = client or self.client
+        csrf = re.search(r'name="csrf" value="([^"]+)"', client.get("/people").text).group(1)
+        return client.post(f"/people/{person['id']}/archive", data={"csrf": csrf})
+
+    def test_archive_hides_person_everywhere_and_restore_brings_them_back(self) -> None:
+        from datetime import datetime, timedelta
+
+        asha = self._person("NP0118", "Asha")
+        self.database.add_extra_device_id(asha["id"], "118")
+        punched = (datetime.now() - timedelta(days=3)).replace(hour=10, minute=0, second=0, microsecond=0)
+        self._punch("118", punched)
+        before = self.database.employee_by_id(asha["id"])
+        issues_before = self.client.get("/people/issues").text.count("count for nobody")
+
+        response = self._archive(asha)
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.location.endswith("/people/archive"))
+        archive_page = self.client.get("/people/archive").text
+        self.assertIn("Archived Asha.", archive_page)
+        self.assertIn("NP0118, 118", archive_page)
+        for url in ("/team", "/people"):
+            self.assertNotIn("asha@example.com", self.client.get(url).text, url)
+        quick = self.client.get(f"/quick/{asha['id']}", headers={"HX-Request": "true"})
+        self.assertEqual(quick.status_code, 404)
+        self.assertEqual(self.client.get(f"/people/{asha['id']}/edit").status_code, 404)
+        issues = self.client.get("/people/issues").text
+        self.assertNotIn("Asha", issues)
+        self.assertEqual(issues.count("count for nobody"), issues_before)
+
+        # Past hours stay in exports for ranges where they punched, not others.
+        day = punched.date().isoformat()
+        export = self.client.get(f"/export.csv?from={day}&to={day}").text
+        self.assertIn("NP0118,Asha", export)
+        tomorrow = (punched.date() + timedelta(days=1)).isoformat()
+        self.assertNotIn("NP0118,Asha", self.client.get(f"/export.csv?from={tomorrow}&to={tomorrow}").text)
+        from essl_hub import hashing
+        self.database.create_api_key(prefix="k1", key_hash=hashing.sha256_hex("secret"), label="t")
+        hours = self.client.get(f"/api/v1/hours?from={day}&to={day}", headers={"Authorization": "Bearer secret"}).json
+        self.assertIn("asha@example.com", {row["employee_email"] for row in hours["results"]})
+
+        csrf = self._csrf("/people/archive")
+        response = self.client.post(f"/people/{asha['id']}/restore", data={"csrf": csrf})
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("Restored Asha.", self.client.get("/people/archive").text)
+        self.assertIn("asha@example.com", self.client.get("/people").text)
+        after = self.database.employee_by_id(asha["id"])
+        for row in (before, after):
+            row.pop("archived_at"), row.pop("updated_at")
+        self.assertEqual(before, after)
+
+    def test_archived_person_is_signed_out_and_cannot_sign_in(self) -> None:
+        asha = self._person("7", "Asha")
+        client, captured = self._client_for("asha@example.com")
+        self.assertEqual(client.get("/day").status_code, 200)
+        self._archive(asha)
+        self.assertEqual(client.get("/day").status_code, 302)
+        fresh, captured = self._client_for("asha@example.com")
+        self.assertNotIn("code", captured)
+        self.assertEqual(fresh.get("/day").status_code, 302)
+
+    def test_archive_guards(self) -> None:
+        self.assertEqual(self._archive(self.admin).status_code, 400)
+        boss = self._person("8", "Boss")
+        worker = self._person("9", "Worker")
+        self.database.set_employee_manager(worker["id"], boss["id"])
+        response = self._archive(boss)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("1 person reports to them", response.text)
+        self.assertIsNotNone(self.database.employee_by_id(boss["id"]))
+        other_admin = self._person("10", "Other", role="admin")
+        self._person("11", "Hilda", role="hr")
+        hr_client, _ = self._client_for("hilda@example.com")
+        self.assertEqual(self._archive(other_admin, hr_client).status_code, 403)
+        self.assertEqual(self._archive(worker, hr_client).status_code, 302)
+
+    def test_new_person_clashing_with_archived_person_names_them(self) -> None:
+        asha = self._person("12", "Asha")
+        self._archive(asha)
+        csrf = self._csrf("/people/new")
+        response = self.client.post("/people/new", data={
+            "csrf": csrf, "name": "New", "email": "asha@example.com", "device_user_id": "12",
+            "manager_id": "", "role": "employee"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Asha (archived) already uses", response.text)
+
+    def test_archive_tab_access_and_csrf(self) -> None:
+        asha = self._person("13", "Asha")
+        client, _ = self._client_for("asha@example.com")
+        self.assertEqual(client.get("/people/archive").status_code, 403)
+        self.assertEqual(self.client.post(f"/people/{asha['id']}/archive").status_code, 400)
+        self.assertIsNotNone(self.database.employee_by_id(asha["id"]))
+
+    def test_restore_with_archived_manager_notes_it(self) -> None:
+        boss = self._person("14", "Boss")
+        worker = self._person("15", "Worker")
+        self.database.set_employee_manager(worker["id"], boss["id"])
+        self._archive(worker)
+        self._archive(boss)
+        csrf = self._csrf("/people/archive")
+        self.client.post(f"/people/{worker['id']}/restore", data={"csrf": csrf})
+        page = self.client.get("/people/archive").text
+        self.assertIn("Their manager, Boss, is archived", page)
+        self.assertIsNotNone(self.database.employee_by_id(worker["id"]))
+
+    def test_roster_import_rejects_archived_person(self) -> None:
+        from essl_hub import roster
+
+        asha = self._person("16", "Asha")
+        self._archive(asha)
+        outcomes = roster.apply_roster(
+            self.database, "name,work email,device user id\r\nAsha B,asha@example.com,16\r\n", actor=self.admin
+        )
+        self.assertEqual(outcomes[0].result, "rejected")
+        self.assertIn("archived person Asha", outcomes[0].reason)
+        self.assertIsNone(self.database.employee_by_id(asha["id"]))
+        self.assertEqual(self.database.employee_by_id(asha["id"], include_archived=True)["name"], "Asha")
+
+
 if __name__ == "__main__":
     unittest.main()

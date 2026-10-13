@@ -269,24 +269,32 @@ class FakeDatabase:
     def device_user_id_owner(self, device_user_id: str):
         return self.employee_by_device_user_id(device_user_id)
 
-    def employees(self):
+    def employees(self, include_archived: bool = False):
         return sorted(
-            (self._ids(e) for e in self.employees_by_id.values()),
+            (self._ids(e) for e in self.employees_by_id.values()
+             if include_archived or not e.get("archived_at")),
             key=lambda e: e["name"],
         )
 
-    def employee_by_email(self, email: str):
+    def archived_employees_with_punches(self, start, end):
+        return []
+
+    def employee_by_email(self, email: str, include_archived: bool = False):
         return self._ids(next(
             (
                 e
                 for e in self.employees_by_id.values()
                 if e["email"].lower() == email.strip().lower()
+                and (include_archived or not e.get("archived_at"))
             ),
             None,
         ))
 
-    def employee_by_id(self, employee_id: int):
-        return self._ids(self.employees_by_id.get(employee_id))
+    def employee_by_id(self, employee_id: int, include_archived: bool = False):
+        employee = self.employees_by_id.get(employee_id)
+        if employee is not None and employee.get("archived_at") and not include_archived:
+            return None
+        return self._ids(employee)
 
     def set_employee_role(self, employee_id: int, role: str) -> None:
         self._check_online()

@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% import "_ui.html" as ui %}
+{% block title %}Archive - People - eSSL Attendance Hub{% endblock %}
+{% block content %}
+<header class="topbar">
+  <div>
+    <h1>People</h1>
+    <p>People who have left. They are hidden from working views and cannot sign in; their punches and past hours are kept.</p>
+  </div>
+</header>
+{% include "_people_tabs.html" %}
+
+{% if flash.archived %}
+<div class="notice notice-ok" role="status">{{ ui.icon('check') }}<p><strong>Archived {{ flash.archived }}.</strong> Their punches and past hours are kept.</p></div>
+{% endif %}
+{% if flash.restored %}
+<div class="notice notice-ok" role="status">{{ ui.icon('check') }}<p><strong>Restored {{ flash.restored }}.</strong> They are back in every view with their past hours.{% if flash.note %} {{ flash.note }}{% endif %}</p></div>
+{% endif %}
+
+{% if rows %}
+<div class="table-scroll">
+  <table class="table hours-table people-table">
+    <caption class="visually-hidden">Archived people, with device IDs, archived date and last punch</caption>
+    <thead><tr>
+      <th scope="col">Name</th><th scope="col" class="num">Device IDs</th><th scope="col">Archived</th>
+      <th scope="col">Last punch</th><th scope="col"><span class="visually-hidden">Actions</span></th>
+    </tr></thead>
+    <tbody>
+      {% for row in rows %}{% set p = row.person %}
+      <tr>
+        <td><strong>{{ p.name }}</strong><br><span class="muted">{{ p.email }}</span></td>
+        <td class="num">{{ (p.device_ids or [p.device_user_id])|join(', ') }}</td>
+        <td>{{ p.archived_at.strftime('%d %b %Y') if p.archived_at else '' }}</td>
+        <td>{{ p.last_punch.strftime('%d %b %Y %H:%M') if p.last_punch else 'Never' }}</td>
+        <td>
+          {% if row.locked %}<span class="lock">{{ ui.icon('lock') }}<span>Admin only</span></span>
+          {% else %}
+          <form method="post" action="{{ url_for('people.person_restore', employee_id=p.id) }}" class="inline-form">
+            <input type="hidden" name="csrf" value="{{ csrf_token }}">
+            {{ ui.button('Restore', 'secondary', type='submit', size='sm', attrs='aria-label="Restore ' ~ p.name|e ~ '"') }}
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+{{ ui.empty_state('No one is archived', 'Archive someone who has left from the bottom of their edit page.', 'inbox') }}
+{% endif %}
+{% endblock %}

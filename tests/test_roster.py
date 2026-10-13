@@ -29,7 +29,7 @@ class FakeDatabase:
         self.employees[device_user_id] = {"name": name, "email": email}
         return result
 
-    def employee_by_email(self, email: str):
+    def employee_by_email(self, email: str, include_archived: bool = False):
         for device_user_id, row in self.employees.items():
             if row["email"].lower() == email.lower():
                 return {**row, "device_user_id": device_user_id}
