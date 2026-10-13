@@ -651,7 +651,7 @@ class WebFlowTest(unittest.TestCase):
         page = self.client.get("/team")
         self.assertEqual(page.status_code, 200)
         self.assertIn('href="/team"', page.text)
-        self.assertIn("<span>Everyone</span>", page.text)
+        self.assertIn("<span>Employees</span>", page.text)
         self.assertNotIn('href="/admin"', page.text)
 
     def test_hr_cannot_view_admin_route(self) -> None:
@@ -1341,7 +1341,7 @@ class AdminViewTest(unittest.TestCase):
         self.assertIn('class="subtab-count"', people)
         page = self.client.get("/people/issues").text
         self.assertIn("231", page)
-        self.assertIn("Not on roster", page)
+        self.assertIn("Not in Directory", page)
         self.assertIn('href="/people/new?device_user_id=231', page)
 
     def test_name_mismatch_can_be_marked_same_person(self) -> None:
@@ -1426,7 +1426,7 @@ class AdminViewTest(unittest.TestCase):
         # The flash shows once.
         self.assertNotIn("Linked NP0231", self.client.get("/people/issues").text)
         self.assertEqual(self.database.employee_by_id(sita["id"])["device_user_id"], "NP0231")
-        self.assertNotIn("Not on roster", response.text)
+        self.assertNotIn("Not in Directory", response.text)
 
     def test_link_refuses_an_id_someone_else_has(self) -> None:
         self.database.upsert_employee(device_user_id="NP0005", name="Owner", email="owner@example.com")
@@ -1442,8 +1442,13 @@ class AdminViewTest(unittest.TestCase):
         self.assertIn('value="NP0231"', page)
         self.assertIn('value="New Joiner"', page)
 
+    def test_people_subtab_reads_directory(self) -> None:
+        page = self.client.get("/people").text
+        self.assertIn('href="/people" aria-current="page">Directory</a>', page)
+        self.assertNotIn(">Roster</a>", page)
+
     def test_admin_navigation_links_to_the_employee_data(self) -> None:
-        # An admin is authorised for Everyone, so the nav must offer it.
+        # An admin is authorised for Employees, so the nav must offer it.
         page = self.client.get("/settings")
         self.assertIn('href="/team"', page.text)
 
@@ -2333,8 +2338,8 @@ class AppShellTest(unittest.TestCase):
         # The manager role arrives with U5.
         expected = {
             "employee": ["Today", "Week"],
-            "hr": ["Today", "Week", "Everyone", "People"],
-            "admin": ["Today", "Week", "Everyone", "People", "Devices", "Settings"],
+            "hr": ["Today", "Week", "Employees", "People"],
+            "admin": ["Today", "Week", "Employees", "People", "Devices", "Settings"],
         }
         for role, labels in expected.items():
             with self.subTest(role=role):
@@ -2548,6 +2553,8 @@ class RolesAndVisibilityTest(unittest.TestCase):
         page = self.client.get("/team")
         self.assertEqual(page.status_code, 200)
         self.assertIn("<h1>Team</h1>", page.text)
+        self.assertIn("<span>Team</span>", page.text)
+        self.assertNotIn("Employees", page.text)
         for name in ("P40", "P41", "P42"):
             self.assertIn(f">{name}</a>", page.text)
         self.assertNotIn(">P43</a>", page.text)
@@ -2558,7 +2565,9 @@ class RolesAndVisibilityTest(unittest.TestCase):
             person = self._person(uid, role)
             self._sign_in(person)
             page = self.client.get("/team")
-            self.assertIn("<h1>Everyone</h1>", page.text)
+            self.assertIn("<h1>Employees</h1>", page.text)
+            self.assertIn("<span>Employees</span>", page.text)
+            self.assertNotIn("Everyone", page.text)
             self.assertIn(">P43</a>", page.text)
 
     def test_team_search_filters_and_htmx_returns_the_results_region(self) -> None:
@@ -2653,7 +2662,7 @@ class RolesAndVisibilityTest(unittest.TestCase):
         expected = {
             "employee": ["Today", "Week"],
             "manager": ["Today", "Week", "Team"],
-            "hr": ["Today", "Week", "Everyone", "People"],
+            "hr": ["Today", "Week", "Employees", "People"],
         }
         for i, (role, labels) in enumerate(expected.items()):
             self._sign_in(self._person(f"5{i}", role))

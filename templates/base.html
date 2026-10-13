@@ -5,7 +5,7 @@
 {%- set nav = [
   ('me.day_view', 'Today', 'clock', ('employee', 'manager', 'hr', 'admin')),
   ('me.week_view', 'Week', 'calendar-days', ('employee', 'manager', 'hr', 'admin')),
-  ('team.team_view', 'Everyone' if role in ('hr', 'admin') else 'Team', 'users', ('manager', 'hr', 'admin')),
+  ('team.team_view', 'Employees' if role in ('hr', 'admin') else 'Team', 'users', ('manager', 'hr', 'admin')),
   ('people.people_view', 'People', 'user-round-cog', ('hr', 'admin')),
   ('admin.devices_view', 'Devices', 'server', ('admin',)),
   ('admin.settings_view', 'Settings', 'settings', ('admin',)),

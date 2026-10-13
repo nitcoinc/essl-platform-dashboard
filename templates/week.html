@@ -8,7 +8,7 @@
 {% block content %}
 <header class="topbar">
   <div>
-    {% if other %}<a class="back-link" href="{{ url_for('team.team_view') }}">{{ ui.icon('arrow-left') }}<span>{{ 'Everyone' if employee.role in ('hr', 'admin') else 'Team' }}</span></a>
+    {% if other %}<a class="back-link" href="{{ url_for('team.team_view') }}">{{ ui.icon('arrow-left') }}<span>{{ 'Employees' if employee.role in ('hr', 'admin') else 'Team' }}</span></a>
     <p class="subject-name">{{ subject.name }}</p>{% endif %}
     <h1>{{ 'This week' if offset == 0 else ('Last week' if offset == -1 else 'Week of ' ~ days[0].date.strftime('%d %B')) }}</h1>
     <p>{{ days[0].date.strftime('%a %d %b') }} to {{ days[-1].date.strftime('%a %d %b %Y') }} <span class="muted">· work days from {{ day_start }}</span></p>

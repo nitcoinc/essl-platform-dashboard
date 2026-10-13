@@ -1,4 +1,4 @@
-"""Team / Everyone view and the scoped CSV and Excel exports."""
+"""Team / Employees view and the scoped CSV and Excel exports."""
 
 from __future__ import annotations
 
@@ -82,7 +82,7 @@ def _render_team(export_error: str | None = None, status: int = 200):
         "employee": g.employee,
         "query": query,
         "rows": _team_rows(query),
-        "title": "Everyone" if everyone_label else "Team",
+        "title": "Employees" if everyone_label else "Team",
         "today": today,
         "unmapped": database.unmapped_device_user_ids() if everyone_label else [],
         "presets": presets,
