@@ -102,6 +102,12 @@ def log_items(result: DayResult, now: datetime | None) -> list[LogItem]:
     return items
 
 
+def punch_flags(raw_state: str | None) -> tuple[str, ...]:
+    """Chips for a stored swipe in the raw-punch list: a C3 swipe the door
+    denied for punch interval still counts (KTD11) but is marked."""
+    return ("interval too short",) if "interval too short" in (raw_state or "") else ()
+
+
 def ring_percent(result: DayResult, target_minutes: int) -> int:
     if target_minutes <= 0:
         return 100

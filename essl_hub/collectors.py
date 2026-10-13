@@ -68,9 +68,16 @@ C3_CMD_LARGE_DATA = 0x0D
 C3_CMD_READ_BUFFER = 0x0E
 C3_REPLY_OK = 0xC8
 C3_TABLE_TIMEOUT_SECONDS = 60
-# Access-granted punches. Others are denied swipes (20, 27), exit button
-# (202), device start (206) and door/aux alarms (2xx), which are not attendance.
-C3_PUNCH_EVENT_TYPES = {"0", "1", "2", "3"}
+# Access-granted punches. Others are denied swipes (27), exit button (202),
+# device start (206) and door/aux alarms (2xx), which are not attendance.
+C3_GRANTED_EVENT_TYPES = {"0", "1", "2", "3"}
+# KTD11: event 20 "Too Short Punch Interval" is a swipe the door denied
+# because it came inside the punch interval of the previous one, usually the
+# second person walking through the first one's opening. The person passed,
+# so it counts as attendance, flagged; hours.py collapses same-person repeats.
+C3_INTERVAL_TOO_SHORT_EVENT = "20"
+C3_INTERVAL_TOO_SHORT_NOTE = "interval too short"
+C3_ATTENDANCE_EVENT_TYPES = C3_GRANTED_EVENT_TYPES | {C3_INTERVAL_TOO_SHORT_EVENT}
 
 _C3_HISTORY_AT: dict[str, float] = {}
 
@@ -84,7 +91,21 @@ def _c3_history_due(device_id: str) -> bool:
 
 
 def _c3_is_punch(event_type: str) -> bool:
-    return str(event_type).strip() in C3_PUNCH_EVENT_TYPES
+    """Attendance swipe: access granted, or denied only for punch interval."""
+    return str(event_type).strip() in C3_ATTENDANCE_EVENT_TYPES
+
+
+def _c3_is_granted(event_type: str) -> bool:
+    return str(event_type).strip() in C3_GRANTED_EVENT_TYPES
+
+
+def _c3_keep(event_type: str, pin: str, card: str) -> bool:
+    """An interval-too-short row with neither PIN nor card has no identity."""
+    if not _c3_is_punch(event_type):
+        return False
+    if str(event_type).strip() == C3_INTERVAL_TOO_SHORT_EVENT:
+        return str(pin or "").strip() not in ("", "0") or str(card or "").strip() not in ("", "0")
+    return True
 
 
 def _read_c3_frame(sock: socket.socket) -> tuple[int, bytes]:
@@ -263,10 +284,10 @@ def collect_c3(device: DeviceConfig) -> CollectionResult:
         events = []
         for row in transactions:
             value = _record_values(row)
-            if not _c3_is_punch(value("EventType", "event_type")):
-                continue
             pin = value("Pin")
             card = value("Cardno", "CardNo", "Card")
+            if not _c3_keep(value("EventType", "event_type"), pin, card):
+                continue
             raw_time = value("Time_second", "TimeSecond")
             timestamp = ""
             if raw_time:
@@ -283,6 +304,7 @@ def collect_c3(device: DeviceConfig) -> CollectionResult:
                 for part in (
                     f"event {event_type}" if event_type else "",
                     f"in/out {in_out}" if in_out else "",
+                    C3_INTERVAL_TOO_SHORT_NOTE if event_type.strip() == C3_INTERVAL_TOO_SHORT_EVENT else "",
                 )
                 if part
             )
@@ -322,7 +344,8 @@ def collect_c3(device: DeviceConfig) -> CollectionResult:
             records = panel.get_rt_log()
             realtime_events = [
                 record for record in records
-                if record.is_event() and _c3_is_punch(str(int(record.event_type)))
+                if record.is_event()
+                and _c3_keep(str(int(record.event_type)), str(record.pin or ""), str(record.card_no or ""))
             ]
             if not realtime_events:
                 break
@@ -349,7 +372,10 @@ def collect_c3(device: DeviceConfig) -> CollectionResult:
                         or names_by_card.get(card)
                         or "",
                         timestamp=raw["timestamp"],
-                        raw_state=f"{record.event_type} · {record.in_out_state}",
+                        raw_state=f"{record.event_type} · {record.in_out_state}" + (
+                            f" · {C3_INTERVAL_TOO_SHORT_NOTE}"
+                            if str(int(record.event_type)) == C3_INTERVAL_TOO_SHORT_EVENT else ""
+                        ),
                         door=str(record.port_nr),
                         raw_direction_byte=int(record.in_out_state),
                         trusted_direction=_c3_trusted_direction(
@@ -416,13 +442,14 @@ def _c3_trusted_direction(in_out_state: int, event_type: int | None = None) -> s
     ENTRY/EXIT. A real exit (protocol byte 1) fails its decode and the record
     keeps only the fallback UNKNOWN_UNSUPPORTED (15); the raw byte is not
     exposed. On a card (punch) event 15 is therefore an exit: on the
-    Gachibowli panel 21 of 22 such rows sit between two entries. Anything
-    else is left for hours.py to alternate."""
+    Gachibowli panel 21 of 22 such rows sit between two entries. That
+    evidence covers granted events only, so an interval-too-short (20) row
+    with 15 is left for hours.py to alternate, like anything else."""
     if in_out_state == 0:
         return "entry"
     if in_out_state == 3:
         return "exit"
-    if in_out_state == 15 and event_type is not None and _c3_is_punch(str(event_type)):
+    if in_out_state == 15 and event_type is not None and _c3_is_granted(str(event_type)):
         return "exit"
     return None
 

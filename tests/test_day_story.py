@@ -117,5 +117,22 @@ class TodayStateTest(unittest.TestCase):
         self.assertIsNone(day_story.review_label(_scored("met", 29000, [])))
 
 
+
+class PunchFlagsTest(unittest.TestCase):
+    def test_interval_too_short_chip(self) -> None:
+        self.assertEqual(day_story.punch_flags("event 20 · in/out 1 · interval too short"), ("interval too short",))
+        self.assertEqual(day_story.punch_flags("event 0 · in/out 1"), ())
+        self.assertEqual(day_story.punch_flags(None), ())
+
+    def test_same_person_event_0_then_20_counts_once(self) -> None:
+        from essl_hub.hours import Punch, compute_day
+
+        second = Punch(_at(13).replace(second=1))
+        r = compute_day([Punch(_at(9), "entry"), Punch(_at(13), "exit"), second, Punch(_at(14), "entry"),
+                         Punch(_at(18), "exit")], target_minutes=480)
+        self.assertEqual(r.collapsed, (second,))
+        self.assertEqual(r.break_seconds, 3600)
+
+
 if __name__ == "__main__":
     unittest.main()

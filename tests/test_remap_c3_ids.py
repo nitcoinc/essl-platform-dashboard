@@ -26,7 +26,9 @@ class RemapTest(unittest.TestCase):
             self.assertEqual(remap_c3_ids.planned_changes([done]), [])
 
     def test_denied_swipes_are_dropped_and_temporary_cards_unlinked(self) -> None:
-        self.assertEqual(remap_c3_ids.not_punches([_row(1, "9"), _row(2, "9", event_type=20)]), [2])
+        self.assertEqual(remap_c3_ids.not_punches([_row(1, "9"), _row(2, "9", event_type=27)]), [2])
+        # KTD11: interval-too-short swipes are attendance now; the script keeps them.
+        self.assertEqual(remap_c3_ids.not_punches([_row(1, "9"), _row(2, "9", event_type=20)]), [])
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(remap_c3_ids.planned_changes([_row(3, "2", pin="2")])[0][1], "C3-2")
 
