@@ -12,8 +12,10 @@ DirectionSource = Literal["raw_byte", "alternation", "mixed", "none"]
 # cross calendar midnight, so a midnight cut splits one shift over two days.
 DEFAULT_DAY_START_HOUR = 6
 
-# KTD9: a swipe within this many seconds of the person's previous kept swipe
-# (any device) is a duplicate: stored, shown "not counted", never paired.
+# KTD9: a direction-less swipe within this many seconds of the previous kept
+# swipe, or a same-direction re-swipe, is a duplicate: stored, shown
+# "not counted", never paired. Known-direction swipes of a different direction
+# always count (magnetic door: every In and Out is a real record).
 DUPLICATE_WINDOW_SECONDS = 60
 
 GapKind = Literal["break", "unclear"]
@@ -68,6 +70,9 @@ class DayResult:
     unpaired: tuple[tuple[datetime, Direction], ...] = ()
     # Duplicate swipes dropped before pairing ("not counted" in raw lists).
     collapsed: tuple[Punch, ...] = ()
+    # Direction-less swipes whose direction was inferred to fill a missing
+    # alternation (Out, swipe, Out -> the swipe is In).
+    inferred: tuple[datetime, ...] = ()
 
 
 def compute_day(
@@ -88,11 +93,10 @@ def compute_day(
             direction_source="none",
         )
 
-    kept, collapsed = _collapse_duplicates(ordered)
-    resolved, direction_source = _resolve_directions(kept)
+    resolved, collapsed, inferred, direction_source = _resolve_directions(ordered)
     segments, unmatched, open_start = _pair_segments(resolved)
     anomalies = tuple(_anomaly_text(ts, direction) for ts, direction in unmatched)
-    extras = {"collapsed": tuple(collapsed)}
+    extras = {"collapsed": tuple(collapsed), "inferred": tuple(inferred)}
 
     # R4: inside now on today's work day is open, whatever orphans came before.
     if open_start is not None and is_today and now is not None:
@@ -184,20 +188,6 @@ def _gaps(
     return tuple(gaps)
 
 
-def _collapse_duplicates(ordered: list[Punch]) -> tuple[list[Punch], list[Punch]]:
-    """Drop swipes within DUPLICATE_WINDOW_SECONDS of the previous kept swipe,
-    keeping the first (KTD9)."""
-    kept: list[Punch] = []
-    collapsed: list[Punch] = []
-    window = timedelta(seconds=DUPLICATE_WINDOW_SECONDS)
-    for punch in ordered:
-        if kept and punch.timestamp - kept[-1].timestamp <= window:
-            collapsed.append(punch)
-        else:
-            kept.append(punch)
-    return kept, collapsed
-
-
 def work_day(timestamp: datetime, day_start_hour: int) -> date:
     """The work day containing ``timestamp`` (naive IST): before the day-start
     hour a time still belongs to the previous calendar day's work day."""
@@ -212,20 +202,43 @@ def work_day_window(day: date, day_start_hour: int) -> tuple[datetime, datetime]
 
 def _resolve_directions(
     ordered: list[Punch],
-) -> tuple[list[tuple[datetime, Direction]], DirectionSource]:
+) -> tuple[list[tuple[datetime, Direction]], list[Punch], list[datetime], DirectionSource]:
+    """Give every swipe a direction or mark it a duplicate (KTD9).
+
+    A known-direction swipe always counts, unless it repeats the previous kept
+    swipe's direction within DUPLICATE_WINDOW_SECONDS (a re-swipe). A
+    direction-less swipe first fills a missing alternation: between a kept
+    swipe and the next known-direction swipe of the same direction it takes
+    the opposite one. Otherwise it is a duplicate within the window of the
+    previous kept swipe, or alternates from it."""
     resolved: list[tuple[datetime, Direction]] = []
-    expected: Direction = "entry"
+    collapsed: list[Punch] = []
+    inferred: list[datetime] = []
+    window = timedelta(seconds=DUPLICATE_WINDOW_SECONDS)
     any_trusted = False
     any_alternated = False
-    for punch in ordered:
+    for i, punch in enumerate(ordered):
+        last = resolved[-1] if resolved else None
+        near = last is not None and punch.timestamp - last[0] <= window
         if punch.trusted_direction is not None:
+            if near and last[1] == punch.trusted_direction:
+                collapsed.append(punch)
+                continue
             direction = punch.trusted_direction
             any_trusted = True
         else:
-            direction = expected
+            following = next((p.trusted_direction for p in ordered[i + 1:]
+                              if p.trusted_direction is not None), None)
+            if last is not None and following == last[1]:
+                direction = _flip(last[1])
+                inferred.append(punch.timestamp)
+            elif near:
+                collapsed.append(punch)
+                continue
+            else:
+                direction = _flip(last[1]) if last is not None else "entry"
             any_alternated = True
         resolved.append((punch.timestamp, direction))
-        expected = "exit" if direction == "entry" else "entry"
 
     if any_trusted and any_alternated:
         source: DirectionSource = "mixed"
@@ -235,7 +248,11 @@ def _resolve_directions(
         source = "alternation"
     else:
         source = "none"
-    return resolved, source
+    return resolved, collapsed, inferred, source
+
+
+def _flip(direction: Direction) -> Direction:
+    return "exit" if direction == "entry" else "entry"
 
 
 def _pair_segments(

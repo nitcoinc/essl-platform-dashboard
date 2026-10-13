@@ -865,7 +865,7 @@ class HoursRenderingTest(unittest.TestCase):
         self.assertIn("Wednesday 09 September 2026", response.text)
         self.assertIn("work day from 06:00", response.text)
         self.assertIn('class="bar-seg is-inside is-open"', response.text)
-        self.assertIn("<span>now</span>", response.text)  # bar axis ends at now
+        self.assertIn('<span class="bar-mark-label">now</span>', response.text)  # bar ends at now
 
     def test_day_view_reads_one_clock_instant_per_request(self) -> None:
         # U10: a clock that ticks on every read must still yield one stretch
@@ -1149,8 +1149,8 @@ class LiveTodayTest(unittest.TestCase):
         self.assertIn('punch-time num">12:30:41</span>', page)
         inside = re.search(r'<dt>Inside</dt><dd><span class="num" data-tick="(\d+)"', page).group(1)
         self.assertEqual(inside, self._attr(page, "data-base-seconds"))
-        self.assertIn('<th scope="row">#1</th>', page)
-        self.assertIn('break-dur">0:31:22', page)
+        self.assertIn('title="Break 1 · 12:30:41', page)
+        self.assertNotIn('class="break-list"', page)
 
     def test_three_break_day_lists_numbered_breaks_and_total(self) -> None:
         page = self._today(
@@ -1161,11 +1161,10 @@ class LiveTodayTest(unittest.TestCase):
             (timedelta(hours=15, minutes=20), "entry"), (timedelta(hours=16, minutes=32), "exit"),
         )
         self.assertIn('<dt>Breaks</dt><dd><span class="num">1:20:00</span> · <span class="num">3</span>', page)
-        self.assertIn('role="img" aria-label="Inside 6:12, 3 breaks totalling 1:20"', page)
+        self.assertIn('role="img" aria-label="Inside 6:12, 3 breaks totalling 1:20: break 1 11:00 to 11:20', page)
         for n in (1, 2, 3):
-            self.assertIn(f'<span class="bar-num">{n}</span>', page)
-            self.assertIn(f'<th scope="row">#{n}</th>', page)
-        self.assertIn('Breaks total</th><td class="num">1:20:00</td>', page)
+            self.assertIn(f'title="Break {n} · ', page)
+        self.assertNotIn("Breaks total", page)
         self.assertNotIn("log-gap", page)
 
     def test_unclear_gap_reads_unclear_with_the_swipe_time(self) -> None:
@@ -1175,9 +1174,9 @@ class LiveTodayTest(unittest.TestCase):
             (timedelta(hours=13), "exit"), (timedelta(hours=14), "entry"), (timedelta(hours=18), "exit"),
         )
         self.assertIn('<div class="is-unclear"><dt>Unclear</dt>', page)
-        self.assertIn('<th scope="row">Unclear</th>', page)
         self.assertIn('class="bar-seg is-unclear"', page)
-        self.assertIn("swipe at <span class=\"num\">", page)
+        self.assertIn('title="Unclear · ', page)
+        self.assertNotIn('class="break-list"', page)
 
     def test_week_table_keeps_hours_and_minutes(self) -> None:
         self._sign_in()
@@ -1249,7 +1248,7 @@ class QuickViewTest(_QuickViewBase):
         self.assertIn(f'data-poll="/day?employee={self.ravi["id"]}&amp;date=2026-09-09"', page)
 
     def test_drawer_renders_the_break_view_with_punches_closed(self) -> None:
-        # U11: same partial as Today; raw punches stay closed by default.
+        # U11: same partial as Today; raw punches always listed.
         rows = [(9, 0, "entry"), (12, 40, "exit"), (13, 10, "entry")]
         self.database.insert_punches([
             _punch_row(f"qv-b{i}", self.DAY + timedelta(hours=h, minutes=m), d) for i, (h, m, d) in enumerate(rows)
@@ -1257,10 +1256,9 @@ class QuickViewTest(_QuickViewBase):
         self._sign_in(self._person("1", "Hema HR", "hr"))
         page = self._quick(self.ravi["id"]).text
         self.assertIn('class="day-bar" role="img" aria-label="Inside', page)
-        self.assertIn('<th scope="row">#1</th>', page)
-        self.assertIn('<details class="raw-punches">', page)
-        self.assertNotIn('<details class="raw-punches" open', page)
-        self.assertIn("<summary>All punches (3)</summary>", page)
+        self.assertIn('<span class="bar-text is-wide">1 · 30m</span>', page)
+        self.assertNotIn('<details class="raw-punches"', page)
+        self.assertIn('<h3 class="raw-punches-title">All punches (3)</h3>', page)
 
     def test_edit_details_only_from_people_for_editors(self) -> None:
         self._sign_in(self._person("1", "Hema HR", "hr"))
@@ -3502,8 +3500,7 @@ class ScreensTest(unittest.TestCase):
             ]
         )
         page = client.get(f"/day?date={day.isoformat()}").text
-        self.assertIn('<details class="raw-punches">', page)
-        self.assertIn('<summary>All punches (2)</summary>', page)
+        self.assertIn('<h3 class="raw-punches-title">All punches (2)</h3>', page)
         self.assertIn('punch-time num">09:00:00</span><span class="punch-dir">In</span>', page)
         self.assertIn('punch-time num">17:30:00</span><span class="punch-dir">Out</span>', page)
         self.assertIn('<dt>Inside</dt><dd><span class="num">8:30:00</span>', page)

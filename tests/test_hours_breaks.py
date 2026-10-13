@@ -147,5 +147,62 @@ class BreakMathTest(unittest.TestCase):
             self.assertEqual(r.gross_seconds, r.effective_seconds + r.break_seconds + r.unclear_seconds)
 
 
+class MagneticDoorPairingTest(unittest.TestCase):
+    """Every recorded swipe is real: a direction-less swipe fills a missing
+    alternation before it can be a duplicate."""
+
+    def test_real_day_filler_swipe_becomes_in(self) -> None:
+        punches = [Punch(_t(15, 37, 59), "entry"), Punch(_t(16, 14, 52), "exit"),
+                   Punch(_t(16, 48, 3), "entry"), Punch(_t(17, 48, 13), "exit"),
+                   Punch(_t(17, 48, 32)), Punch(_t(18, 46, 55), "exit"),
+                   Punch(_t(19, 14, 54), "entry"), Punch(_t(20, 0, 37), "exit"),
+                   Punch(_t(20, 23, 50), "entry")]
+        r = compute_day(punches, target_minutes=480)
+        self.assertEqual([(g.kind, g.number, g.start, g.end, g.seconds) for g in r.gaps], [
+            ("break", 1, _t(16, 14, 52), _t(16, 48, 3), 1991),
+            ("break", 2, _t(17, 48, 13), _t(17, 48, 32), 19),
+            ("break", 3, _t(18, 46, 55), _t(19, 14, 54), 1679),
+        ])
+        self.assertEqual((r.collapsed, r.inferred, r.unclear_seconds), ((), (_t(17, 48, 32),), 0))
+        self.assertEqual(r.unpaired, ((_t(20, 23, 50), "entry"),))
+        self.assertEqual((r.gross_seconds, r.effective_seconds, r.break_seconds),
+                         (15758, 15758 - 1991 - 19 - 1679, 1991 + 19 + 1679))
+        live = compute_day(punches, target_minutes=480, now=_t(21), is_today=True)
+        self.assertEqual([g.seconds for g in live.gaps], [1991, 19, 1679, 1393])
+        self.assertEqual(live.gross_seconds, live.effective_seconds + live.break_seconds)
+
+    def test_swipe_between_out_and_in_within_window_is_duplicate(self) -> None:
+        dup = Punch(_t(13, 0, 20))
+        r = compute_day([Punch(_t(9), "entry"), Punch(_t(13), "exit"), dup,
+                         Punch(_t(14), "entry"), Punch(_t(18), "exit")], target_minutes=480)
+        self.assertEqual((r.collapsed, r.inferred), ((dup,), ()))
+        self.assertEqual([(g.kind, g.seconds) for g in r.gaps], [("break", 3600)])
+
+    def test_pure_direction_less_double_swipe_still_collapsed(self) -> None:
+        dup = Punch(_t(13, 0, 4))
+        r = compute_day([Punch(_t(9)), Punch(_t(13)), dup, Punch(_t(14)), Punch(_t(18))], target_minutes=480)
+        self.assertEqual((r.collapsed, r.inferred), ((dup,), ()))
+        self.assertEqual(r.segments, (Segment(_t(9), _t(13)), Segment(_t(14), _t(18))))
+
+    def test_same_direction_reswipe_not_counted(self) -> None:
+        again = Punch(_t(13, 0, 30), "exit")
+        r = compute_day([Punch(_t(9), "entry"), Punch(_t(13), "exit"), again,
+                         Punch(_t(14), "entry"), Punch(_t(18), "exit")], target_minutes=480)
+        self.assertEqual(r.collapsed, (again,))
+        self.assertEqual(r.break_seconds, 3600)
+
+    def test_known_directions_never_collapsed_across_direction(self) -> None:
+        r = compute_day([Punch(_t(9), "entry"), Punch(_t(13), "exit"), Punch(_t(13, 0, 19), "entry"),
+                         Punch(_t(18), "exit")], target_minutes=480)
+        self.assertEqual(r.collapsed, ())
+        self.assertEqual([(g.kind, g.seconds) for g in r.gaps], [("break", 19)])
+
+    def test_out_out_without_filler_stays_unclear(self) -> None:
+        r = compute_day([Punch(_t(9), "entry"), Punch(_t(13), "exit"), Punch(_t(14), "exit"),
+                         Punch(_t(15), "entry"), Punch(_t(18), "exit")], target_minutes=480)
+        self.assertEqual([(g.kind, g.seconds) for g in r.gaps], [("unclear", 7200)])
+        self.assertEqual(r.gross_seconds, r.effective_seconds + r.break_seconds + r.unclear_seconds)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -51,7 +51,8 @@ One Docker Compose stack on an office Linux host with routes to `192.168.1.201` 
 
 ## Break rules
 
-- A swipe within 60 seconds of the person's previous kept swipe (any device) is a duplicate: stored and shown "not counted", never paired.
+- Every In and Out swipe is a real record and always counts. A swipe with no direction first fills a missing alternation (Out, swipe, Out: the swipe is In; In, swipe, In: it is Out) and is marked "inferred".
+- Otherwise a direction-less swipe within 60 seconds of the previous counted swipe (any device), or a same-direction re-swipe within 60 seconds, is a duplicate: stored and shown "not counted", never paired.
 - A gap between two paired stretches is a **break** only when it is a clean out-then-in. A gap holding an unpaired swipe is **unclear**: totalled separately, never counted as break, so gross = effective + breaks + unclear.
 - The C3 records event 20 ("Too Short Punch Interval") when a swipe comes too soon after the previous one at the same door; the door does not open, but the person was there. The collector stores it as attendance with the note "interval too short". Recommend setting the C3 door **Punch Interval** to 1 second or less so real swipes are not denied.
 

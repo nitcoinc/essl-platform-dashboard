@@ -332,7 +332,8 @@ For someone who has left, open their person page and use **Archive person** at t
 
 ### Breaks and duplicate swipes
 
-- A swipe within 60 seconds of the person's previous swipe (any device) is a duplicate: kept in **All punches** as *not counted*, never paired.
+- Every In and Out swipe counts (the door is magnetic; punching both ways is compulsory). A swipe with no direction first fills a missing alternation: between Out and Out it is In, between In and In it is Out, shown with an *inferred* chip.
+- Otherwise a direction-less swipe within 60 seconds of the person's previous counted swipe, or a same-direction re-swipe within 60 seconds, is a duplicate: kept in **All punches** as *not counted*, never paired.
 - A gap between paired stretches is a **break** only when it is a clean out then in. A gap holding an unpaired swipe is **unclear**: shown dotted on the day bar and totalled apart, never counted as break.
 - C3 event 20 swipes (*interval too short*) count as attendance; see [C3-400](#c3-400-gachibowli).
 
