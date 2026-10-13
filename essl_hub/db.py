@@ -63,6 +63,26 @@ class OfflineError(Exception):
     because it is offline with no local replica (KTD6, KTD11)."""
 
 
+class BusyError(OfflineError):
+    """Another process held the write lock past busy_timeout ("database is
+    locked"). Transient: the web answers 503 and the collector spools (KTD6)."""
+
+
+class DatabaseMissing(Exception):
+    """A must-exist open found no database file. Only the backup commands
+    (init, restore, import-turso) create it (KTD5)."""
+
+
+# Busy wait on the shared file (KTD6). libsql holds the GIL while it waits
+# (KTD7), so this also caps how long other threads in the process pause.
+BUSY_TIMEOUT_MS = 5000
+
+SETUP_COMMANDS = tuple(
+    f"docker compose run --rm backup python -m essl_hub.backup {command}"
+    for command in ("init", "restore", "import-turso")
+)
+
+
 # libsql raises plain ValueError for constraint failures and network failures
 # alike (U8), so the message is the only thing to classify on.
 _OFFLINE_MARKERS = (
@@ -84,6 +104,8 @@ def classify_error(exc: BaseException) -> Exception | None:
     lowered = message.lower()
     if "constraint failed" in lowered:
         return IntegrityError(message)
+    if "database is locked" in lowered:
+        return BusyError(message)
     if any(marker in lowered for marker in _OFFLINE_MARKERS):
         return OfflineError(message)
     return None
@@ -530,7 +552,8 @@ def _schema_version(connection: Any) -> int:
 class Database:
     """One libsql connection per process, shared under an RLock (KTD1).
 
-    Local mode (no TURSO_DATABASE_URL, KTD2) opens `path` as a plain file.
+    Local mode (no TURSO_DATABASE_URL, KTD2) opens `path` as a plain file in
+    WAL mode; `must_exist` refuses to create it (DatabaseMissing, KTD5).
     Replica mode opens `path` as an embedded replica of the Turso primary; if
     the primary is unreachable at open time it falls back to the existing
     replica file read-only (`offline` True) and `reconnect()` upgrades later.
@@ -543,8 +566,12 @@ class Database:
         sync_url: str | None = None,
         auth_token: str | None = None,
         read_only: bool = False,
+        must_exist: bool = False,
     ):
         self.path = path or db_path()
+        # Web app and collector: never create the file (KTD5); a missing file
+        # raises DatabaseMissing on every use until a backup command makes it.
+        self.must_exist = must_exist
         # Read-only token (nightly export): skip PRAGMA foreign_keys, which a
         # replica forwards to the primary as a write and Turso then blocks.
         self.read_only = read_only
@@ -592,7 +619,14 @@ class Database:
 
     def _open(self) -> _Connection:
         if not self.replica:
+            if self.must_exist and not os.path.exists(self.path):
+                raise DatabaseMissing(f"{self.path} does not exist")
             raw = libsql.connect(self.path, isolation_level=None)
+            # Two processes share the file (KTD6): WAL so readers never block
+            # the writer, NORMAL sync (safe under WAL), bounded lock waits.
+            raw.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+            raw.execute("PRAGMA journal_mode=WAL")
+            raw.execute("PRAGMA synchronous=NORMAL")
             raw.execute("PRAGMA foreign_keys=ON")
             return _Connection(raw)
         connection = self._open_replica()
@@ -608,6 +642,9 @@ class Database:
         raw = libsql.connect(self.path, isolation_level=None)
         raw.execute("PRAGMA query_only=ON")
         return _Connection(raw, offline=True)
+
+    def exists(self) -> bool:
+        return os.path.exists(self.path)
 
     def _connection(self) -> _Connection:
         with self._lock:

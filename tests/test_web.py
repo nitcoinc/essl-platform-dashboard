@@ -2636,6 +2636,73 @@ class StartupTest(unittest.TestCase):
         self.assertEqual(replica.sync_loop_interval, 300)
 
 
+class DatabaseSetupTest(unittest.TestCase):
+    """Local-first U1 / KTD5, KTD6: missing file serves setup page; busy is 503."""
+
+    def setUp(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.folder = tmp.name
+        self.path = str(Path(tmp.name) / "essl.db")
+
+    def _app(self):
+        from essl_hub.db import Database
+
+        app = create_app(database=Database(self.path, sync_url="", must_exist=True))
+        app.testing = True
+        return app
+
+    def test_missing_database_serves_setup_page_and_creates_nothing(self) -> None:
+        with self.assertLogs("essl_hub.web", level="WARNING"):
+            app = self._app()
+            client = app.test_client()
+            response = client.get("/signin")
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("Database not set up", response.text)
+        for command in ("init", "restore", "import-turso"):
+            self.assertIn(f"python -m essl_hub.backup {command}", response.text)
+        self.assertEqual(os.listdir(self.folder), [])
+
+    def test_health_is_unhealthy_while_database_missing(self) -> None:
+        with self.assertLogs("essl_hub.web", level="WARNING"):
+            client = self._app().test_client()
+            response = client.get("/api/health")
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(response.get_json()["ok"])
+
+    def test_first_request_after_init_boots_and_promotes_bootstrap_admin(self) -> None:
+        from essl_hub.db import Database
+
+        with patch.dict(os.environ, {"ESSL_BOOTSTRAP_ADMIN_EMAIL": "boss@example.com"}):
+            with self.assertLogs("essl_hub.web", level="WARNING"):
+                app = self._app()
+            client = app.test_client()
+            # A backup command creates the file while the web app is running.
+            creator = Database(self.path, sync_url="")
+            creator.migrate_schema()
+            creator.upsert_employee(device_user_id="1", name="Boss", email="boss@example.com")
+            creator.close()
+            self.assertEqual(client.get("/api/health").status_code, 200)
+            self.assertEqual(client.get("/signin").status_code, 200)
+        database = app.extensions["essl_database"]
+        self.assertEqual(database.employee_by_email("boss@example.com")["role"], "admin")
+
+    def test_busy_database_returns_503_try_again(self) -> None:
+        from essl_hub.db import BusyError
+
+        app, _ = _make_app()
+
+        def locked(*args, **kwargs):
+            raise BusyError("database is locked")
+
+        app.view_functions["api.health"] = locked
+        response = app.test_client().get("/api/health")
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("Busy, try again", response.text)
+
+
 if __name__ == "__main__":
     unittest.main()
 

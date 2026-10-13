@@ -1191,3 +1191,68 @@ class TursoConfigTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SharedLocalFileTest(unittest.TestCase):
+    """Local-first U1 / KTD5, KTD6: two processes share one WAL file."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.folder = tmp.name
+        self.path = os.path.join(tmp.name, "essl.db")
+
+    def _open(self, **kwargs) -> db_module.Database:
+        database = db_module.Database(self.path, sync_url="", **kwargs)
+        self.addCleanup(database.close)
+        return database
+
+    def test_open_sets_wal_normal_sync_and_busy_timeout(self) -> None:
+        with self._open().connect() as connection:
+            self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()["journal_mode"], "wal")
+            self.assertEqual(connection.execute("PRAGMA synchronous").fetchone()["synchronous"], 1)
+            self.assertEqual(connection.execute("PRAGMA busy_timeout").fetchone()["timeout"], 5000)
+
+    def test_reader_sees_writer_rows_at_once(self) -> None:
+        self._open().initialize((DeviceConfig(
+            id="d1", site="Uppal", model="X990", ip="10.0.0.1", port=4370,
+            protocol="zk-attendance", password_env="ESSL_X990_PASSWORD",
+        ),))
+        collector = self._open(must_exist=True)
+        web = self._open(must_exist=True)
+        collector.insert_punches([{
+            "device_id": "d1", "device_user_id": "7", "event_timestamp": datetime(2026, 10, 14, 9, 0),
+            "fingerprint": "fp-shared", "site": "Uppal", "device_serial": "SN-1",
+            "employee_name": "Ravi",
+        }])
+        with web.connect() as connection:
+            row = connection.execute("SELECT fingerprint FROM punches").fetchone()
+        self.assertEqual(row["fingerprint"], "fp-shared")
+
+    def test_lock_held_past_timeout_raises_busy_error(self) -> None:
+        self._open().migrate_schema()
+        holder = self._open()
+        waiter = self._open(must_exist=True)
+        with mock.patch.object(db_module, "BUSY_TIMEOUT_MS", 100):
+            with waiter.connect():
+                pass
+        with holder.transaction():
+            with self.assertRaises(db_module.BusyError):
+                with waiter.transaction() as connection:
+                    connection.execute("UPDATE settings SET value = value")
+
+    def test_classify_error_maps_locked_to_busy(self) -> None:
+        self.assertIsInstance(db_module.classify_error(ValueError("database is locked")), db_module.BusyError)
+
+    def test_must_exist_raises_and_creates_nothing(self) -> None:
+        database = self._open(must_exist=True)
+        with self.assertRaises(db_module.DatabaseMissing):
+            database.migrate_schema()
+        self.assertFalse(database.exists())
+        self.assertEqual(os.listdir(self.folder), [])
+
+    def test_existing_file_opens_and_migrates_with_must_exist(self) -> None:
+        self._open().migrate_schema()
+        database = self._open(must_exist=True)
+        database.initialize(())
+        self.assertEqual(database.setting("schema_version"), str(db_module.SCHEMA_VERSION))

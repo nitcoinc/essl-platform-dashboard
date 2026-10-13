@@ -610,6 +610,11 @@ class _SwitchableDatabase(FakeDatabase):
         self.last_sync_error = None
         return True
 
+    def initialize(self, devices) -> None:
+        if self.offline:
+            raise collector_main.frappe_sync.OfflineError("database unavailable")
+        super().initialize(devices)
+
     def record_poll(self, device_id, **kwargs) -> int:
         self._check()
         return super().record_poll(device_id, **kwargs)
@@ -701,14 +706,13 @@ class SpoolCycleTest(unittest.TestCase):
             stamp = datetime.fromisoformat(status[key])
             self.assertLess(abs(ist_now - stamp), timedelta(minutes=1), key)
 
-    def test_boot_with_turso_unreachable_polls_spools_and_reports_then_drains(self) -> None:
+    def test_boot_with_database_unavailable_polls_spools_and_reports_then_drains(self) -> None:
         database = _SwitchableDatabase()
         database.offline = True
         self.batches = [[_punch("fp-1")]]
         with self.assertLogs(collector_main._logger, level="WARNING"):
             status = self._cycle(database)
         self.assertTrue(status["offline"])
-        self.assertEqual(status["last_sync_error"], "Turso is unreachable")
         self.assertEqual(status["spool_depth"], 1)
         self.assertIsNotNone(status["last_poll"])
         self.assertEqual(database.initialized, 0)
@@ -719,24 +723,41 @@ class SpoolCycleTest(unittest.TestCase):
         self.assertEqual(status["spool_depth"], 0)
         self.assertEqual([p["fingerprint"] for p in database.inserted_punches], ["fp-1"])
 
-    def test_boot_against_an_unreachable_real_turso_url_does_not_block(self) -> None:
-        import time as _time
-
+    def test_missing_database_spools_and_waits_without_creating_the_file(self) -> None:
         from essl_hub.db import Database
 
-        database = Database(
-            os.path.join(self.tmp, "replica.db"),
-            sync_url="https://127.0.0.1:1",
-            auth_token="t",
-        )
+        path = os.path.join(self.tmp, "essl.db")
+        database = Database(path, sync_url="", must_exist=True)
         self.batches = [[_punch("fp-1")]]
-        started = _time.monotonic()
-        with self.assertLogs(level="WARNING"):
+        env = {"TURSO_DATABASE_URL": "", "TURSO_AUTH_TOKEN": ""}
+        with patch.dict(os.environ, env), self.assertLogs(collector_main._logger, level="WARNING") as logs:
             status = self._cycle(database)
-        self.assertLess(_time.monotonic() - started, 30)
-        self.assertTrue(status["offline"])
-        self.assertTrue(status["last_sync_error"])
+        self.assertFalse(os.path.exists(path))
+        self.assertFalse(self.state.ready)
+        self.assertTrue(any("essl_hub.backup init" in line for line in logs.output))
         self.assertEqual(status["spool_depth"], 1)
+        self.assertEqual(status["dead_count"], 0)
+
+        # A backup command creates the file; the next cycle migrates and replays.
+        Database(path, sync_url="").migrate_schema()
+        status = self._cycle(database)
+        self.assertTrue(self.state.ready)
+        self.assertEqual(status["spool_depth"], 0)
+        with database.connect() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) AS n FROM punches").fetchone()["n"], 1)
+
+    def test_a_busy_database_spools_and_replay_waits_uncounted(self) -> None:
+        from essl_hub.db import BusyError
+
+        database = _SwitchableDatabase()
+        database.error = BusyError("database is locked")
+        self.batches = [[_punch("fp-1")], [_punch("fp-2")]]
+        with self.assertLogs(collector_main._logger, level="WARNING"):
+            self._cycle(database)
+            status = self._cycle(database)
+        self.assertEqual(status["spool_depth"], 2)
+        self.assertEqual(status["dead_count"], 0)
+        self.assertEqual(self.spool.pending()[0].attempts, 0)
 
     def test_a_row_failing_twenty_replays_while_syncs_succeed_moves_to_dead(self) -> None:
         database = _SwitchableDatabase()

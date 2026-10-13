@@ -19,9 +19,8 @@ from .config import (
     collector_status_path,
     heartbeat_write_seconds,
     spool_path,
-    turso_sync_seconds,
 )
-from .db import Database
+from .db import SETUP_COMMANDS, BusyError, Database, DatabaseMissing
 from .spool import Spool
 from . import frappe_sync
 
@@ -210,6 +209,11 @@ def _turso_healthy(database: Database) -> bool:
     return not getattr(database, "offline", False) and getattr(database, "last_sync_error", None) is None
 
 
+def _transient(exc: BaseException) -> bool:
+    """Busy lock or missing file: retry later, never dead-letter (KTD5, KTD6)."""
+    return isinstance(exc, (BusyError, DatabaseMissing))
+
+
 def replay_spool(database: Database, spool: Spool) -> int:
     """Replay spooled batches oldest-first (KTD9); returns batches written.
 
@@ -221,7 +225,7 @@ def replay_spool(database: Database, spool: Spool) -> int:
             database.insert_punches(entry.punches)
         except Exception as exc:
             error = str(exc) or type(exc).__name__
-            if not _turso_healthy(database):
+            if _transient(exc) or not _turso_healthy(database):
                 _logger.warning("spool replay paused while Turso is unreachable: %s", error)
                 break
             if spool.fail(entry.id, error):
@@ -240,17 +244,20 @@ def replay_spool(database: Database, spool: Spool) -> int:
 
 
 def ensure_ready(database: Database, state: PollState) -> bool:
-    """Best-effort Turso boot work, retried each cycle until it succeeds (KTD10).
+    """Boot work (schema, seed), retried each cycle until it succeeds (KTD10).
 
-    ``Database.sync()`` probes before touching libsql, so a dead network costs
-    seconds and never raises."""
+    The collector never creates the database (KTD5): while the file is missing
+    it logs the setup commands and waits; punches meanwhile go to the spool."""
     if state.ready:
         return True
-    if not database.sync():
-        return False
     try:
         database.initialize(DEVICES)
         database.warn_device_drift(DEVICES)
+    except DatabaseMissing as exc:
+        _logger.warning(
+            "database not set up (%s); waiting for one of: %s", exc, "; ".join(SETUP_COMMANDS)
+        )
+        return False
     except Exception as exc:
         _logger.warning("collector database setup failed; retrying next cycle: %s", exc)
         return False
@@ -368,11 +375,11 @@ def run_forever(
 def main() -> None:
     interval = collector_interval_seconds()
     device_id = os.getenv("ESSL_COLLECTOR_DEVICE_ID") or None
-    # KTD10: the spool and polling never wait on Turso. Database() opens
-    # lazily; run_cycle retries the boot work each cycle.
+    # KTD10: the spool and polling never wait on the database. It opens
+    # lazily, local only, and is never created here (KTD5); run_cycle
+    # retries the boot work each cycle until the file exists.
     spool = Spool(spool_path())
-    database = Database()
-    database.start_sync_loop(turso_sync_seconds(300))
+    database = Database(sync_url="", must_exist=True)
     frappe = None
     frappe_config = frappe_sync.config_from_env()
     if frappe_config is not None:
