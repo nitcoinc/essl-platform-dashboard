@@ -64,4 +64,36 @@
     {{ ui.button('Cancel', 'tertiary', href=url_for('people.people_view')) }}
   </div>
 </form>
+
+{% if target %}
+<section class="person-form person-extra-ids" aria-labelledby="extra-ids-heading">
+  <h2 id="extra-ids-heading">Other device IDs</h2>
+  <p class="field-hint">Punches under these IDs count for {{ target.name }} too, for example when a device stores {{ values.device_user_id }} in another format.</p>
+  {% if extra_ids %}
+  <ul class="extra-id-list">
+    {% for uid in extra_ids %}
+    <li><span class="num">{{ uid }}</span>
+      {% if extra_locked %}<span class="lock">{{ ui.icon('lock') }}<span>Admin only</span></span>
+      {% else %}
+      <form method="post" action="{{ url_for('people.person_remove_device_id', employee_id=target.id) }}" class="inline-form">
+        <input type="hidden" name="csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="device_user_id" value="{{ uid }}">
+        {{ ui.button('Remove', 'tertiary', type='submit', size='sm', attrs='aria-label="Remove device ID ' ~ uid|e ~ '"') }}
+      </form>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="muted">None.</p>
+  {% endif %}
+  {% if not extra_locked %}
+  <form method="post" action="{{ url_for('people.person_add_device_id', employee_id=target.id) }}" novalidate>
+    <input type="hidden" name="csrf" value="{{ csrf_token }}">
+    {{ ui.field('extra_device_user_id', 'Add another device ID', errors.extra_value or '', error=errors.extra_id, attrs='autocomplete="off" autocapitalize="characters"') }}
+    <div class="form-actions">{{ ui.button('Add device ID', 'secondary', type='submit') }}</div>
+  </form>
+  {% endif %}
+</section>
+{% endif %}
 {% endblock %}

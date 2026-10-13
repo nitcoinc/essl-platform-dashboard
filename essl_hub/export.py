@@ -18,6 +18,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from .db import device_ids_of
 from .hours import DEFAULT_DAY_START_HOUR, DayResult, Punch, compute_day, work_day, work_day_window
 
 MAX_RANGE_DAYS = 93
@@ -53,8 +54,10 @@ def _load(
     """Results and sites seen per (person id, work day), plus the punches per
     (device user id, work day), from one punch query
     spanning the first day's window start to the last day's window end."""
+    # Punches under any of a person's IDs group under their main ID.
+    main_of = {uid: p["device_user_id"] for p in people for uid in device_ids_of(p)}
     rows = database.punches_for_device_users_range(
-        [p["device_user_id"] for p in people],
+        list(main_of),
         work_day_window(start, day_start_hour)[0],
         work_day_window(end, day_start_hour)[1],
     )
@@ -62,7 +65,8 @@ def _load(
     seen_sites: dict[tuple[str, date], set[str]] = defaultdict(set)
     for row in rows:
         stamp = row["event_timestamp"]
-        key = (row["device_user_id"], work_day(stamp, day_start_hour))
+        owner = main_of.get(row["device_user_id"], row["device_user_id"])
+        key = (owner, work_day(stamp, day_start_hour))
         grouped[key].append(Punch(timestamp=stamp, trusted_direction=row["trusted_direction"]))
         if row.get("site"):
             seen_sites[key].add(row["site"])

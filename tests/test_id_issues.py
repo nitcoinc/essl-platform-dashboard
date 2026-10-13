@@ -72,6 +72,41 @@ class PrimaryFixTest(unittest.TestCase):
 
 
 
+class CanonicalTwinTest(unittest.TestCase):
+    def _fixes(self, summary, employees):
+        from essl_hub.id_issues import id_twins, primary_fix, suggestions
+
+        issues = find_issues(summary, employees)
+        pairs, twins = suggestions(issues), id_twins(issues, employees)
+        return {i.key: primary_fix(i, pairs, twins) for i in issues}
+
+    def test_twin_of_a_punching_person_adds_another_device_id(self) -> None:
+        fixes = self._fixes([_seen("NP128", "Device"), _seen("NP0128", "Kiran")], [_emp(5, "NP0128", "Kiran")])
+        fix = fixes["unknown:NP128"]
+        self.assertEqual((fix.action, fix.label, fix.device_user_id, fix.employee_id),
+                         ("link", "Add as another device ID for Kiran", "NP128", 5))
+
+    def test_twin_of_a_never_punched_id_changes_the_id(self) -> None:
+        fixes = self._fixes([_seen("NP0128", "Device")], [_emp(5, "128", "Kiran")])
+        self.assertEqual(fixes["unknown:NP0128"].label, "Change ID to NP0128")
+        self.assertEqual(fixes["never:128"].device_user_id, "NP0128")
+
+    def test_two_unknowns_with_the_same_number_suggest_nothing(self) -> None:
+        fixes = self._fixes([_seen("NP128", "A"), _seen("0128", "B"), _seen("128", "Kiran")], [_emp(5, "128", "Kiran")])
+        self.assertEqual(fixes["unknown:NP128"].action, "add")
+        self.assertEqual(fixes["unknown:0128"].action, "add")
+
+    def test_all_zero_ids_never_pair_and_get_no_add_button(self) -> None:
+        fixes = self._fixes([_seen("0", "X"), _seen("NP0000", "Y")], [_emp(5, "00", "Kiran")])
+        self.assertEqual(fixes["unknown:0"].action, "none")
+        self.assertEqual(fixes["unknown:NP0000"].action, "none")
+
+    def test_extra_ids_count_as_mapped(self) -> None:
+        employee = {**_emp(5, "NP0128", "Kiran"), "device_ids": ["NP0128", "128"], "archived_at": datetime(2026, 1, 1)}
+        issues = find_issues([_seen("128", "Kiran"), _seen("NP0128", "Kiran")], [employee])
+        self.assertEqual(issues, [])
+
+
 class SuggestionsTest(unittest.TestCase):
     def test_unknown_id_is_paired_with_matching_unclaimed_roster_person(self) -> None:
         from essl_hub.id_issues import suggestions

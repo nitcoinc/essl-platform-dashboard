@@ -259,6 +259,8 @@ def _render_person_form(target: dict | None, values: dict, errors: dict, status:
             role_options=role_options,
             role_labels=ROLE_LABELS,
             managers=[p for p in database.employees() if target is None or p["id"] != target["id"]],
+            extra_ids=database.extra_device_ids(target["id"]) if target is not None else [],
+            extra_locked=target is not None and not access.can_modify_employee(actor, target, "device_ids"),
         ),
         status,
     )
@@ -337,14 +339,63 @@ def person_edit(employee_id: int):
     target = database.employee_by_id(employee_id)
     if target is None:
         abort(404)
-    values = {
+    return _render_person_form(target, _target_values(target), {})
+
+
+def _target_values(target: dict) -> dict:
+    return {
         "name": target["name"],
         "email": target["email"],
         "device_user_id": target["device_user_id"],
         "manager_id": str(target.get("manager_id") or ""),
         "role": target["role"],
     }
-    return _render_person_form(target, values, {})
+
+
+def _extra_id_target(employee_id: int) -> dict:
+    target = database.employee_by_id(employee_id)
+    if target is None:
+        abort(404)
+    if not access.can_modify_employee(g.employee, target, "device_ids"):
+        abort(403)
+    return target
+
+
+@bp.post("/people/<int:employee_id>/device-ids")
+@_role_required("hr", "admin")
+def person_add_device_id(employee_id: int):
+    """Attach another device user ID (KTD2): punches under it count for this person."""
+    _require_csrf()
+    target = _extra_id_target(employee_id)
+    device_user_id = roster.normalize_device_id(request.form.get("extra_device_user_id") or "")
+    error = None
+    if not device_user_id:
+        error = "Type the other device ID."
+    elif roster.is_zero_device_id(device_user_id):
+        error = _sentence(roster.ZERO_DEVICE_ID)
+    elif (holder := database.employee_by_device_user_id(device_user_id)) is not None:
+        error = (f"{target['name']} already has this device ID." if holder["id"] == target["id"]
+                 else f"{holder['name']} already uses device ID {device_user_id}.")
+    if error is None:
+        try:
+            database.add_extra_device_id(target["id"], device_user_id)
+        except IntegrityError:
+            error = f"Device ID {device_user_id} is already in use."
+    if error is not None:
+        return _render_person_form(target, _target_values(target), {"extra_id": error, "extra_value": device_user_id}, status=400)
+    forget_issue_count()
+    return redirect(url_for("people.person_edit", employee_id=target["id"]))
+
+
+@bp.post("/people/<int:employee_id>/device-ids/remove")
+@_role_required("hr", "admin")
+def person_remove_device_id(employee_id: int):
+    _require_csrf()
+    target = _extra_id_target(employee_id)
+    if not database.remove_extra_device_id(target["id"], (request.form.get("device_user_id") or "").strip()):
+        abort(404)
+    forget_issue_count()
+    return redirect(url_for("people.person_edit", employee_id=target["id"]))
 
 
 @bp.post("/people/<int:employee_id>/edit")
@@ -566,7 +617,8 @@ def id_issues_view():
     issues.sort(key=lambda i: (order[i.severity], i.kind, i.device_user_id))
     counts = {kind: sum(1 for i in issues if i.kind == kind) for kind in ("unknown", "placeholder", "never", "name", "shared")}
     pairs = id_issues.suggestions(issues)
-    twins = id_issues.id_twins(issues)
+    roster_people = database.employees()
+    twins = id_issues.id_twins(issues, roster_people)
     flash = _take_flash()
     confirm = None
     if request.args.get("confirm"):
@@ -583,7 +635,7 @@ def id_issues_view():
         twins=twins,
         fixes={i.key: id_issues.primary_fix(i, pairs, twins) for i in issues},
         lost_punches=sum(i.punch_count for i in issues if i.kind == "unknown"),
-        roster=database.employees(),
+        roster=roster_people,
         dismissed_count=len(dismissed),
         csrf_token=g.csrf_token,
         flash=flash,
@@ -605,7 +657,19 @@ def _link_preview(device_user_id: str, person: str) -> dict | str:
     clash = database.employee_by_device_user_id(device_user_id)
     if clash is not None and clash["id"] != target["id"]:
         return f"{clash['name']} already uses device ID {device_user_id}."
-    return {"device_user_id": device_user_id, "employee": target, "punches": _punch_count(device_user_id)}
+    if clash is not None:
+        return f"{target['name']} already has device ID {device_user_id}."
+    return {"device_user_id": device_user_id, "employee": target, "punches": _punch_count(device_user_id),
+            "mode": _link_mode(target)}
+
+
+def _link_mode(target: dict) -> str:
+    """KTD4: "extra" adds the ID alongside the main one; "replace" changes
+    the main ID, only when the current one has never punched."""
+    main = str(target["device_user_id"])
+    if "@" in main or _punch_count(main) == 0:
+        return "replace"
+    return "extra"
 
 
 @bp.post("/people/issues/dismiss")
@@ -638,11 +702,16 @@ def id_issues_link():
     clash = database.employee_by_device_user_id(device_user_id)
     if clash is not None and clash["id"] != target["id"]:
         return _issue_error(f"{clash['name']} already uses device ID {device_user_id}.")
+    if clash is not None:
+        return _issue_error(f"{target['name']} already has device ID {device_user_id}.")
     message = roster.identity_error(target["name"], target["email"], device_user_id)
     if message:
         return _issue_error(_sentence(message))
     try:
-        database.update_employee(target["id"], name=target["name"], email=target["email"], device_user_id=device_user_id)
+        if _link_mode(target) == "extra":
+            database.add_extra_device_id(target["id"], device_user_id)
+        else:
+            database.update_employee(target["id"], name=target["name"], email=target["email"], device_user_id=device_user_id)
     except IntegrityError:
         return _issue_error(f"Device ID {device_user_id} is already in use.")
     forget_issue_count()

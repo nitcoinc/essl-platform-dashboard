@@ -436,6 +436,38 @@ class DatabaseTest(unittest.TestCase):
             self.database.upsert_employee(device_user_id="118", name="Asha K", email="asha@x.com"), "updated"
         )
 
+    def test_extra_ids_resolve_in_lookups_punches_and_unmapped(self) -> None:
+        asha = self._employee("NP0118", "asha@x.com")
+        self.database.insert_punches([
+            self._punch(fingerprint="a", device_user_id="NP0118"),
+            self._punch(fingerprint="b", device_user_id="118", event_timestamp=datetime(2026, 9, 10, 18, 0)),
+        ])
+        self.assertEqual([r["device_user_id"] for r in self.database.unmapped_device_user_ids()], ["118"])
+        self.database.add_extra_device_id(asha, "118")
+        self.assertEqual(self.database.unmapped_device_user_ids(), [])
+        person = self.database.employee_by_device_user_id("118")
+        self.assertEqual((person["id"], person["device_ids"]), (asha, ["NP0118", "118"]))
+        self.assertEqual(self.database.employee_by_id(asha)["device_ids"], ["NP0118", "118"])
+        self.assertEqual(self.database.employees()[0]["device_ids"], ["NP0118", "118"])
+        self.assertEqual(db_module.device_ids_of({"device_user_id": "7"}), ["7"])
+        rows = self.database.punches_for_employee_range(
+            db_module.device_ids_of(person), datetime(2026, 9, 10), datetime(2026, 9, 11)
+        )
+        self.assertEqual(len(rows), 2)
+
+    def test_frappe_and_checkins_send_main_id_and_requeue_skipped_extra_punches(self) -> None:
+        asha = self._employee("NP0118", "asha@x.com")
+        self.database.insert_punches([self._punch(fingerprint="b", device_user_id="118")])
+        punch_id = self.database.frappe_pending_punches(since=None, limit=10)[0]["id"]
+        self.database.record_frappe_sync(punch_id, status="skipped", error="Employee not found")
+        self.assertEqual(self.database.frappe_pending_punches(since=None, limit=10), [])
+        self.database.add_extra_device_id(asha, "118")
+        pending = self.database.frappe_pending_punches(since=None, limit=10)
+        self.assertEqual([(p["id"], p["device_user_id"]) for p in pending], [(punch_id, "NP0118")])
+        self.assertEqual(
+            [r["device_user_id"] for r in self.database.checkins_since(since=None, limit=10)], ["NP0118"]
+        )
+
     def test_set_employee_archived_sets_and_clears(self) -> None:
         asha = self._employee("118", "asha@x.com")
         self.database.set_employee_archived(asha, True)

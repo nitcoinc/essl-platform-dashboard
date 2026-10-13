@@ -22,12 +22,13 @@
 <section class="issue-confirm" aria-labelledby="confirm-heading">
   <h2 id="confirm-heading">Link {{ confirm.device_user_id }} to {{ confirm.employee.name }}?</h2>
   <p><strong>{{ n }} {{ 'punch' if n == 1 else 'punches' }}</strong> will start counting for {{ confirm.employee.name }}.
-    {% if confirm.employee.device_user_id != confirm.device_user_id %}Their device ID changes from {{ confirm.employee.device_user_id }} to {{ confirm.device_user_id }}.{% endif %}</p>
+    {% if confirm.mode == 'extra' %}{{ confirm.device_user_id }} is added as another device ID; their main ID {{ confirm.employee.device_user_id }} stays.
+    {%- else %}Their main device ID changes from {{ confirm.employee.device_user_id }} to {{ confirm.device_user_id }}.{% endif %}</p>
   <form method="post" action="{{ url_for('people.id_issues_link') }}" class="issue-confirm-actions">
     <input type="hidden" name="csrf" value="{{ csrf_token }}">
     <input type="hidden" name="device_user_id" value="{{ confirm.device_user_id }}">
     <input type="hidden" name="employee_id" value="{{ confirm.employee.id }}">
-    {{ ui.button('Link ' ~ confirm.device_user_id, 'primary', type='submit') }}
+    {{ ui.button(('Add ' if confirm.mode == 'extra' else 'Link ') ~ confirm.device_user_id, 'primary', type='submit') }}
     {{ ui.button('Cancel', 'tertiary', href=url_for('people.id_issues_view')) }}
   </form>
 </section>
@@ -83,7 +84,7 @@
 
 {% if issues %}
 <datalist id="unknown-ids">
-  {% for i in issues if i.kind == 'unknown' %}<option value="{{ i.device_user_id }}">{{ i.device_name }}</option>{% endfor %}
+  {% for i in issues if i.kind == 'unknown' and fixes[i.key].action != 'none' %}<option value="{{ i.device_user_id }}">{{ i.device_name }}</option>{% endfor %}
 </datalist>
 <datalist id="roster-people">
   {% for p in roster %}<option value="{{ p.email }}">{{ p.name }} ({{ p.device_user_id }})</option>{% endfor %}

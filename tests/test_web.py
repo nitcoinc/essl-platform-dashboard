@@ -47,6 +47,7 @@ class FakeDatabase:
         self.devices_by_id: dict[str, dict] = {}
         self.punches: list[dict] = []
         self.employees_by_id: dict[int, dict] = {}
+        self.extra_ids: dict[str, int] = {}  # extra device user ID -> employee id
         self._next_employee_id = 1
         self.settings: dict[str, str] = {}
         self.login_codes: list[dict] = []
@@ -172,11 +173,12 @@ class FakeDatabase:
             inserted += 1
         return inserted
 
-    def punches_for_employee_range(self, device_user_id: str, start: datetime, end: datetime):
+    def punches_for_employee_range(self, device_user_ids, start: datetime, end: datetime):
+        wanted = {device_user_ids} if isinstance(device_user_ids, str) else set(device_user_ids)
         rows = [
             p
             for p in self.punches
-            if p.get("device_user_id") == device_user_id and start <= p["event_timestamp"] < end
+            if p.get("device_user_id") in wanted and start <= p["event_timestamp"] < end
         ]
         rows.sort(key=lambda p: p["event_timestamp"])
         return [
@@ -207,7 +209,7 @@ class FakeDatabase:
         ]
 
     def unmapped_device_user_ids(self):
-        mapped = {e["device_user_id"] for e in self.employees_by_id.values()}
+        mapped = {e["device_user_id"] for e in self.employees_by_id.values()} | set(self.extra_ids)
         counts: dict[str, int] = {}
         for p in self.punches:
             uid = p.get("device_user_id")
@@ -239,25 +241,52 @@ class FakeDatabase:
 
     def update_employee(self, employee_id: int, *, name: str, email: str, device_user_id: str) -> None:
         self.employees_by_id[employee_id].update(name=name, email=email, device_user_id=device_user_id)
+        self._ids(self.employees_by_id[employee_id])
+
+    def _ids(self, employee):
+        if employee is not None:
+            employee["device_ids"] = [employee["device_user_id"]] + sorted(
+                uid for uid, owner in self.extra_ids.items() if owner == employee["id"]
+            )
+        return employee
+
+    def extra_device_ids(self, employee_id: int) -> list[str]:
+        return sorted(uid for uid, owner in self.extra_ids.items() if owner == employee_id)
+
+    def add_extra_device_id(self, employee_id: int, device_user_id: str) -> None:
+        from essl_hub.db import IntegrityError
+
+        if self.employee_by_device_user_id(device_user_id) is not None:
+            raise IntegrityError("device user ID in use")
+        self.extra_ids[device_user_id] = employee_id
+
+    def remove_extra_device_id(self, employee_id: int, device_user_id: str) -> bool:
+        if self.extra_ids.get(device_user_id) != employee_id:
+            return False
+        del self.extra_ids[device_user_id]
+        return True
+
+    def device_user_id_owner(self, device_user_id: str):
+        return self.employee_by_device_user_id(device_user_id)
 
     def employees(self):
         return sorted(
-            self.employees_by_id.values(),
+            (self._ids(e) for e in self.employees_by_id.values()),
             key=lambda e: e["name"],
         )
 
     def employee_by_email(self, email: str):
-        return next(
+        return self._ids(next(
             (
                 e
                 for e in self.employees_by_id.values()
                 if e["email"].lower() == email.strip().lower()
             ),
             None,
-        )
+        ))
 
     def employee_by_id(self, employee_id: int):
-        return self.employees_by_id.get(employee_id)
+        return self._ids(self.employees_by_id.get(employee_id))
 
     def set_employee_role(self, employee_id: int, role: str) -> None:
         self._check_online()
@@ -288,14 +317,16 @@ class FakeDatabase:
         return chain
 
     def employee_by_device_user_id(self, device_user_id: str):
-        return next(
+        if device_user_id in self.extra_ids:
+            return self._ids(self.employees_by_id.get(self.extra_ids[device_user_id]))
+        return self._ids(next(
             (
                 e
                 for e in self.employees_by_id.values()
                 if e["device_user_id"] == device_user_id
             ),
             None,
-        )
+        ))
 
     def has_admin(self) -> bool:
         return any(e["role"] == "admin" for e in self.employees_by_id.values())
@@ -389,7 +420,7 @@ class FakeDatabase:
         employee = self.employees_by_id.get(session["employee_id"])
         if employee is None:
             return None
-        return {**employee, "csrf_token": session["csrf_token"]}
+        return {**self._ids(employee), "csrf_token": session["csrf_token"]}
 
     def revoke_session(self, token_hash: str) -> None:
         if token_hash in self.sessions:
@@ -3115,6 +3146,101 @@ class PeopleManagementTest(unittest.TestCase):
         self.client.get("/people")
         self.assertEqual(calls["n"], small)
         self.assertLessEqual(small, 3)
+
+    # --- extra device IDs (U5) ---
+
+    def _punches(self, *items) -> None:
+        self.database.initialize(DEVICES)
+        self.database.insert_punches([
+            {"fingerprint": f"x-{uid}-{at.isoformat()}", "device_id": DEVICES[0].id, "site": "Uppal",
+             "device_user_id": uid, "employee_name": name, "event_timestamp": at, "trusted_direction": way}
+            for uid, name, at, way in items
+        ])
+
+    def _two_format_day(self):
+        kiran = self._person("NP0128", "Kiran Kumar")
+        day = (_ist_now() - timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0)
+        self._punches(("NP0128", "Kiran", day.replace(hour=9), "entry"),
+                      ("NP128", "Kiran", day.replace(hour=17), "exit"))
+        return kiran, day.date()
+
+    def test_two_format_ids_link_as_extra_and_count_everywhere(self) -> None:
+        kiran, day = self._two_format_day()
+        self._sign_in(self.hr)
+        page = self.client.get("/people/issues").text
+        self.assertIn("Add as another device ID for Kiran Kumar", page)
+        confirm = self.client.get(f"/people/issues?confirm=1&device_user_id=NP128&person={kiran['id']}").text
+        self.assertIn("added as another device ID", confirm)
+        response = self.client.post("/people/issues/link", data={
+            "csrf": self._csrf(), "device_user_id": "NP128", "employee_id": kiran["id"]})
+        self.assertEqual(response.status_code, 302)
+        after = self.database.employee_by_id(kiran["id"])
+        self.assertEqual((after["device_user_id"], after["device_ids"]), ("NP0128", ["NP0128", "NP128"]))
+        self.assertNotIn("Not in Directory", self.client.get("/people/issues").text)
+        self.assertIn("8h 00m", self.client.get(f"/day?date={day.isoformat()}&employee={kiran['id']}").text)
+        self.assertIn("8h 00m", self.client.get(f"/week?date={day.isoformat()}&employee={kiran['id']}").text)
+        self.assertIn("NP0128, NP128", self.client.get(f"/quick/{kiran['id']}", headers={"HX-Request": "true"}).text)
+        csv_text = self.client.get(f"/export.csv?from={day.isoformat()}&to={day.isoformat()}").text
+        row = next(line for line in csv_text.splitlines() if "Kiran Kumar" in line)
+        self.assertIn("09:00,17:00,2,8:00", row)
+
+    def test_twin_of_never_punched_id_replaces_the_main_id(self) -> None:
+        kiran = self._person("128", "Kiran Kumar")
+        self._punches(("NP0128", "Someone", _ist_now() - timedelta(days=1), "entry"))
+        self._sign_in(self.hr)
+        self.assertIn("Change ID to NP0128", self.client.get("/people/issues").text)
+        self.client.post("/people/issues/link", data={
+            "csrf": self._csrf(), "device_user_id": "NP0128", "employee_id": kiran["id"]})
+        after = self.database.employee_by_id(kiran["id"])
+        self.assertEqual(after["device_ids"], ["NP0128"])
+
+    def test_zero_unknown_id_gets_no_add_or_link_button(self) -> None:
+        self._punches(("0", "Nobody", _ist_now() - timedelta(days=1), "entry"))
+        self._sign_in(self.hr)
+        page = self.client.get("/people/issues").text
+        self.assertIn("all-zero ID", page)
+        self.assertNotIn("Add as new person", page)
+        self.assertNotIn("people/new?device_user_id=0", page)
+
+    def _add_extra(self, person, value):
+        return self.client.post(f"/people/{person['id']}/device-ids",
+                                data={"csrf": self._csrf(), "extra_device_user_id": value})
+
+    def test_extra_id_add_clash_and_remove_on_the_form(self) -> None:
+        self._sign_in(self.hr)
+        response = self._add_extra(self.ravi, "3")  # Ramesh's main ID
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Ramesh already uses device ID 3", response.text)
+        self.database.add_extra_device_id(self.sita["id"], "NP0004")
+        response = self._add_extra(self.ravi, "np0004")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Sita already uses device ID NP0004", response.text)
+        self.assertEqual(self._add_extra(self.ravi, "0").status_code, 400)
+        self.assertEqual(self._add_extra(self.ravi, " np0005 ").status_code, 302)
+        page = self.client.get(f"/people/{self.ravi['id']}/edit").text
+        self.assertIn("Other device IDs", page)
+        self.assertIn("NP0005", page)
+        self._punches(("NP0005", "Ravi", _ist_now() - timedelta(days=1), "entry"))
+        self.assertNotIn("Not in Directory", self.client.get("/people/issues").text)
+        response = self.client.post(f"/people/{self.ravi['id']}/device-ids/remove",
+                                    data={"csrf": self._csrf(), "device_user_id": "NP0005"})
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(self.database.extra_device_ids(self.ravi["id"]), [])
+        self.assertIn("Not in Directory", self.client.get("/people/issues").text)
+
+    def test_hr_cannot_change_an_admins_extra_ids(self) -> None:
+        self.database.add_extra_device_id(self.admin["id"], "A2")
+        self._sign_in(self.hr)
+        self.assertEqual(self._add_extra(self.admin, "A3").status_code, 403)
+        response = self.client.post(f"/people/{self.admin['id']}/device-ids/remove",
+                                    data={"csrf": self._csrf(), "device_user_id": "A2"})
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.database.extra_device_ids(self.admin["id"]), ["A2"])
+        self.assertNotIn("Add device ID", self.client.get(f"/people/{self.admin['id']}/edit").text)
+        self.client.post("/signout", data={"csrf": self._csrf()})
+        self._sign_in(self.admin)
+        self.assertEqual(self._add_extra(self.admin, "A3").status_code, 302)
+        self.assertEqual(self.database.extra_device_ids(self.admin["id"]), ["A2", "A3"])
 
 
 class ScreensTest(unittest.TestCase):

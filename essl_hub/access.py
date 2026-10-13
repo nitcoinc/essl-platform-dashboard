@@ -11,8 +11,8 @@ ROLES = ("employee", "manager", "hr", "admin")
 EVERYONE_ROLES = ("hr", "admin")
 EDITOR_ROLES = ("hr", "admin")
 # Fields of an admin's record that only another admin may change (R14).
-ADMIN_PROTECTED_FIELDS = ("email", "device_user_id", "role")
-EDITABLE_FIELDS = ("name", "email", "device_user_id", "manager_id", "role")
+ADMIN_PROTECTED_FIELDS = ("email", "device_user_id", "device_ids", "role")
+EDITABLE_FIELDS = ("name", "email", "device_user_id", "device_ids", "manager_id", "role")
 
 
 def visible_employee_ids(database, viewer: dict) -> set[int]:

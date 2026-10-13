@@ -14,7 +14,7 @@ from werkzeug.local import LocalProxy
 
 from .. import config, roster
 from ..config import TIMEZONE_NAME
-from ..db import Database
+from ..db import Database, device_ids_of
 from ..hours import DEFAULT_DAY_START_HOUR, DayResult, Punch, compute_day, work_day, work_day_window
 
 
@@ -263,7 +263,7 @@ def _day_for_employee(
     if day_start_hour is None:
         day_start_hour = _day_start_hour(database)
     start, end = work_day_window(day, day_start_hour)
-    rows = database.punches_for_employee_range(employee["device_user_id"], start, end)
+    rows = database.punches_for_employee_range(device_ids_of(employee), start, end)
     punches = [
         Punch(timestamp=row["event_timestamp"], trusted_direction=row["trusted_direction"])
         for row in rows

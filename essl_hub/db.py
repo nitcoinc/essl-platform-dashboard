@@ -128,6 +128,41 @@ def _dict_row(names: list[str], row: tuple | None) -> dict[str, object] | None:
     return {name: _convert(name, value) for name, value in zip(names, row)}
 
 
+def device_ids_of(employee: dict) -> list[str]:
+    """Every device user ID of one employee, main ID first (v6). Rows from
+    Database employee lookups carry ``device_ids``; anything else (a bare
+    dict) falls back to the main ID alone."""
+    ids = employee.get("device_ids")
+    if ids:
+        return list(ids)
+    main = employee.get("device_user_id")
+    return [str(main)] if main else []
+
+
+def _attach_device_ids(connection, rows):
+    """Add ``device_ids`` (main first, then extras oldest first) to employee rows."""
+    rows = [row for row in rows if row is not None]
+    if not rows:
+        return rows
+    extras: dict[object, list[str]] = {}
+    for row in connection.execute(
+        "SELECT employee_id, device_user_id FROM employee_device_ids "
+        "ORDER BY created_at, device_user_id"
+    ).fetchall():
+        extras.setdefault(row["employee_id"], []).append(str(row["device_user_id"]))
+    for row in rows:
+        row["device_ids"] = [str(row["device_user_id"]), *extras.get(row["id"], [])]
+    return rows
+
+
+# Punch device user ID as Frappe knows it: an extra ID becomes its owner's main ID.
+_MAIN_ID_SQL = (
+    "COALESCE((SELECT e.device_user_id FROM employee_device_ids x "
+    "JOIN employees e ON e.id = x.employee_id WHERE x.device_user_id = p.device_user_id), "
+    "p.device_user_id)"
+)
+
+
 def _parse_timestamp(value: object) -> datetime | None:
     """Normalise a collector timestamp; None when empty, ValueError when malformed."""
     if value is None or value == "":
@@ -1005,17 +1040,21 @@ class Database:
         return list(rows)
 
     def punches_for_employee_range(
-        self, device_user_id: str, start: datetime, end: datetime
+        self, device_user_ids: str | Iterable[str], start: datetime, end: datetime
     ) -> list[dict[str, object]]:
+        """One person's punches; pass every ID (``device_ids_of``) so punches
+        under extra IDs count too."""
+        ids = [device_user_ids] if isinstance(device_user_ids, str) else sorted(set(device_user_ids))
         with self.connect() as connection:
             rows = connection.execute(
                 """
                 SELECT event_timestamp, trusted_direction, raw_direction_byte, raw_state
                 FROM punches
-                WHERE device_user_id = ? AND event_timestamp >= ? AND event_timestamp < ?
+                WHERE device_user_id IN (SELECT value FROM json_each(?))
+                  AND event_timestamp >= ? AND event_timestamp < ?
                 ORDER BY event_timestamp ASC
                 """,
-                (device_user_id, start, end),
+                (json.dumps(ids), start, end),
             ).fetchall()
         return list(rows)
 
@@ -1085,12 +1124,20 @@ class Database:
 
     def add_extra_device_id(self, employee_id: int, device_user_id: str) -> None:
         """Attach an extra device user ID. Raises IntegrityError when the ID is
-        already anyone's main or extra ID (PRIMARY KEY plus v6 triggers)."""
+        already anyone's main or extra ID (PRIMARY KEY plus v6 triggers).
+
+        Punches under the ID that Frappe skipped (employee not found) are
+        re-queued: they now push under the owner's main ID."""
         with self.transaction() as connection:
             connection.execute(
                 "INSERT INTO employee_device_ids (device_user_id, employee_id, created_at) "
                 "VALUES (?, ?, ?)",
                 (device_user_id, employee_id, _now()),
+            )
+            connection.execute(
+                "DELETE FROM frappe_sync_log WHERE status = 'skipped' AND punch_id IN "
+                "(SELECT id FROM punches WHERE device_user_id = ?)",
+                (device_user_id,),
             )
 
     def remove_extra_device_id(self, employee_id: int, device_user_id: str) -> bool:
@@ -1130,7 +1177,7 @@ class Database:
             rows = connection.execute(
                 "SELECT * FROM employees ORDER BY name"
             ).fetchall()
-        return list(rows)
+            return _attach_device_ids(connection, list(rows))
 
     def employee_by_email(self, email: str) -> dict[str, object] | None:
         with self.connect() as connection:
@@ -1138,14 +1185,14 @@ class Database:
                 "SELECT * FROM employees WHERE lower(email) = lower(?)",
                 (email,),
             ).fetchone()
-        return row
+            return (_attach_device_ids(connection, [row]) or [None])[0]
 
     def employee_by_id(self, employee_id: int) -> dict[str, object] | None:
         with self.connect() as connection:
             row = connection.execute(
                 "SELECT * FROM employees WHERE id = ?", (employee_id,)
             ).fetchone()
-        return row
+            return (_attach_device_ids(connection, [row]) or [None])[0]
 
     def set_employee_role(self, employee_id: int, role: str) -> None:
         """Guarded in one statement (KTD7): the admin count is evaluated by the
@@ -1233,11 +1280,19 @@ class Database:
             return _manager_chain(connection, employee_id)
 
     def employee_by_device_user_id(self, device_user_id: str) -> dict[str, object] | None:
+        """The holder of a main or extra device user ID (archived included)."""
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT * FROM employees WHERE device_user_id = ?", (device_user_id,)
+                """
+                SELECT e.* FROM employees e WHERE e.device_user_id = ?
+                UNION ALL
+                SELECT e.* FROM employee_device_ids x JOIN employees e ON e.id = x.employee_id
+                WHERE x.device_user_id = ?
+                LIMIT 1
+                """,
+                (device_user_id, device_user_id),
             ).fetchone()
-        return row
+            return (_attach_device_ids(connection, [row]) or [None])[0]
 
     def has_admin(self) -> bool:
         with self.connect() as connection:
@@ -1280,6 +1335,9 @@ class Database:
                 FROM punches p
                 LEFT JOIN employees e ON e.device_user_id = p.device_user_id
                 WHERE e.id IS NULL AND p.device_user_id IS NOT NULL
+                    AND NOT EXISTS (
+                        SELECT 1 FROM employee_device_ids x WHERE x.device_user_id = p.device_user_id
+                    )
                     AND p.device_user_id <> ''
                 GROUP BY p.device_user_id
                 ORDER BY p.device_user_id
@@ -1392,7 +1450,7 @@ class Database:
                 """,
                 (token_hash, _now()),
             ).fetchone()
-        return row
+            return (_attach_device_ids(connection, [row]) or [None])[0]
 
     def revoke_session(self, token_hash: str) -> None:
         with self.transaction() as connection:
@@ -1452,7 +1510,8 @@ class Database:
     def frappe_pending_punches(self, *, since: datetime | None, limit: int) -> list[dict]:
         """Punches with no frappe_sync_log row, oldest first."""
         sql = (
-            "SELECT p.id, p.device_id, p.device_user_id, p.event_timestamp, p.trusted_direction "
+            f"SELECT p.id, p.device_id, {_MAIN_ID_SQL} AS device_user_id, "
+            "p.event_timestamp, p.trusted_direction "
             "FROM punches p LEFT JOIN frappe_sync_log f ON f.punch_id = p.id "
             "WHERE f.punch_id IS NULL"
         )
@@ -1498,15 +1557,16 @@ class Database:
 
     def checkins_since(self, *, since: datetime | None, limit: int) -> list[dict]:
         sql = (
-            "SELECT id, device_id, device_user_id, event_timestamp, trusted_direction "
-            "FROM punches WHERE event_timestamp IS NOT NULL "
-            "AND device_user_id IS NOT NULL AND device_user_id != ''"
+            f"SELECT p.id, p.device_id, {_MAIN_ID_SQL} AS device_user_id, "
+            "p.event_timestamp, p.trusted_direction "
+            "FROM punches p WHERE p.event_timestamp IS NOT NULL "
+            "AND p.device_user_id IS NOT NULL AND p.device_user_id != ''"
         )
         params: list[object] = []
         if since is not None:
-            sql += " AND event_timestamp > ?"
+            sql += " AND p.event_timestamp > ?"
             params.append(since)
-        sql += " ORDER BY event_timestamp, id LIMIT ?"
+        sql += " ORDER BY p.event_timestamp, p.id LIMIT ?"
         params.append(limit)
         with self.connect() as connection:
             return connection.execute(sql, params).fetchall()
