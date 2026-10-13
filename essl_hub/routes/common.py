@@ -303,8 +303,9 @@ WEB_SYNC_WARN = timedelta(minutes=5)
 WEB_SYNC_BAD = timedelta(minutes=60)
 COLLECTOR_STALE = timedelta(minutes=10)
 SPOOL_BAD = timedelta(minutes=60)
-EXPORT_WARN = timedelta(days=2)
-EXPORT_BAD = timedelta(days=7)
+BACKUP_WARN_INTERVALS = 2  # green below this many backup intervals since last_ok_at
+BACKUP_BAD_INTERVALS = 6
+BACKUP_REPEATED_ERRORS = 3  # this many failed cycles in a row = red
 
 
 def _parse_ts(value: object) -> datetime | None:
@@ -362,63 +363,70 @@ def _collector_signal(status: object, now: datetime) -> dict:
     return {"tone": "ok", "summary": f"Last poll {_ago(now - last_poll)}", "label": "Collector OK"}
 
 
-def _last_export_ok(entries: list[dict]) -> datetime | None:
-    for entry in reversed(entries):
-        if isinstance(entry, dict) and entry.get("status") == "ok":
-            when = _parse_ts(entry.get("finished")) or _parse_ts(entry.get("started"))
-            if when is not None:
-                return when
-    return None
-
-
-def _export_signal(entries: list[dict], now: datetime) -> dict:
-    last_ok = _last_export_ok(entries)
+def _backup_signal(status: object, now: datetime, *, r2_configured: bool, minutes: int) -> dict:
+    if not r2_configured:
+        return {"tone": "neutral", "summary": "Off", "label": "Backups off",
+                "error": "R2 is not configured (R2_* variables), so nothing is copied off-site."}
+    if not isinstance(status, dict):
+        return {"tone": "bad", "summary": "No backup yet", "label": "No backup yet", "error": None}
+    error = status.get("last_error") or None
+    last_ok = _parse_ts(status.get("last_ok_at"))
+    entries = [e for e in status.get("entries") or [] if isinstance(e, dict)]
+    tail = entries[-BACKUP_REPEATED_ERRORS:]
+    when = f"Last backup {_ago(now - last_ok)}" if last_ok else "No backup yet"
+    if status.get("blocked"):
+        return {"tone": "bad", "summary": f"Blocked · {when}", "error": error,
+                "label": "Backups blocked: different database"}
+    if len(tail) == BACKUP_REPEATED_ERRORS and all(e.get("status") != "ok" for e in tail):
+        return {"tone": "bad", "summary": f"Failing · {when}", "label": "Backups failing", "error": error}
     if last_ok is None:
-        return {"tone": "bad", "summary": "No export yet", "label": "No export yet"}
+        return {"tone": "bad", "summary": when, "label": "No backup yet", "error": error}
     age = now - last_ok
-    tone = "ok" if age <= EXPORT_WARN else "warn" if age < EXPORT_BAD else "bad"
-    return {"tone": tone, "summary": f"Last OK {_ago(age)}", "label": f"Export {_ago(age)}"}
+    interval = timedelta(minutes=max(1, minutes))
+    tone = ("ok" if age < BACKUP_WARN_INTERVALS * interval
+            else "warn" if age < BACKUP_BAD_INTERVALS * interval else "bad")
+    return {"tone": tone, "summary": when, "label": f"Backup {_ago(age)}", "error": error}
 
 
 def sync_health(
     web_sync_ok_at: datetime | None,
     collector_status: object,
-    export_status: object,
+    backup_status: object,
     now: datetime,
-    local_mode: bool = False,
+    local_mode: bool = True,
     web_rebuilt_at: datetime | None = None,
+    *,
+    r2_configured: bool = True,
+    backup_minutes: int = 15,
 ) -> dict:
-    """Summarise the three sync signals (health-state table, R4).
+    """Summarise the collector, backups (and, on a replica, web sync) signals.
 
     Pure: callers read the status files (missing/corrupt passed as None).
-    Each signal gets a tone; the worst wins and the label names it."""
-    if local_mode:
-        return {
-            "tone": "neutral",
-            "label": "Local database",
-            "title": "Local database file; Turso sync is not configured.",
-            "signal": None,
-            "details": [],
-        }
-    entries = export_status if isinstance(export_status, list) else []
+    Each signal gets a tone; the worst wins and the label names it. A neutral
+    signal (backups Off) never sets the top-bar tone."""
     collector = collector_status if isinstance(collector_status, dict) else None
+    backup = backup_status if isinstance(backup_status, dict) else None
     collector_poll = _parse_ts(collector.get("last_poll")) if collector else None
-    details = [
-        {"key": "web", "name": "Web replica sync", **_web_signal(web_sync_ok_at, now),
-         "times": [("Last successful sync", _ist(web_sync_ok_at)),
-                   ("Last replica rebuild", _ist(web_rebuilt_at))]},
+    details = []
+    if not local_mode:
+        details.append(
+            {"key": "web", "name": "Web replica sync", **_web_signal(web_sync_ok_at, now),
+             "times": [("Last successful sync", _ist(web_sync_ok_at)),
+                       ("Last replica rebuild", _ist(web_rebuilt_at))]})
+    details.append(
         {"key": "collector", "name": "Collector", **_collector_signal(collector, now),
          "times": [
              ("Last poll", _ist(collector_poll)),
-             ("Last sync OK", _ist(_parse_ts(collector.get("last_sync_ok_at")) if collector else None)),
              ("Oldest spooled punch", _ist(_parse_ts(collector.get("spool_oldest_at")) if collector else None)),
-             ("Last replica rebuild", _ist(_parse_ts(collector.get("replica_rebuilt_at")) if collector else None)),
-         ]},
-        {"key": "export", "name": "Nightly export", **_export_signal(entries, now),
-         "times": [("Last successful export", _ist(_last_export_ok(entries)))]},
-    ]
-    worst = max(details, key=lambda d: _TONE_RANK[d["tone"]])  # first worst wins ties
-    label = "Turso sync healthy" if worst["tone"] == "ok" else worst["label"]
+         ]})
+    details.append(
+        {"key": "backup", "name": "Backups",
+         **_backup_signal(backup, now, r2_configured=r2_configured, minutes=backup_minutes),
+         "times": [("Last backup", _ist(_parse_ts(backup.get("last_ok_at")) if backup else None)),
+                   ("Last upload", _ist(_parse_ts(backup.get("last_upload_at")) if backup else None))]})
+    ranked = [d for d in details if d["tone"] in _TONE_RANK]
+    worst = max(ranked, key=lambda d: _TONE_RANK[d["tone"]])  # first worst wins ties
+    label = "All systems healthy" if worst["tone"] == "ok" else worst["label"]
     title = " · ".join(
         f"{d['name']}: {d['summary']} ({d['times'][0][0].lower()} {d['times'][0][1]})" for d in details
     )
@@ -434,16 +442,20 @@ def _read_json(path: str) -> object:
 
 
 def current_sync_health(db: object) -> tuple[dict, list[dict]]:
-    """Read the status files tolerantly and summarise; also returns export entries."""
-    from ..backup import backup_status_path, status_entries
+    """Read the status files tolerantly and summarise; also returns backup entries."""
+    from ..backup import backup_status_path, r2_config
 
-    exports = status_entries(backup_status_path())
+    raw = _read_json(backup_status_path())
+    status = raw if isinstance(raw, dict) else None
+    entries = [e for e in (status or {}).get("entries") or [] if isinstance(e, dict)]
     health = sync_health(
         getattr(db, "last_sync_ok_at", None),
         _read_json(config.collector_status_path()),
-        exports,
+        status,
         _now_naive(),
         local_mode=not getattr(db, "replica", False),
         web_rebuilt_at=getattr(db, "last_rebuild_at", None),
+        r2_configured=r2_config() is not None,
+        backup_minutes=config.backup_minutes(),
     )
-    return health, exports
+    return health, entries

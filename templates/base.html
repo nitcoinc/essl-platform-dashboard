@@ -39,7 +39,7 @@
 {%- macro sync_badge() -%}
 {%- if sync_health is defined and sync_health -%}
 {%- set tone_icon = {'ok': 'check', 'warn': 'triangle-alert', 'bad': 'circle-alert'}.get(sync_health.tone, 'server') -%}
-<a class="sync-badge tone-{{ sync_health.tone }}" href="{{ url_for('admin.health_view') }}" title="{{ sync_health.title }}" aria-label="Turso sync health: {{ sync_health.label }}. {{ sync_health.title }}"><span class="chip-dot" aria-hidden="true"></span>{{ ui.icon(tone_icon) }}<span>{{ sync_health.label }}</span></a>
+<a class="sync-badge tone-{{ sync_health.tone }}" href="{{ url_for('admin.health_view') }}" title="{{ sync_health.title }}" aria-label="System health: {{ sync_health.label }}. {{ sync_health.title }}"><span class="chip-dot" aria-hidden="true"></span>{{ ui.icon(tone_icon) }}<span>{{ sync_health.label }}</span></a>
 {%- endif -%}
 {%- endmacro -%}
 {%- macro shell_tools() -%}{{ sync_badge() }}{{ theme_switch() }}{%- endmacro -%}

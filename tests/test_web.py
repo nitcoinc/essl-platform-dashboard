@@ -3607,19 +3607,20 @@ class ScreensTest(unittest.TestCase):
 
 
 class SyncHealthTest(unittest.TestCase):
-    """Boundaries of the health-state table (U5)."""
+    """Boundaries of the health-state table: collector + backups (U5)."""
 
     NOW = datetime(2026, 10, 10, 12, 0, 0)
 
-    def _health(self, web=timedelta(minutes=1), collector="ok", exports="ok", local=False):
+    def _health(self, web=timedelta(minutes=1), collector="ok", backup="ok", local=True, r2=True):
         from essl_hub.routes.common import sync_health
 
         if collector == "ok":
             collector = self._collector()
-        if exports == "ok":
-            exports = self._exports(timedelta(hours=10))
+        if backup == "ok":
+            backup = self._backup(timedelta(minutes=10))
         web_at = None if web is None else self.NOW - web
-        return sync_health(web_at, collector, exports, self.NOW, local_mode=local)
+        return sync_health(web_at, collector, backup, self.NOW, local_mode=local,
+                           r2_configured=r2, backup_minutes=15)
 
     def _collector(self, age=timedelta(minutes=1), depth=0, oldest=None, dead=0):
         return {
@@ -3629,27 +3630,55 @@ class SyncHealthTest(unittest.TestCase):
             "dead_count": dead,
         }
 
-    def _exports(self, age):
-        at = (self.NOW - age).isoformat(sep=" ")
-        return [{"status": "failed", "started": at, "finished": at},
-                {"status": "ok", "started": at, "finished": at},
-                {"status": "failed", "started": at, "finished": at}]
+    def _backup(self, age, *, blocked=False, error=None, entries=None):
+        at = None if age is None else (self.NOW - age).isoformat(sep=" ")
+        return {"last_ok_at": at, "last_upload_at": at, "blocked": blocked, "last_error": error,
+                "entries": entries if entries is not None else [{"status": "ok", "started": at}]}
+
+    def _signal(self, health, key):
+        return next(d for d in health["details"] if d["key"] == key)
 
     def test_all_green(self) -> None:
         health = self._health()
-        self.assertEqual((health["tone"], health["label"]), ("ok", "Turso sync healthy"))
+        self.assertEqual((health["tone"], health["label"]), ("ok", "All systems healthy"))
+        self.assertEqual(self._signal(health, "backup")["summary"], "Last backup 10 min ago")
         self.assertIn("IST", health["title"])
+        self.assertEqual([d["key"] for d in health["details"]], ["collector", "backup"])
 
-    def test_web_sync_boundaries(self) -> None:
-        cases = [(timedelta(minutes=5), "ok"), (timedelta(minutes=5, seconds=1), "warn"),
-                 (timedelta(minutes=60), "warn"), (timedelta(minutes=60, seconds=1), "bad"), (None, "bad")]
+    def test_backup_boundaries(self) -> None:
+        cases = [(timedelta(minutes=29), "ok"), (timedelta(minutes=30), "warn"),
+                 (timedelta(minutes=50), "warn"), (timedelta(minutes=89), "warn"),
+                 (timedelta(minutes=90), "bad"), (None, "bad")]
         for age, tone in cases:
             with self.subTest(age=age):
-                health = self._health(web=age)
+                health = self._health(backup=self._backup(age))
                 self.assertEqual(health["tone"], tone)
                 if tone != "ok":
-                    self.assertEqual(health["signal"], "web")
-                    self.assertIn("Web sync", health["label"])
+                    self.assertEqual(health["signal"], "backup")
+        for missing in (None, "garbage"):
+            self.assertEqual(self._health(backup=missing)["label"], "No backup yet")
+
+    def test_blocked_is_red_with_different_database_message(self) -> None:
+        err = "R2 backups belong to a different database (abc)"
+        health = self._health(backup=self._backup(timedelta(minutes=5), blocked=True, error=err))
+        self.assertEqual((health["tone"], health["signal"]), ("bad", "backup"))
+        self.assertIn("different database", health["label"])
+        self.assertEqual(self._signal(health, "backup")["error"], err)
+
+    def test_repeated_errors_are_red(self) -> None:
+        failed = [{"status": "failed"}] * 3
+        health = self._health(backup=self._backup(timedelta(minutes=5), error="boom", entries=failed))
+        self.assertEqual((health["tone"], health["label"]), ("bad", "Backups failing"))
+        two = [{"status": "ok"}, {"status": "failed"}, {"status": "failed"}]
+        self.assertEqual(self._health(backup=self._backup(timedelta(minutes=5), entries=two))["tone"], "ok")
+
+    def test_no_r2_is_off_and_collector_still_rates(self) -> None:
+        health = self._health(backup=None, r2=False)
+        self.assertEqual(health["tone"], "ok")
+        self.assertEqual(self._signal(health, "backup")["summary"], "Off")
+        self.assertEqual(self._signal(health, "backup")["tone"], "neutral")
+        health = self._health(backup=None, r2=False, collector=None)
+        self.assertEqual((health["tone"], health["signal"]), ("bad", "collector"))
 
     def test_collector_boundaries(self) -> None:
         cases = [
@@ -3669,29 +3698,14 @@ class SyncHealthTest(unittest.TestCase):
                     self.assertEqual(health["signal"], "collector")
                     self.assertIn("Collector", health["label"])
 
-    def test_export_boundaries(self) -> None:
-        cases = [(timedelta(days=2), "ok"), (timedelta(days=2.5), "warn"), (timedelta(days=6.5), "warn"),
-                 (timedelta(days=7), "bad")]
-        for age, tone in cases:
-            with self.subTest(age=age):
-                health = self._health(exports=self._exports(age))
-                self.assertEqual(health["tone"], tone)
-                if tone != "ok":
-                    self.assertEqual(health["signal"], "export")
-        for empty in ([], None, [{"status": "failed", "started": "2026-10-09 02:00:00"}]):
-            health = self._health(exports=empty)
-            self.assertEqual((health["tone"], health["label"]), ("bad", "No export yet"))
-
     def test_worst_signal_wins_and_is_named(self) -> None:
-        health = self._health(web=timedelta(minutes=30), collector=self._collector(dead=2))
+        health = self._health(backup=self._backup(timedelta(minutes=40)), collector=self._collector(dead=2))
         self.assertEqual((health["tone"], health["signal"]), ("bad", "collector"))
         self.assertEqual(health["label"], "Collector: 2 dead punches")
-        health = self._health(web=timedelta(minutes=30), exports=self._exports(timedelta(days=3)))
-        self.assertEqual((health["tone"], health["signal"]), ("warn", "web"))
 
-    def test_local_mode_is_neutral(self) -> None:
-        health = self._health(web=None, collector=None, exports=None, local=True)
-        self.assertEqual((health["tone"], health["label"]), ("neutral", "Local database"))
+    def test_replica_mode_adds_web_signal(self) -> None:
+        health = self._health(local=False, web=timedelta(minutes=30))
+        self.assertEqual((health["tone"], health["signal"]), ("warn", "web"))
 
 
 class BrandIconsTest(unittest.TestCase):

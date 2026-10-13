@@ -1,18 +1,15 @@
 {% extends "base.html" %}
 {% import "_ui.html" as ui %}
-{% block title %}Sync health - eSSL Attendance Hub{% endblock %}
+{% block title %}System health - eSSL Attendance Hub{% endblock %}
 {% block content %}
 <header class="topbar">
   <div>
-    <h1>Turso sync health</h1>
-    <p>Each signal is read from the shared volume, so this page still loads when Turso is down. The worst signal sets the top-bar indicator.</p>
+    <h1>System health</h1>
+    <p>Each signal is read from the data folder. The worst signal sets the top-bar indicator.</p>
   </div>
 </header>
 
-{% if health.tone == 'neutral' %}
-<p class="section-intro">{{ ui.chip('Local database') }} This instance runs on a local database file. Turso sync, the collector spool and the nightly export are not configured.</p>
-{% else %}
-{% set chip_tone = {'ok': 'ok', 'warn': 'warn', 'bad': 'bad'} %}
+{% set chip_tone = {'ok': 'ok', 'warn': 'warn', 'bad': 'bad', 'neutral': 'neutral'} %}
 <div class="health-signals">
   {% for signal in health.details %}
   <section class="health-signal" aria-labelledby="signal-{{ signal.key }}">
@@ -24,37 +21,39 @@
       {% for label, value in signal.times %}
       <dt>{{ label }}</dt><dd>{{ value }}</dd>
       {% endfor %}
+      {% if signal.error %}<dt>Last error</dt><dd>{{ signal.error }}</dd>{% endif %}
     </dl>
   </section>
   {% endfor %}
 </div>
 
-<section aria-labelledby="exports-head">
-  <div class="section-head"><h2 id="exports-head">Recent exports</h2></div>
+<section aria-labelledby="backups-head">
+  <div class="section-head"><h2 id="backups-head">Recent backups</h2></div>
   {% if exports %}
-  {% call ui.table([('Started (IST)', 'left'), ('Finished (IST)', 'left'), ('Result', 'left'), ('Size', 'num'), ('Detail', 'left')], caption='Last 14 nightly exports') %}
+  {% call ui.table([('Started (IST)', 'left'), ('Finished (IST)', 'left'), ('Result', 'left'), ('Size', 'num'), ('Detail', 'left')], caption='Last 14 backup cycles') %}
     {% for entry in exports %}
     <tr>
       <td>{{ entry.started or '-' }}</td>
       <td>{{ entry.finished or '-' }}</td>
-      <td>{{ ui.chip('OK', 'ok') if entry.status == 'ok' else ui.chip('Failed', 'bad') }}</td>
+      <td>{% if entry.status == 'ok' %}{{ ui.chip('Unchanged' if entry.skipped else 'OK', 'ok') }}{% elif entry.status == 'blocked' %}{{ ui.chip('Blocked', 'bad') }}{% elif entry.status == 'not_set_up' %}{{ ui.chip('Not set up', 'bad') }}{% else %}{{ ui.chip('Failed', 'bad') }}{% endif %}</td>
       <td class="num">{% if entry.size %}{{ '%.1f'|format(entry.size / 1048576) }} MB{% else %}-{% endif %}</td>
-      <td>{{ entry.key or entry.error or '-' }}</td>
+      <td>{{ entry.error or entry.key or '-' }}</td>
     </tr>
     {% endfor %}
   {% endcall %}
   {% else %}
-  {{ ui.empty_state('No export yet', 'The nightly export has not recorded a run. Check the export service logs.') }}
+  {{ ui.empty_state('No backup yet', 'The backup service has not recorded a cycle. Check: docker compose logs backup') }}
   {% endif %}
 </section>
-{% endif %}
 
 <section class="health-recovery" aria-labelledby="recovery-head">
   <h2 id="recovery-head">Recovery</h2>
   <ol>
-    <li>Turso unreachable: reads keep serving from the local replica and writes show the offline page. The collector spools punches and replays them in order once sync returns.</li>
-    <li>Dead-lettered punches stay in the spool's <code>dead</code> table; nothing is dropped.</li>
-    <li>Data loss on the primary: restore from Turso point-in-time recovery first, then from the latest nightly export in R2.</li>
+    <li>Check backups: <code>docker compose run --rm backup python -m essl_hub.backup status</code></li>
+    <li>See snapshots in R2: <code>docker compose run --rm backup python -m essl_hub.backup list</code></li>
+    <li>Lost or corrupt database: stop the stack, move <code>essl.db</code>, <code>essl.db-wal</code> and <code>essl.db-shm</code> aside, then <code>docker compose run --rm backup python -m essl_hub.backup restore</code> (add <code>--key &lt;key&gt;</code> for an older snapshot). Everyone signs in again afterwards.</li>
+    <li>Blocked, "different database": restore takes the bucket's database; <code>docker compose run --rm backup python -m essl_hub.backup adopt</code> makes this database the owner instead.</li>
+    <li>Collector dead-lettered punches stay in the spool's <code>dead</code> table; nothing is dropped.</li>
   </ol>
   <p>The full runbook is in the README, section "Recovery".</p>
 </section>
