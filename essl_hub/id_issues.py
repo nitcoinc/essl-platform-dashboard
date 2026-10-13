@@ -246,7 +246,7 @@ def find_issues(summary: list[dict], employees: list[dict], dismissed: set[str] 
         if "@" in uid:
             issues.append(Issue("placeholder", "warn", title="No device ID yet",
                                 detail="The ID is the work email, so no door punch can ever match. Set the ID enrolled on the device.", **common))
-        elif uid not in by_id:
+        elif not any(i in by_id for i in _all_ids(employee)):
             issues.append(Issue("never", "warn", title="No punches on any device",
                                 detail="Nobody has scanned with this ID. Check it matches the device enrolment.", **common))
 

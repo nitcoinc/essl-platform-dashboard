@@ -45,6 +45,11 @@ class FindIssuesTest(unittest.TestCase):
         self.assertEqual(find_issues([], [_emp(4, "NP0500", "Ghost")], {"never:NP0500"}), [])
 
 
+    def test_punches_only_under_extra_id_are_not_never_punched(self) -> None:
+        asha = {**_emp(1, "128", "Asha"), "device_ids": ["128", "NP0128"]}
+        self.assertEqual(find_issues([_seen("NP0128", "Asha")], [asha]), [])
+
+
 class PrimaryFixTest(unittest.TestCase):
     def _fixes(self, summary, employees):
         from essl_hub.id_issues import id_twins, primary_fix, suggestions

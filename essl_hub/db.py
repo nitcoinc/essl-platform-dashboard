@@ -1113,6 +1113,12 @@ class Database:
                 """,
                 (name, email, device_user_id, _now(), employee_id),
             )
+            # A new main ID may own punches Frappe skipped (employee not found).
+            connection.execute(
+                "DELETE FROM frappe_sync_log WHERE status = 'skipped' AND punch_id IN "
+                "(SELECT id FROM punches WHERE device_user_id = ?)",
+                (device_user_id,),
+            )
 
     def extra_device_ids(self, employee_id: int) -> list[str]:
         """Extra device user IDs for one employee (v6), oldest first."""

@@ -468,6 +468,15 @@ class DatabaseTest(unittest.TestCase):
             [r["device_user_id"] for r in self.database.checkins_since(since=None, limit=10)], ["NP0118"]
         )
 
+    def test_main_id_change_requeues_skipped_punches(self) -> None:
+        asha = self._employee("asha@x.com", "asha@x.com")
+        self.database.insert_punches([self._punch(fingerprint="b", device_user_id="777")])
+        punch_id = self.database.frappe_pending_punches(since=None, limit=10)[0]["id"]
+        self.database.record_frappe_sync(punch_id, status="skipped", error="Employee not found")
+        self.database.update_employee(asha, name="Asha", email="asha@x.com", device_user_id="777")
+        pending = self.database.frappe_pending_punches(since=None, limit=10)
+        self.assertEqual([(p["id"], p["device_user_id"]) for p in pending], [(punch_id, "777")])
+
     def test_archive_hides_person_and_restore_brings_them_back(self) -> None:
         asha = self._employee("118", "asha@x.com")
         self.database.add_extra_device_id(asha, "NP0118")
