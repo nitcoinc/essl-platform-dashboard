@@ -86,6 +86,8 @@
     {% for item in log %}
     {% if item.kind == 'break' %}
     <li class="log-gap"><span class="log-gap-text">Break <span class="num">{{ ui.clock(item.seconds) }}</span></span></li>
+    {% elif item.kind == 'unclear' %}
+    <li class="log-gap"><span class="log-gap-text">Unclear <span class="num">{{ ui.clock(item.seconds) }}</span></span></li>
     {% elif item.kind == 'in' %}
     <li class="log-node is-in"><span class="log-dot" aria-hidden="true"></span><span class="log-time num">{{ item.time.strftime('%H:%M:%S') }}{% if item.time.date() > day %}<sup title="Next calendar day">+1</sup>{% endif %}</span><span class="log-label">In</span>{% if item.seconds is not none %}<span class="log-meta">Inside <span class="num" data-log-stretch="{{ item.seconds }}"{% if live and loop.revindex == 2 %} data-tick="{{ item.seconds }}"{% endif %}>{{ ui.clock(item.seconds) }}</span></span>{% endif %}</li>
     {% elif item.kind == 'out' %}

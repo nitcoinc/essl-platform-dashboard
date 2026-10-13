@@ -14,7 +14,7 @@ from .hours import DayResult
 
 @dataclass(frozen=True)
 class LogItem:
-    kind: str  # "in" | "out" | "break" | "now" | "missing"
+    kind: str  # "in" | "out" | "break" | "unclear" | "now" | "missing"
     time: datetime | None
     minutes: int | None = None  # stretch length on "in", gap on "break"
     seconds: int | None = None  # exact length; "in" stretches sum to effective_seconds
@@ -77,12 +77,17 @@ def headline(result: DayResult, target_minutes: int, now: datetime | None, *, is
 
 
 def log_items(result: DayResult, now: datetime | None) -> list[LogItem]:
-    """In/out nodes with the break between stretches, ending in "now" while inside."""
+    """In/out nodes with the gap between stretches, ending in "now" while inside.
+    Gap kind (break or unclear) comes from ``result.gaps`` (KTD9); a past day's
+    trailing entry gets no gap before "missing"."""
     items: list[LogItem] = []
     previous_end: datetime | None = None
+    unclear_ends = {g.end for g in result.gaps if g.kind == "unclear"}
     for seg in result.segments:
-        if previous_end is not None:
-            items.append(_stretch("break", None, previous_end, seg.start))
+        trailing_missing = seg.end is None and result.status != "open"
+        if previous_end is not None and not trailing_missing:
+            kind = "unclear" if seg.start in unclear_ends else "break"
+            items.append(_stretch(kind, None, previous_end, seg.start))
         end = seg.end
         if end is None and result.status == "open" and now is not None:
             items.append(_stretch("in", seg.start, seg.start, now))

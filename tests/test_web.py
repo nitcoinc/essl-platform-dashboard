@@ -831,6 +831,22 @@ class HoursRenderingTest(unittest.TestCase):
         self.assertIn("Missing exit punch", response.text)
         self.assertIn("No exit recorded", response.text)
 
+    def test_past_day_has_no_break_row_before_missing_exit(self) -> None:
+        # U10/KTD9: the trailing entry's gap is not a break.
+        self._sign_in()
+        day = _ist_today() - timedelta(days=1)
+        while day.weekday() >= 5:
+            day -= timedelta(days=1)
+        base = datetime.combine(day, datetime.min.time())
+        self.database.insert_punches([
+            {"fingerprint": f"fp-u10-{h}", "device_id": DEVICES[1].id, "site": "Gachibowli",
+             "device_user_id": "118", "event_timestamp": base + timedelta(hours=h), "trusted_direction": d}
+            for h, d in ((9, "entry"), (13, "exit"), (14, "entry"))
+        ])
+        response = self.client.get(f"/day?date={day.isoformat()}")
+        self.assertIn("No exit recorded", response.text)
+        self.assertNotIn('class="log-gap"', response.text)
+
     def _at(self, at: datetime):
         common, me = _fixed_now(at)
         common.start()

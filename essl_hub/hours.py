@@ -12,6 +12,12 @@ DirectionSource = Literal["raw_byte", "alternation", "mixed", "none"]
 # cross calendar midnight, so a midnight cut splits one shift over two days.
 DEFAULT_DAY_START_HOUR = 6
 
+# KTD9: a swipe within this many seconds of the person's previous kept swipe
+# (any device) is a duplicate: stored, shown "not counted", never paired.
+DUPLICATE_WINDOW_SECONDS = 60
+
+GapKind = Literal["break", "unclear"]
+
 
 @dataclass(frozen=True)
 class Punch:
@@ -24,6 +30,20 @@ class Segment:
     start: datetime
     end: datetime | None
     direction: Direction = "entry"
+
+
+@dataclass(frozen=True)
+class Gap:
+    """Time outside between two paired stretches (KTD9). A clean Out->In gap
+    is a break; a gap holding an unpaired swipe is unclear and never counted
+    as break. ``number`` counts within its kind, from 1."""
+
+    kind: GapKind
+    number: int
+    start: datetime
+    end: datetime
+    seconds: int
+    unpaired: tuple[tuple[datetime, Direction], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -40,6 +60,14 @@ class DayResult:
     effective_seconds: int = 0
     gross_seconds: int | None = 0
     break_seconds: int = 0
+    # KTD9: gaps between paired stretches in time order (breaks and unclear).
+    gaps: tuple[Gap, ...] = ()
+    unclear_seconds: int = 0
+    # Swipes that paired with nothing (superseded entries, orphan exits, and a
+    # past day's trailing entry), with their resolved direction.
+    unpaired: tuple[tuple[datetime, Direction], ...] = ()
+    # Duplicate swipes dropped before pairing ("not counted" in raw lists).
+    collapsed: tuple[Punch, ...] = ()
 
 
 def compute_day(
@@ -60,9 +88,11 @@ def compute_day(
             direction_source="none",
         )
 
-    resolved, direction_source = _resolve_directions(ordered)
+    kept, collapsed = _collapse_duplicates(ordered)
+    resolved, direction_source = _resolve_directions(kept)
     segments, unmatched, open_start = _pair_segments(resolved)
     anomalies = tuple(_anomaly_text(ts, direction) for ts, direction in unmatched)
+    extras = {"collapsed": tuple(collapsed)}
 
     # R4: inside now on today's work day is open, whatever orphans came before.
     if open_start is not None and is_today and now is not None:
@@ -70,13 +100,16 @@ def compute_day(
         effective = sum(_seconds(s.end - s.start) for s in segments if s.end is not None)
         effective += _seconds(now - open_start)
         gross = _seconds(now - segments[0].start)
-        return _scored("open", gross, effective, segments, direction_source, anomalies)
+        extras["unpaired"] = tuple(unmatched)
+        return _scored("open", gross, effective, segments, direction_source, anomalies, extras)
 
     closed = list(segments)
     if open_start is not None:
         # A trailing entry with no exit on a past day: flag it, keep it visible.
         anomalies += (_anomaly_text(open_start, "entry"),)
+        unmatched.append((open_start, "entry"))
         segments.append(Segment(start=open_start, end=None))
+    extras["unpaired"] = tuple(unmatched)
 
     # R3: an unmatched swipe only zeroes the day when nothing paired at all.
     if not closed:
@@ -89,6 +122,7 @@ def compute_day(
             direction_source=direction_source,
             anomalies=anomalies,
             gross_seconds=None,
+            **extras,
         )
 
     effective = sum(_seconds(s.end - s.start) for s in closed)
@@ -96,7 +130,7 @@ def compute_day(
     # R17: compare exact seconds; the target is whole minutes, so the floored
     # minute display never disagrees with the status.
     status: DayStatus = "met" if effective >= target_minutes * 60 else "short"
-    return _scored(status, gross, effective, segments, direction_source, anomalies)
+    return _scored(status, gross, effective, segments, direction_source, anomalies, extras)
 
 
 def _scored(
@@ -106,23 +140,62 @@ def _scored(
     segments: list[Segment],
     direction_source: DirectionSource,
     anomalies: tuple[str, ...],
+    extras: dict,
 ) -> DayResult:
-    """Build a scored result from exact seconds. Break minutes are gross minus
-    effective minutes so the minute view adds up (flooring break alone drifts)."""
+    """Build a scored result from exact seconds. Gaps come from the paired
+    stretches (a past day's trailing open entry has none before it), so
+    gross = effective + breaks + unclear. With no unclear gap, break minutes
+    are gross minus effective minutes so the minute view adds up (flooring
+    break alone drifts)."""
+    gaps = _gaps([s for s in segments if s.end is not None or status == "open"], extras["unpaired"])
+    break_seconds = sum(g.seconds for g in gaps if g.kind == "break")
+    unclear_seconds = sum(g.seconds for g in gaps if g.kind == "unclear")
     gross_minutes = gross // 60
     effective_minutes = effective // 60
+    break_minutes = gross_minutes - effective_minutes if not unclear_seconds else break_seconds // 60
     return DayResult(
         status=status,
         gross_minutes=gross_minutes,
         effective_minutes=effective_minutes,
-        break_minutes=gross_minutes - effective_minutes,
+        break_minutes=break_minutes,
         segments=tuple(segments),
         direction_source=direction_source,
         anomalies=anomalies,
         effective_seconds=effective,
         gross_seconds=gross,
-        break_seconds=gross - effective,
+        break_seconds=break_seconds,
+        gaps=gaps,
+        unclear_seconds=unclear_seconds,
+        **extras,
     )
+
+
+def _gaps(
+    segments: list[Segment], unpaired: tuple[tuple[datetime, Direction], ...]
+) -> tuple[Gap, ...]:
+    gaps: list[Gap] = []
+    counts = {"break": 0, "unclear": 0}
+    for before, after in zip(segments, segments[1:]):
+        start, end = before.end, after.start
+        inside = tuple(u for u in unpaired if start <= u[0] <= end)
+        kind: GapKind = "unclear" if inside else "break"
+        counts[kind] += 1
+        gaps.append(Gap(kind, counts[kind], start, end, _seconds(end - start), inside))
+    return tuple(gaps)
+
+
+def _collapse_duplicates(ordered: list[Punch]) -> tuple[list[Punch], list[Punch]]:
+    """Drop swipes within DUPLICATE_WINDOW_SECONDS of the previous kept swipe,
+    keeping the first (KTD9)."""
+    kept: list[Punch] = []
+    collapsed: list[Punch] = []
+    window = timedelta(seconds=DUPLICATE_WINDOW_SECONDS)
+    for punch in ordered:
+        if kept and punch.timestamp - kept[-1].timestamp <= window:
+            collapsed.append(punch)
+        else:
+            kept.append(punch)
+    return kept, collapsed
 
 
 def work_day(timestamp: datetime, day_start_hour: int) -> date:
