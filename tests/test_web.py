@@ -2648,6 +2648,30 @@ class DatabaseSetupTest(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertFalse(response.get_json()["ok"])
 
+    def test_busy_boot_is_retried_on_next_request(self) -> None:
+        from essl_hub.db import BusyError, Database
+
+        creator = Database(self.path)
+        creator.migrate_schema()
+        creator.close()
+        real = Database.initialize
+        calls = []
+
+        def flaky(db, devices):
+            calls.append(1)
+            if len(calls) == 1:
+                raise BusyError("locked")
+            return real(db, devices)
+
+        with patch.object(Database, "initialize", flaky):
+            with self.assertLogs("essl_hub.web", level="WARNING"):
+                client = self._app().test_client()
+            self.assertEqual(len(calls), 1)
+            client.get("/api/health")
+            self.assertEqual(len(calls), 2)
+            client.get("/api/health")
+            self.assertEqual(len(calls), 2)
+
     def test_first_request_after_init_boots_and_promotes_bootstrap_admin(self) -> None:
         from essl_hub.db import Database
 

@@ -463,8 +463,8 @@ The bucket's `latest.json` names another database. Decide which is right:
 Do it once after the upgrade, then quarterly, on a **scratch host** (never on production):
 
 1. On production: `docker compose run --rm backup python -m essl_hub.backup now`, then `list`; confirm the new `recent/` key and an OK row on the health page.
-2. On the scratch host: copy `.env`, leave `TUNNEL_TOKEN` empty, point `R2_*` at the same bucket, `docker compose build`, then `docker compose run --rm backup python -m essl_hub.backup restore`.
-3. **Stop the scratch `backup` service at once** (`docker compose up -d web collector` only), so it never uploads into the production bucket. Sign in (set `ESSL_MAIL_PROVIDER=console` on the scratch host) and check yesterday's hours match production.
+2. On the scratch host: copy `.env`, then edit it so the copy can never touch production: leave `TUNNEL_TOKEN` empty, **blank `ESSL_X990_IP`, `ESSL_C3_IP` and every `FRAPPE_*`** (no door reads, no pushes to Frappe), set `ESSL_MAIL_PROVIDER=console`, and point `R2_*` at the same bucket with **read-only R2 credentials** (or remove the write credentials). Then `docker compose build` and `docker compose run --rm backup python -m essl_hub.backup restore --drill`. `--drill` gives the restored file a new random `database_id`, so even with write credentials it can never pass the bucket guard and upload.
+3. Start **only the web app**: `docker compose up -d web`. Never start `backup` (or `collector`) on the scratch host. Sign in and check yesterday's hours match production.
 4. Record the time it took, then destroy the scratch host.
 
 ## R2 plan limits

@@ -297,6 +297,19 @@ class CycleTest(Base):
         self.assertEqual(len(self.r2.list("nightly/")), 1)
         self.assertEqual(self.r2.objects["nightly/20261014.db.gz"], nightly_bytes)
 
+    def test_nightly_written_on_sha_skip_when_due(self) -> None:
+        self.init_db()
+        self.cycle(datetime(2026, 10, 14, 1, 0))
+        self.assertEqual(self.r2.list("nightly/"), [])
+        self.assertEqual(self.cycle(datetime(2026, 10, 14, 2, 0)), "skipped")
+        self.assertEqual([o.key for o in self.r2.list("nightly/")], ["nightly/20261014.db.gz"])
+        self.assertEqual(self.r2.objects["nightly/20261014.db.gz"],
+                         self.r2.objects["recent/20261014T010000.db.gz"])
+        self.assertNotIn("recent/20261014T020000.db.gz", self.r2.objects)
+        puts = len(self.r2.puts)
+        self.assertEqual(self.cycle(datetime(2026, 10, 14, 2, 15)), "skipped")
+        self.assertEqual(len(self.r2.puts), puts)
+
     def test_missing_database_reports_not_set_up(self) -> None:
         self.assertEqual(self.cycle(), "not_set_up")
         self.assertEqual(self.r2.objects, {})
@@ -488,7 +501,42 @@ class RestoreTest(Base):
         self.assertEqual(seen, [0o600])
 
 
+class DrillTest(Base):
+    def test_drill_restore_gets_new_id_and_never_uploads(self) -> None:
+        db_id = self.init_db()
+        self.cycle()
+        for suffix in ("", "-wal", "-shm"):
+            if os.path.exists(self.db_path + suffix):
+                os.unlink(self.db_path + suffix)
+        with redirect_stdout(io.StringIO()):
+            bk.cmd_restore(self.db_path, self.r2, drill=True)
+        new_id = _setting(self.db_path, "database_id")
+        self.assertTrue(new_id)
+        self.assertNotEqual(new_id, db_id)
+        before = dict(self.r2.objects)
+        self.assertEqual(self.cycle(NOW + timedelta(minutes=15)), "blocked")
+        self.assertEqual(self.r2.objects, before)
+
+
+class HasBackupsTest(Base):
+    def test_exit_codes(self) -> None:
+        with mock.patch.object(bk, "make_client", return_value=self.r2):
+            self.assertEqual(bk.main(["has-backups"]), 3)
+            self.r2.objects[bk.LATEST_KEY] = b'{"database_id": "x"}'
+            self.assertEqual(bk.main(["has-backups"]), 0)
+            self.r2.fail_get = OSError("down")
+            with mock.patch("sys.stderr", io.StringIO()):
+                self.assertEqual(bk.main(["has-backups"]), 1)
+
+
 class AdoptTest(Base):
+    def test_adopt_writes_null_key(self) -> None:
+        self.init_db()
+        self.cycle()
+        with redirect_stdout(io.StringIO()):
+            bk.cmd_adopt(self.db_path, self.r2, confirm=lambda: True)
+        self.assertIsNone(self.r2.latest()["key"])
+
     def test_adopt_needs_confirmation(self) -> None:
         db_id = self.init_db()
         self.r2.objects[bk.LATEST_KEY] = json.dumps({"database_id": "other"}).encode()

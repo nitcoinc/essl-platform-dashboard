@@ -255,6 +255,12 @@ if [ "$STATE" = turso ]; then
 fi
 if [ "$STATE" = fresh ] && [ "$CHECK_ONLY" = 0 ]; then
   step "Creating the database"
+  # Never start an empty database over existing backups: it would need adopt
+  # and orphan the real data. Exit 0 = backups exist, 3 = none, else unknown.
+  rc=0
+  docker compose run --rm --no-deps backup python -m essl_hub.backup has-backups || rc=$?
+  [ "$rc" = 0 ] && die "R2 already holds backups (latest.json). Restore them instead: docker compose run --rm backup python -m essl_hub.backup restore"
+  [ "$rc" = 3 ] || die "could not check R2 for existing backups (fix R2_* in .env), then re-run; to restore: docker compose run --rm backup python -m essl_hub.backup restore"
   docker compose run --rm --no-deps backup python -m essl_hub.backup init
   ok "database created"
 fi

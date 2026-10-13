@@ -2,8 +2,8 @@
 
     python -m essl_hub.backup                 # loop: snapshot every ESSL_BACKUP_MINUTES
     python -m essl_hub.backup init            # new empty database
-    python -m essl_hub.backup restore [--key KEY]
-    python -m essl_hub.backup list | now | status | adopt [--yes] | import-turso
+    python -m essl_hub.backup restore [--key KEY] [--drill]
+    python -m essl_hub.backup list | now | status | has-backups | adopt [--yes] | import-turso
 
 Only this module holds R2 credentials. It never talks to devices. Every cycle
 and every command that touches the database file or the bucket holds an
@@ -517,7 +517,12 @@ def run_cycle(
                     )
                 sha = _sha256(snap.path)
                 size = snap.path.stat().st_size
-                if sha == status.get("last_sha256"):
+                skip = sha == status.get("last_sha256")
+                nightly = nightly_key(started)
+                nightly_due = started.hour >= hour and not any(
+                    o.key == nightly for o in client.list(nightly)
+                )
+                if skip and not nightly_due:
                     result = "skipped"
                     entry.update(status="ok", skipped=True, key=status.get("last_key"), size=size)
                 else:
@@ -533,12 +538,15 @@ def run_cycle(
                             "restore` to take the bucket's database, or `adopt` to make this "
                             "database the owner"
                         )
+                if skip and nightly_due:
+                    client.put_file(str(snap.path), nightly)
+                    result = "skipped"
+                    entry.update(status="ok", skipped=True, key=status.get("last_key"),
+                                 size=size, nightly=nightly)
+                elif not skip:
                     key = recent_key(started)
                     client.put_file(str(snap.path), key)
-                    nightly = nightly_key(started)
-                    if started.hour >= hour and not any(
-                        o.key == nightly for o in client.list(nightly)
-                    ):
+                    if nightly_due:
                         client.put_file(str(snap.path), nightly)
                     client.put_bytes(
                         LATEST_KEY,
@@ -620,7 +628,11 @@ def _verify_restored(path: str) -> str | None:
         conn.close()
 
 
-def cmd_restore(database_path: str, client: R2Client | None, key: str | None = None) -> str:
+def cmd_restore(
+    database_path: str, client: R2Client | None, key: str | None = None, *, drill: bool = False
+) -> str:
+    """drill=True gives the restored file a fresh random database_id so it can
+    never pass the bucket guard and upload over production backups."""
     with backup_lock(database_path):
         _refuse_existing(database_path)
         if client is None:
@@ -644,16 +656,36 @@ def cmd_restore(database_path: str, client: R2Client | None, key: str | None = N
             except (OSError, EOFError, gzip.BadGzipFile) as exc:
                 raise CommandError(f"could not unpack {key}: {exc}") from None
             database_id = _verify_restored(plain)
+            if drill:
+                database_id = uuid.uuid4().hex
+                conn = sqlite3.connect(plain)
+                try:
+                    with conn:
+                        _write_setting(conn, DATABASE_ID_KEY, database_id)
+                finally:
+                    conn.close()
             _refuse_existing(database_path)
             os.rename(plain, database_path)
     print(f"Restored {key} to {database_path}.")
-    if database_id:
+    if drill:
+        print(f"Drill: new database_id {database_id}; this copy can never upload to R2.")
+    elif database_id:
         print(f"database_id {database_id} kept; backups continue on the next cycle.")
     else:
         print("This snapshot has no database_id: run `python -m essl_hub.backup adopt` "
               "before backups resume.")
     print("Note: everyone signs in again (sessions are not in snapshots).")
     return key
+
+
+def cmd_has_backups(client: R2Client | None) -> bool:
+    """True when R2 already holds latest.json (an install must restore, not init)."""
+    if client is None:
+        raise CommandError("R2 credentials are not configured (R2_* variables)")
+    try:
+        return _read_latest(client) is not None
+    except Exception as exc:  # noqa: BLE001
+        raise CommandError(f"could not read latest.json: {exc}") from None
 
 
 def cmd_list(client: R2Client | None) -> list[ObjectInfo]:
@@ -748,7 +780,7 @@ def cmd_adopt(
         status_path = backup_status_path(database_path)
         status = load_status(status_path)
         client.put_bytes(
-            LATEST_KEY, _latest_payload(database_id, status.get("last_key"), punches, _now())
+            LATEST_KEY, _latest_payload(database_id, None, punches, _now())
         )
         status.update(blocked=False, last_error=None, last_sha256=None)
         _write_json_atomic(status_path, status)
@@ -853,7 +885,10 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("init", help="create a new empty database")
     restore = sub.add_parser("restore", help="restore the latest (or --key) snapshot")
     restore.add_argument("--key", help="exact R2 key, e.g. recent/20261014T101500.db.gz")
+    restore.add_argument("--drill", action="store_true",
+                         help="restore drill: give the copy a new database_id (never uploads)")
     sub.add_parser("list", help="list snapshots in R2")
+    sub.add_parser("has-backups", help="exit 0 if R2 has latest.json, 3 if not")
     sub.add_parser("now", help="run one backup cycle now")
     sub.add_parser("status", help="show backup status")
     adopt = sub.add_parser("adopt", help="make this database the backups' owner")
@@ -869,7 +904,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "init":
             cmd_init(path)
         elif args.command == "restore":
-            cmd_restore(path, make_client(), key=args.key)
+            cmd_restore(path, make_client(), key=args.key, drill=args.drill)
+        elif args.command == "has-backups":
+            return 0 if cmd_has_backups(make_client()) else 3
         elif args.command == "list":
             cmd_list(make_client())
         elif args.command == "now":

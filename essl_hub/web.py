@@ -16,20 +16,25 @@ from .routes.common import SESSION_COOKIE, _htmx_partial, _theme, current_sync_h
 _logger = logging.getLogger(__name__)
 
 
-def _prepare_database(database: Database) -> None:
+def _prepare_database(database: Database) -> bool:
     """Boot steps on the local file: the web app is the schema owner (KTD8),
     so it migrates and seeds, then checks the bootstrap admin. A busy or
-    unavailable database skips a step with a log line so serving still starts."""
+    unavailable database skips a step with a log line so serving still starts;
+    returns False then, so the steps run again on the next request."""
+    ok = True
     try:
         database.initialize(DEVICES)
     except OfflineError as exc:
         _logger.warning("Database unavailable; schema migration and seeding skipped: %s", exc)
+        ok = False
     # Web process only: the collector never grants roles or reads the bootstrap
     # address, so it stays independent of dashboard configuration (R10, R14).
     try:
         database.ensure_bootstrap_admin(config.bootstrap_admin_email())
     except OfflineError as exc:
         _logger.warning("Database unavailable; bootstrap admin check skipped: %s", exc)
+        ok = False
+    return ok
 
 
 def create_app(database: Database | None = None) -> Flask:
@@ -54,10 +59,10 @@ def create_app(database: Database | None = None) -> Flask:
         with ready_lock:
             if not ready["done"]:
                 try:
-                    _prepare_database(database)
+                    # Busy/offline: serve anyway, retry the boot steps next request.
+                    ready["done"] = _prepare_database(database)
                 except DatabaseMissing:
                     return False
-                ready["done"] = True
         return True
 
     if not ensure_prepared():
