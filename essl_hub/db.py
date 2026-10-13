@@ -4,28 +4,21 @@ import json
 import logging
 import os
 import re
-import socket
 import threading
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Iterable, Iterator
-from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import libsql
 
-from .config import DeviceConfig, TIMEZONE_NAME, db_path, turso_settings
+from .config import DeviceConfig, TIMEZONE_NAME, db_path
 
 _TZ = ZoneInfo(TIMEZONE_NAME)
 _logger = logging.getLogger(__name__)
 
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 SCHEMA_VERSION = 6
-
-# Seconds the TCP probe waits before calling the primary unreachable. libsql's
-# own replica connect can block ~134s holding the GIL on a black-holed address
-# (U8), so it is never attempted without a successful probe first.
-PROBE_TIMEOUT_SECONDS = 3.0
 
 # libsql exposes no declared column types (U8), so read-side conversion is by
 # column name. Every TIMESTAMP column in the schema is listed here.
@@ -59,8 +52,8 @@ class IntegrityError(Exception):
 
 
 class OfflineError(Exception):
-    """A write could not reach the Turso primary, or the database is unavailable
-    because it is offline with no local replica (KTD6, KTD11)."""
+    """The database is temporarily unavailable; callers answer 503 or spool.
+    BusyError is the case the local file raises (KTD6)."""
 
 
 class BusyError(OfflineError):
@@ -200,56 +193,11 @@ def _parse_timestamp(value: object) -> datetime | None:
     return parsed.replace(microsecond=0)
 
 
-def primary_reachable(sync_url: str, timeout: float = PROBE_TIMEOUT_SECONDS) -> bool:
-    """Fast TCP probe of the sync URL's host, so a dead network costs seconds,
-    not a GIL-holding libsql connect."""
-    parsed = urlparse(sync_url)
-    if not parsed.hostname:
-        return False
-    port = parsed.port or (80 if parsed.scheme in ("http", "ws") else 443)
-    try:
-        socket.create_connection((parsed.hostname, port), timeout=timeout).close()
-    except OSError:
-        return False
-    return True
-
-
-# Replica freshness (stale-replica self-heal). libsql 0.1.11 replicas can stop
-# advancing after Turso rolls to a new generation, while sync() still returns
-# cleanly. After each sync we compare these watermarks with what the primary
-# reported at the previous check: anything committed then must be local now.
-FRESHNESS_SQL = (
-    "SELECT (SELECT coalesce(max(rowid), 0) FROM punches),"
-    " (SELECT coalesce(max(last_attempt), '') FROM devices WHERE retired_at IS NULL)"
-)
-# Consecutive behind-checks before the replica file is rebuilt from scratch.
-STALE_CHECKS_BEFORE_REBUILD = 2
-_REPLICA_SUFFIXES = ("", "-wal", "-shm", "-info")
-
-
-def remove_replica_files(path: str) -> None:
-    """Delete a replica and its sidecars so the next open bootstraps fresh."""
-    for suffix in _REPLICA_SUFFIXES:
-        try:
-            os.remove(path + suffix)
-        except FileNotFoundError:
-            pass
-
-
-def replica_behind(local: tuple | None, seen_remote: tuple | None) -> bool:
-    """True when the replica lacks something the primary already had."""
-    if local is None or seen_remote is None:
-        return False
-    (local_rowid, local_attempt), (seen_rowid, seen_attempt) = local, seen_remote
-    return (local_rowid or 0) < (seen_rowid or 0) or str(local_attempt or "") < str(seen_attempt or "")
-
-
 class _Cursor:
     """Dict rows over a libsql cursor, with the sqlite3 attributes callers use."""
 
-    def __init__(self, cursor, offline: bool):
+    def __init__(self, cursor):
         self._cursor = cursor
-        self._offline = offline
         self._names = [column[0] for column in cursor.description or ()]
 
     @property
@@ -261,22 +209,20 @@ class _Cursor:
         return self._cursor.lastrowid
 
     def fetchone(self) -> dict[str, object] | None:
-        return _dict_row(self._names, _call(self._cursor.fetchone, self._offline))
+        return _dict_row(self._names, _call(self._cursor.fetchone))
 
     def fetchall(self) -> list[dict[str, object]]:
-        return [_dict_row(self._names, row) for row in _call(self._cursor.fetchall, self._offline)]
+        return [_dict_row(self._names, row) for row in _call(self._cursor.fetchall)]
 
     def __iter__(self) -> Iterator[dict[str, object]]:
         return iter(self.fetchall())
 
 
-def _call(fn, offline: bool, *args):
+def _call(fn, *args):
     try:
         return fn(*args)
     except ValueError as exc:
         mapped = classify_error(exc)
-        if mapped is None and offline and "readonly database" in str(exc):
-            mapped = OfflineError("Turso is unreachable; the database is read-only until it reconnects")
         if mapped is None:
             raise
         raise mapped from exc
@@ -286,9 +232,8 @@ class _Connection:
     """The one shared libsql connection, wrapped so callers keep sqlite3-style
     dict rows and get IntegrityError / OfflineError instead of ValueError."""
 
-    def __init__(self, raw, *, offline: bool = False):
+    def __init__(self, raw):
         self.raw = raw
-        self.offline = offline
         self._trace = None
 
     def set_trace_callback(self, callback) -> None:
@@ -297,18 +242,15 @@ class _Connection:
     def execute(self, sql: str, params: Iterable[object] = ()) -> _Cursor:
         if self._trace is not None:
             self._trace(sql)
-        return _Cursor(_call(self.raw.execute, self.offline, sql, _bind(params)), self.offline)
+        return _Cursor(_call(self.raw.execute, sql, _bind(params)))
 
     def executemany(self, sql: str, rows: Iterable[Iterable[object]]) -> None:
         if self._trace is not None:
             self._trace(sql)
-        _call(self.raw.executemany, self.offline, sql, [_bind(row) for row in rows])
+        _call(self.raw.executemany, sql, [_bind(row) for row in rows])
 
     def commit(self) -> None:
-        _call(self.raw.commit, self.offline)
-
-    def sync(self) -> None:
-        _call(self.raw.sync, self.offline)
+        _call(self.raw.commit)
 
     def close(self) -> None:
         self.raw.close()
@@ -444,7 +386,7 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         """,
         "CREATE INDEX IF NOT EXISTS idx_frappe_sync_status ON frappe_sync_log(status)",
     ),
-    # v3: manual backups removed; Turso keeps point-in-time history (R5).
+    # v3: manual backups table removed (off-site copies are R2 snapshots).
     3: ("DROP TABLE IF EXISTS backups",),
     # v4: the devices table is authoritative (admins add and retire devices).
     # SQLite has no ADD COLUMN IF NOT EXISTS; migrate_schema skips a column
@@ -454,7 +396,7 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         "ALTER TABLE devices ADD COLUMN created_at TIMESTAMP",
     ),
     # v5: sign-in branding images live in the database so they survive
-    # replicas and the nightly export (a host-volume file would not).
+    # snapshots and restores (a host-volume file would not).
     5: (
         """
         CREATE TABLE IF NOT EXISTS branding_assets (
@@ -534,8 +476,8 @@ DEFAULT_DAY_START_HOUR = "6"
 
 
 def _schema_version(connection: Any) -> int:
-    """Higher of PRAGMA user_version and settings.schema_version (Turso cannot
-    write the pragma, so a replica records its version only in settings)."""
+    """Higher of PRAGMA user_version and settings.schema_version (files that
+    came from Turso record their version only in settings)."""
     version = connection.execute("PRAGMA user_version").fetchone()["user_version"]
     has_settings = connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings'"
@@ -552,96 +494,30 @@ def _schema_version(connection: Any) -> int:
 class Database:
     """One libsql connection per process, shared under an RLock (KTD1).
 
-    Local mode (no TURSO_DATABASE_URL, KTD2) opens `path` as a plain file in
-    WAL mode; `must_exist` refuses to create it (DatabaseMissing, KTD5).
-    Replica mode opens `path` as an embedded replica of the Turso primary; if
-    the primary is unreachable at open time it falls back to the existing
-    replica file read-only (`offline` True) and `reconnect()` upgrades later.
+    Opens `path` as a plain local file in WAL mode, shared by the web app and
+    the collector (KTD6); `must_exist` refuses to create it (DatabaseMissing,
+    KTD5).
     """
 
-    def __init__(
-        self,
-        path: str | None = None,
-        *,
-        sync_url: str | None = None,
-        auth_token: str | None = None,
-        read_only: bool = False,
-        must_exist: bool = False,
-    ):
+    def __init__(self, path: str | None = None, *, must_exist: bool = False):
         self.path = path or db_path()
         # Web app and collector: never create the file (KTD5); a missing file
         # raises DatabaseMissing on every use until a backup command makes it.
         self.must_exist = must_exist
-        # Read-only token (nightly export): skip PRAGMA foreign_keys, which a
-        # replica forwards to the primary as a write and Turso then blocks.
-        self.read_only = read_only
-        if sync_url is None:
-            settings = turso_settings()
-            if settings is not None:
-                sync_url, auth_token = settings
-        self.sync_url = sync_url or None
-        self.auth_token = auth_token
-        self.offline = False
-        self.last_sync_ok_at: datetime | None = None
-        self.last_sync_error: str | None = None
         self._lock = threading.RLock()
         self._conn: _Connection | None = None
-        self._stop = threading.Event()
-        self.last_rebuild_at: datetime | None = None
-        self._remote = None
-        self._remote_seen: tuple | None = None
-        self._behind_checks = 0
-
-    @property
-    def replica(self) -> bool:
-        return self.sync_url is not None
-
-    def _open_replica(self) -> _Connection | None:
-        """Replica connection, or None when the primary is unreachable. Probes
-        first so a dead network never reaches libsql's blocking connect."""
-        if not primary_reachable(self.sync_url):
-            return None
-        try:
-            raw = libsql.connect(
-                self.path,
-                sync_url=self.sync_url,
-                auth_token=self.auth_token,
-                isolation_level=None,
-            )
-        except ValueError as exc:
-            if not isinstance(classify_error(exc), OfflineError):
-                raise
-            _logger.warning("Turso replica connect failed: %s", exc)
-            return None
-        if not self.read_only:
-            raw.execute("PRAGMA foreign_keys=ON")
-        return _Connection(raw)
 
     def _open(self) -> _Connection:
-        if not self.replica:
-            if self.must_exist and not os.path.exists(self.path):
-                raise DatabaseMissing(f"{self.path} does not exist")
-            raw = libsql.connect(self.path, isolation_level=None)
-            # Two processes share the file (KTD6): WAL so readers never block
-            # the writer, NORMAL sync (safe under WAL), bounded lock waits.
-            raw.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-            raw.execute("PRAGMA journal_mode=WAL")
-            raw.execute("PRAGMA synchronous=NORMAL")
-            raw.execute("PRAGMA foreign_keys=ON")
-            return _Connection(raw)
-        connection = self._open_replica()
-        if connection is not None:
-            self.offline = False
-            return connection
-        self.offline = True
-        if not os.path.exists(self.path):
-            raise OfflineError("Turso is unreachable and no local replica file exists yet")
-        _logger.warning("Turso unreachable; serving %s read-only until it reconnects", self.path)
-        # Degraded: plain local open of the replica file. query_only keeps it
-        # untouched so the later replica connect sees a clean file.
+        if self.must_exist and not os.path.exists(self.path):
+            raise DatabaseMissing(f"{self.path} does not exist")
         raw = libsql.connect(self.path, isolation_level=None)
-        raw.execute("PRAGMA query_only=ON")
-        return _Connection(raw, offline=True)
+        # Two processes share the file (KTD6): WAL so readers never block
+        # the writer, NORMAL sync (safe under WAL), bounded lock waits.
+        raw.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        raw.execute("PRAGMA journal_mode=WAL")
+        raw.execute("PRAGMA synchronous=NORMAL")
+        raw.execute("PRAGMA foreign_keys=ON")
+        return _Connection(raw)
 
     def exists(self) -> bool:
         return os.path.exists(self.path)
@@ -652,28 +528,8 @@ class Database:
                 self._conn = self._open()
             return self._conn
 
-    def reconnect(self) -> bool:
-        """Upgrade a degraded (or unopened) replica to a live one. Never blocks
-        on a dead network; True when a live connection is in place."""
-        if not self.replica:
-            return True
-        with self._lock:
-            if self._conn is not None and not self.offline:
-                return True
-            connection = self._open_replica()
-            if connection is None:
-                return False
-            if self._conn is not None:
-                self._conn.close()
-            self._conn = connection
-            self.offline = False
-            _logger.info("Turso replica connection established")
-            return True
-
     def close(self) -> None:
-        self._stop.set()
         with self._lock:
-            self._remote = None
             if self._conn is not None:
                 self._conn.close()
                 self._conn = None
@@ -687,11 +543,9 @@ class Database:
     @contextmanager
     def transaction(self) -> Iterator[_Connection]:
         """Write context: explicit BEGIN IMMEDIATE on the autocommit connection
-        (KTD7). Refused up front while degraded so nothing lands locally."""
+        (KTD7)."""
         with self._lock:
             connection = self._connection()
-            if self.offline:
-                raise OfflineError("Turso is unreachable; writes are paused until it reconnects")
             connection.execute("BEGIN IMMEDIATE")
             try:
                 yield connection
@@ -702,90 +556,6 @@ class Database:
                     _logger.exception("ROLLBACK failed")
                 raise
             connection.commit()
-
-    def sync(self) -> bool:
-        """Pull the primary into the replica (KTD4). Records the outcome on
-        last_sync_ok_at / last_sync_error and never raises. No-op locally."""
-        if not self.replica:
-            return True
-        with self._lock:
-            try:
-                if not self.reconnect():
-                    raise OfflineError("Turso is unreachable")
-                if not primary_reachable(self.sync_url):
-                    raise OfflineError("Turso is unreachable")
-                self._conn.sync()
-                self._check_freshness()
-            except Exception as exc:  # noqa: BLE001 - recorded, never fatal
-                self.last_sync_error = str(exc) or type(exc).__name__
-                _logger.warning("Turso sync failed: %s", self.last_sync_error)
-                return False
-            self.last_sync_ok_at = _now()
-            self.last_sync_error = None
-            return True
-
-    def _watermarks(self, connection) -> tuple | None:
-        try:
-            row = connection.execute(FRESHNESS_SQL).fetchone()
-        except Exception as exc:  # noqa: BLE001 - no schema yet, or a blip
-            _logger.debug("freshness probe failed: %s", exc)
-            return None
-        return tuple(row.values()) if isinstance(row, dict) else tuple(row)
-
-    def _remote_watermarks(self) -> tuple | None:
-        try:
-            if self._remote is None:
-                self._remote = libsql.connect(self.sync_url, auth_token=self.auth_token)
-            return self._watermarks(self._remote)
-        except Exception as exc:  # noqa: BLE001 - skip this check, retry next sync
-            _logger.debug("remote freshness probe failed: %s", exc)
-            self._remote = None
-            return None
-
-    def _check_freshness(self) -> None:
-        """Rebuild the replica when it stays behind the primary (see FRESHNESS_SQL)."""
-        local = self._watermarks(self._conn)
-        if replica_behind(local, self._remote_seen):
-            self._behind_checks += 1
-            _logger.warning(
-                "Turso replica %s behind primary (local %s, primary had %s), check %d",
-                self.path, local, self._remote_seen, self._behind_checks,
-            )
-            if self._behind_checks >= STALE_CHECKS_BEFORE_REBUILD:
-                self.rebuild_replica()
-        else:
-            self._behind_checks = 0
-        self._remote_seen = self._remote_watermarks()
-
-    def rebuild_replica(self) -> None:
-        """Drop the replica file and bootstrap a fresh one from the primary."""
-        with self._lock:
-            if self._conn is not None:
-                self._conn.close()
-                self._conn = None
-            remove_replica_files(self.path)
-            self._behind_checks = 0
-            self._remote_seen = None
-            connection = self._open_replica()
-            if connection is None:
-                raise OfflineError("Turso became unreachable while rebuilding the replica")
-            self._conn = connection
-            self.offline = False
-            self.last_rebuild_at = _now()
-            _logger.warning("Turso replica %s rebuilt from the primary", self.path)
-
-    def start_sync_loop(self, interval: float) -> threading.Thread | None:
-        """Daemon thread calling sync() every `interval` seconds; None locally."""
-        if not self.replica:
-            return None
-
-        def loop() -> None:
-            while not self._stop.wait(interval):
-                self.sync()
-
-        thread = threading.Thread(target=loop, name="turso-sync", daemon=True)
-        thread.start()
-        return thread
 
     def migrate_schema(self) -> None:
         """Bring the schema to SCHEMA_VERSION; no seeding (KTD8). Every step is
@@ -801,15 +571,14 @@ class Database:
                 if version < target:
                     for statement in MIGRATIONS[target]:
                         _run_migration_statement(connection, statement)
-            # Turso rejects PRAGMA writes, so the version lives in settings;
-            # local files (tests, migrate_postgres output) also get the pragma.
+            # The version lives in settings (older files only had it there)
+            # and in the pragma.
             connection.execute(
                 "INSERT INTO settings (key, value) VALUES ('schema_version', ?) "
                 "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
                 (str(SCHEMA_VERSION),),
             )
-            if not self.replica:
-                connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     create_schema = migrate_schema
 
@@ -962,9 +731,9 @@ class Database:
         return self._unseen(punches)
 
     def _unseen(self, punches: Iterable[dict[str, object]]) -> list[dict[str, object]]:
-        """Drop punches the replica already holds. Devices return their whole
-        history every poll; this read is local, so only new rows go to Turso.
-        A stale replica only costs extra rows that ON CONFLICT then ignores."""
+        """Drop punches the database already holds. Devices return their whole
+        history every poll, so only new rows are written; ON CONFLICT covers
+        any race."""
         punches = list(punches)
         if not punches:
             return punches
@@ -981,8 +750,8 @@ class Database:
 
     def _insert_chunks(self, punches: list[dict[str, object]]) -> tuple[int, list[dict[str, object]]]:
         """Commit all but the last PUNCH_TX_ROWS-sized chunk in their own
-        transactions, so a first-run backlog never holds Turso's write lock
-        for minutes. Inserts are idempotent, so a partial run is safe to
+        transactions, so a first-run backlog never holds the shared write
+        lock for long (the web waits at most busy_timeout). Inserts are idempotent, so a partial run is safe to
         repeat. Returns (rows inserted, last chunk for the caller's tx)."""
         inserted = 0
         while len(punches) > PUNCH_TX_ROWS:
@@ -1010,8 +779,8 @@ class Database:
         ]
         if not updates:
             return 0
-        # Local read first: a history download is the device's whole log, and
-        # each UPDATE on a replica is a Turso round trip.
+        # Read first: a history download is the device's whole log, so only
+        # rows still missing a direction are updated.
         with self.connect() as connection:
             missing = {
                 row["fingerprint"]
@@ -1332,7 +1101,7 @@ class Database:
     def set_employee_role(self, employee_id: int, role: str) -> None:
         """Guarded in one statement (KTD7): the admin count is evaluated by the
         UPDATE itself on the primary, so two concurrent demotions cannot both
-        succeed and a stale replica read cannot let one through."""
+        succeed and a stale read cannot let one through."""
         with self.transaction() as connection:
             cursor = connection.execute(
                 """
@@ -1747,8 +1516,7 @@ _PUNCH_COLUMNS = (
     "event_timestamp, raw_state, door, reader, raw_direction_byte, "
     "trusted_direction, raw_json, collected_at"
 )
-# Rows per INSERT. Each statement on a replica is a round trip to Turso
-# (~130 ms measured), so a device's full history must not go row by row.
+# Rows per INSERT, so a device's full history does not go row by row.
 # 100 rows x 14 params stays far under SQLite's bound-parameter limit.
 PUNCH_INSERT_BATCH = 100
 # Rows per write transaction (~10 statements, a few seconds of write lock).

@@ -59,7 +59,7 @@ def request_code(
     is ever demonstrated to matter in practice.
 
     The login-code row is written before any mail goes out, so an OfflineError
-    (Turso unreachable, KTD11) propagates to the app's 503 offline page and no
+    (database busy) propagates to the app's 503 offline page and no
     code is ever emailed that the verify step could not find.
     """
     mailer = mailer or mail.send_login_code

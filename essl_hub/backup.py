@@ -575,7 +575,7 @@ def run_cycle(
 def cmd_init(database_path: str) -> str:
     with backup_lock(database_path):
         _refuse_existing(database_path)
-        database = Database(database_path, sync_url="")
+        database = Database(database_path)
         try:
             database.initialize(config.DEVICES)
             database_id = uuid.uuid4().hex
@@ -730,7 +730,7 @@ def cmd_adopt(
               "any other database are no longer protected from being replaced.")
         if not confirm():
             raise CommandError("adopt cancelled")
-        database = Database(database_path, sync_url="", must_exist=True)
+        database = Database(database_path, must_exist=True)
         try:
             with database.connect() as conn:
                 row = conn.execute(

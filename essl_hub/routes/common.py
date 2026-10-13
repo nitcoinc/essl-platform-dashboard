@@ -296,11 +296,9 @@ def _safe_next(target: str | None, fallback: str) -> str:
     return target
 
 
-# --- Turso sync health (R4, KTD12) --------------------------------------
+# --- Sync health: collector and backups (R10) ---------------------------
 
 _TONE_RANK = {"ok": 0, "warn": 1, "bad": 2}
-WEB_SYNC_WARN = timedelta(minutes=5)
-WEB_SYNC_BAD = timedelta(minutes=60)
 COLLECTOR_STALE = timedelta(minutes=10)
 SPOOL_BAD = timedelta(minutes=60)
 BACKUP_WARN_INTERVALS = 2  # green below this many backup intervals since last_ok_at
@@ -328,14 +326,6 @@ def _parse_ts(value: object) -> datetime | None:
 
 def _ist(value: datetime | None) -> str:
     return f"{value.strftime('%d %b %Y, %H:%M:%S')} IST" if value else "never"
-
-
-def _web_signal(last_ok: datetime | None, now: datetime) -> dict:
-    if last_ok is None:
-        return {"tone": "bad", "summary": "Never synced", "label": "Web sync never succeeded"}
-    age = now - last_ok
-    tone = "ok" if age <= WEB_SYNC_WARN else "warn" if age <= WEB_SYNC_BAD else "bad"
-    return {"tone": tone, "summary": f"Last OK {_ago(age)}", "label": f"Web sync {_ago(age)}"}
 
 
 def _collector_signal(status: object, now: datetime) -> dict:
@@ -389,17 +379,14 @@ def _backup_signal(status: object, now: datetime, *, r2_configured: bool, minute
 
 
 def sync_health(
-    web_sync_ok_at: datetime | None,
     collector_status: object,
     backup_status: object,
     now: datetime,
-    local_mode: bool = True,
-    web_rebuilt_at: datetime | None = None,
     *,
     r2_configured: bool = True,
     backup_minutes: int = 15,
 ) -> dict:
-    """Summarise the collector, backups (and, on a replica, web sync) signals.
+    """Summarise the collector and backups signals.
 
     Pure: callers read the status files (missing/corrupt passed as None).
     Each signal gets a tone; the worst wins and the label names it. A neutral
@@ -408,11 +395,6 @@ def sync_health(
     backup = backup_status if isinstance(backup_status, dict) else None
     collector_poll = _parse_ts(collector.get("last_poll")) if collector else None
     details = []
-    if not local_mode:
-        details.append(
-            {"key": "web", "name": "Web replica sync", **_web_signal(web_sync_ok_at, now),
-             "times": [("Last successful sync", _ist(web_sync_ok_at)),
-                       ("Last replica rebuild", _ist(web_rebuilt_at))]})
     details.append(
         {"key": "collector", "name": "Collector", **_collector_signal(collector, now),
          "times": [
@@ -449,12 +431,9 @@ def current_sync_health(db: object) -> tuple[dict, list[dict]]:
     status = raw if isinstance(raw, dict) else None
     entries = [e for e in (status or {}).get("entries") or [] if isinstance(e, dict)]
     health = sync_health(
-        getattr(db, "last_sync_ok_at", None),
         _read_json(config.collector_status_path()),
         status,
         _now_naive(),
-        local_mode=not getattr(db, "replica", False),
-        web_rebuilt_at=getattr(db, "last_rebuild_at", None),
         r2_configured=r2_config() is not None,
         backup_minutes=config.backup_minutes(),
     )

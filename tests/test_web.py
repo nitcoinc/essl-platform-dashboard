@@ -54,25 +54,13 @@ class FakeDatabase:
         self._next_login_code_id = 1
         self.sessions: dict[str, dict] = {}
         self.api_keys_list: list[dict] = []
-        # Local mode by default: no sync loop. `offline` makes every write
-        # raise OfflineError the way a degraded replica does (KTD11).
-        self.replica = False
+        # `offline` makes every write raise OfflineError, the way an
+        # unavailable database does.
         self.offline = False
-        self.sync_calls = 0
-        self.sync_loop_interval = None
-
-    # replica / sync --------------------------------------------------------
-
-    def sync(self) -> bool:
-        self.sync_calls += 1
-        return not self.offline
-
-    def start_sync_loop(self, interval):
-        self.sync_loop_interval = interval
 
     def _check_online(self) -> None:
         if self.offline:
-            raise OfflineError("Turso is unreachable")
+            raise OfflineError("database unavailable")
 
     # devices ------------------------------------------------------------
 
@@ -1872,7 +1860,7 @@ class AdminDeviceLifecycleTest(AdminDeviceEditTest):
         self.assertIsNone(device["retired_at"])
         page = self.client.get("/devices?added=kondapur-c3-400").text
         self.assertIn("Pending", page)
-        self.assertIn("about 6 minutes", page)
+        self.assertIn("about 2 minutes", page)
 
     def test_duplicate_active_address_is_rejected_inline(self) -> None:
         before = set(self.database.devices_by_id)
@@ -2570,7 +2558,7 @@ class BrandingRemovedTest(unittest.TestCase):
 
 
 class OfflineTest(unittest.TestCase):
-    """U9 / KTD11: reads survive a Turso outage, writes get the 503 offline page."""
+    """Reads survive an unavailable database, writes get the 503 offline page."""
 
     # Signed in as admin, like AdminViewTest, without re-running its tests.
     setUp = AdminViewTest.setUp
@@ -2587,7 +2575,6 @@ class OfflineTest(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 503)
         self.assertIn("Temporarily offline", response.text)
-        self.assertIn("Viewing attendance still works", response.text)
         self.assertEqual(self.database.employee_by_id(employee["id"])["role"], "employee")
 
     def test_read_while_offline_still_returns_200(self) -> None:
@@ -2605,7 +2592,7 @@ class OfflineTest(unittest.TestCase):
 
 
 class StartupTest(unittest.TestCase):
-    """U9 / KTD3, KTD4, KTD8: boot steps that need the primary never block serving."""
+    """KTD8: boot steps that fail on an unavailable database never block serving."""
 
     def test_offline_boot_with_bootstrap_admin_logs_and_serves(self) -> None:
         database = FakeDatabase()
@@ -2619,22 +2606,10 @@ class StartupTest(unittest.TestCase):
         self.assertEqual(database.employee_by_email("boss@example.com")["role"], "employee")
         self.assertEqual(app.test_client().get("/signin").status_code, 200)
 
-    def test_startup_syncs_before_migrating(self) -> None:
+    def test_startup_migrates_and_seeds(self) -> None:
         database = FakeDatabase()
         create_app(database=database)
-        self.assertEqual(database.sync_calls, 1)
         self.assertTrue(database.devices_by_id)
-
-    def test_sync_loop_starts_only_in_replica_mode(self) -> None:
-        local = FakeDatabase()
-        create_app(database=local)
-        self.assertIsNone(local.sync_loop_interval)
-
-        replica = FakeDatabase()
-        replica.replica = True
-        with patch.dict(os.environ, {"TURSO_SYNC_SECONDS": ""}):
-            create_app(database=replica)
-        self.assertEqual(replica.sync_loop_interval, 300)
 
 
 class DatabaseSetupTest(unittest.TestCase):
@@ -2651,7 +2626,7 @@ class DatabaseSetupTest(unittest.TestCase):
     def _app(self):
         from essl_hub.db import Database
 
-        app = create_app(database=Database(self.path, sync_url="", must_exist=True))
+        app = create_app(database=Database(self.path, must_exist=True))
         app.testing = True
         return app
 
@@ -2681,7 +2656,7 @@ class DatabaseSetupTest(unittest.TestCase):
                 app = self._app()
             client = app.test_client()
             # A backup command creates the file while the web app is running.
-            creator = Database(self.path, sync_url="")
+            creator = Database(self.path)
             creator.migrate_schema()
             creator.upsert_employee(device_user_id="1", name="Boss", email="boss@example.com")
             creator.close()
@@ -3611,16 +3586,14 @@ class SyncHealthTest(unittest.TestCase):
 
     NOW = datetime(2026, 10, 10, 12, 0, 0)
 
-    def _health(self, web=timedelta(minutes=1), collector="ok", backup="ok", local=True, r2=True):
+    def _health(self, collector="ok", backup="ok", r2=True):
         from essl_hub.routes.common import sync_health
 
         if collector == "ok":
             collector = self._collector()
         if backup == "ok":
             backup = self._backup(timedelta(minutes=10))
-        web_at = None if web is None else self.NOW - web
-        return sync_health(web_at, collector, backup, self.NOW, local_mode=local,
-                           r2_configured=r2, backup_minutes=15)
+        return sync_health(collector, backup, self.NOW, r2_configured=r2, backup_minutes=15)
 
     def _collector(self, age=timedelta(minutes=1), depth=0, oldest=None, dead=0):
         return {
@@ -3702,10 +3675,6 @@ class SyncHealthTest(unittest.TestCase):
         health = self._health(backup=self._backup(timedelta(minutes=40)), collector=self._collector(dead=2))
         self.assertEqual((health["tone"], health["signal"]), ("bad", "collector"))
         self.assertEqual(health["label"], "Collector: 2 dead punches")
-
-    def test_replica_mode_adds_web_signal(self) -> None:
-        health = self._health(local=False, web=timedelta(minutes=30))
-        self.assertEqual((health["tone"], health["signal"]), ("warn", "web"))
 
 
 class BrandIconsTest(unittest.TestCase):

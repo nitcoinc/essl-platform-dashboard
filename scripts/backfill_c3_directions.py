@@ -9,7 +9,7 @@ It never guesses: a row with no history match stays NULL.
     python scripts/backfill_c3_directions.py           # dry run: prints the counts
     python scripts/backfill_c3_directions.py --apply   # writes them
 
-Uses ESSL_DB_PATH / TURSO_* and the device passwords like the apps. Safe to
+Uses ESSL_DB_PATH (the local file) and the device passwords like the apps. Safe to
 re-run: only rows that are still NULL are touched.
 """
 
@@ -57,12 +57,7 @@ def main(argv: list[str] | None = None, *, database: Database | None = None, dow
 
     own = database is None
     if own:
-        database = Database(
-            os.getenv("ESSL_DB_PATH", "data/essl.db"),
-            sync_url=os.getenv("TURSO_DATABASE_URL", ""),
-            auth_token=os.getenv("TURSO_AUTH_TOKEN", ""),
-        )
-        database.sync()
+        database = Database(os.getenv("ESSL_DB_PATH", "data/essl.db"), must_exist=True)
     # Every non-retired C3 row in the DB, not just the seeded ones.
     rows = database.device_connection_info()
     c3_devices = [d for d in merge_device_configs(DEVICES, rows) if d.protocol == "c3-pullsdk"]
@@ -84,7 +79,6 @@ def main(argv: list[str] | None = None, *, database: Database | None = None, dow
     )
     if args.apply and repairs:
         updated = database.fill_punch_directions(repairs)  # one transaction
-        database.sync()
         print(f"applied: {updated} updated")
     if own:
         database.close()

@@ -20,7 +20,7 @@ from .config import (
     heartbeat_write_seconds,
     spool_path,
 )
-from .db import SETUP_COMMANDS, BusyError, Database, DatabaseMissing
+from .db import SETUP_COMMANDS, Database, DatabaseMissing, OfflineError
 from .spool import Spool
 from . import frappe_sync
 
@@ -100,8 +100,8 @@ class PollState:
     """In-memory collector state (KTD11).
 
     ``written`` holds the device-row state last committed, so an unchanged idle
-    poll writes nothing. ``ready`` turns True once the Turso boot work (initial
-    sync, schema, seed) has succeeded (KTD10)."""
+    poll writes nothing. ``ready`` turns True once the boot work (schema,
+    seed) has succeeded (KTD10)."""
 
     heartbeat_seconds: float = 900
     clock: Callable[[], float] = time.monotonic
@@ -163,7 +163,7 @@ def collect_once(
     version = state.connection_versions.get(device.id)
     last = state.written.get(device.id)
     # Devices return their whole history every poll, so "no events" never
-    # held; skip on "nothing new" (a local replica read) instead.
+    # held; skip on "nothing new" (a local read) instead.
     if (
         last is not None
         and write.get("transport") != "TCP history"
@@ -205,28 +205,25 @@ def collect_once(
     state.written[device.id] = _Written(status_key, version, now)
 
 
-def _turso_healthy(database: Database) -> bool:
-    return not getattr(database, "offline", False) and getattr(database, "last_sync_error", None) is None
-
-
 def _transient(exc: BaseException) -> bool:
-    """Busy lock or missing file: retry later, never dead-letter (KTD5, KTD6)."""
-    return isinstance(exc, (BusyError, DatabaseMissing))
+    """Busy lock, unavailable or missing file: retry later, never dead-letter
+    (KTD5, KTD6)."""
+    return isinstance(exc, (OfflineError, DatabaseMissing))
 
 
 def replay_spool(database: Database, spool: Spool) -> int:
     """Replay spooled batches oldest-first (KTD9); returns batches written.
 
-    A failure while Turso looks healthy counts toward the dead-letter limit
-    and replay moves on; a failure while offline stops replay uncounted."""
+    A permanent failure counts toward the dead-letter limit and replay moves
+    on; a transient one (busy, missing file) stops replay uncounted."""
     written = 0
     for entry in spool.pending():
         try:
             database.insert_punches(entry.punches)
         except Exception as exc:
             error = str(exc) or type(exc).__name__
-            if _transient(exc) or not _turso_healthy(database):
-                _logger.warning("spool replay paused while Turso is unreachable: %s", error)
+            if _transient(exc):
+                _logger.warning("spool replay paused, database unavailable: %s", error)
                 break
             if spool.fail(entry.id, error):
                 _logger.error(
@@ -266,14 +263,6 @@ def ensure_ready(database: Database, state: PollState) -> bool:
     return True
 
 
-def _iso(value: object) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.isoformat(sep=" ")
-    return str(value)
-
-
 def write_status(path: str, status: dict) -> None:
     """Write ``status`` as JSON atomically: temp file in the same directory,
     then rename (KTD12)."""
@@ -297,13 +286,10 @@ def write_status(path: str, status: dict) -> None:
 def collector_status(database: Database, spool: Spool, state: PollState) -> dict:
     return {
         "last_poll": state.last_poll,
-        "last_sync_ok_at": _iso(getattr(database, "last_sync_ok_at", None)),
-        "last_sync_error": getattr(database, "last_sync_error", None),
-        "replica_rebuilt_at": _iso(getattr(database, "last_rebuild_at", None)),
         "spool_depth": spool.depth(),
         "spool_oldest_at": spool.oldest_at(),
         "dead_count": spool.dead_count(),
-        "offline": bool(getattr(database, "offline", False)) or not state.ready,
+        "offline": not state.ready,
     }
 
 
@@ -379,7 +365,7 @@ def main() -> None:
     # lazily, local only, and is never created here (KTD5); run_cycle
     # retries the boot work each cycle until the file exists.
     spool = Spool(spool_path())
-    database = Database(sync_url="", must_exist=True)
+    database = Database(must_exist=True)
     frappe = None
     frappe_config = frappe_sync.config_from_env()
     if frappe_config is not None:

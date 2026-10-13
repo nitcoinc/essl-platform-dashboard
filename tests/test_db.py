@@ -284,19 +284,6 @@ class DatabaseTest(unittest.TestCase):
         self._retire("gachibowli-c3-400")
         self.assertEqual(self.database.min_device_last_success(), recent)
 
-    def test_freshness_watermark_ignores_retired_devices(self) -> None:
-        with self.database.transaction() as connection:
-            connection.execute(
-                "UPDATE devices SET last_attempt='2026-10-12 09:00:00' WHERE id='uppal-x990'"
-            )
-            connection.execute(
-                "UPDATE devices SET last_attempt='2026-10-12 10:00:00' WHERE id='gachibowli-c3-400'"
-            )
-        self._retire("gachibowli-c3-400")
-        with self.database.connect() as connection:
-            marks = self.database._watermarks(connection)
-        self.assertEqual(str(marks[1]), "2026-10-12 09:00:00")
-
     def test_v3_to_v4_adds_device_columns_keeps_rows_and_reruns_safely(self) -> None:
         self.database.close()
         path = os.path.join(self._tmp.name, "v3.db")
@@ -564,7 +551,7 @@ class DatabaseTest(unittest.TestCase):
                 connection.set_trace_callback(None)
         return statements
 
-    def test_record_poll_skips_punches_the_replica_already_has(self) -> None:
+    def test_record_poll_skips_punches_already_stored(self) -> None:
         # Devices return their full history each poll; known rows never reach Turso.
         history = [self._punch(fingerprint=f"h{i}") for i in range(5)]
         self.database.insert_punches(history)
@@ -932,7 +919,7 @@ class DatabaseTest(unittest.TestCase):
         self.assertEqual(version, db_module.SCHEMA_VERSION)
 
     def test_settings_schema_version_counts_without_pragma(self) -> None:
-        # Turso replicas cannot write PRAGMA user_version; settings carries it.
+        # Files from Turso carry the version only in settings.
         with self.database.transaction() as connection:
             connection.execute("PRAGMA user_version=0")
             connection.execute(
@@ -978,11 +965,6 @@ class DatabaseTest(unittest.TestCase):
         reader.start()
         reader.join()
         self.assertEqual(seen, ["1"])
-
-    def test_sync_is_a_noop_in_local_mode(self) -> None:
-        self.assertTrue(self.database.sync())
-        self.assertIsNone(self.database.start_sync_loop(1))
-        self.assertIsNone(self.database.last_sync_error)
 
     def test_classifier_maps_sample_messages(self) -> None:
         classify = db_module.classify_error
@@ -1046,153 +1028,6 @@ class DatabaseTest(unittest.TestCase):
         self.assertIsNone(self.database.device_by_id("kondapur-c3-400")["retired_at"])
 
 
-class ReplicaModeTest(unittest.TestCase):
-    """Replica-mode branches with the network faked out: no Turso needed."""
-
-    URL = "libsql://example.turso.io"
-
-    def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.path = os.path.join(self._tmp.name, "replica.db")
-
-    def _replica(self) -> db_module.Database:
-        database = db_module.Database(self.path, sync_url=self.URL, auth_token="t")
-        self.addCleanup(database.close)
-        return database
-
-    def test_degraded_mode_reads_existing_file_and_refuses_writes(self) -> None:
-        local = db_module.Database(self.path, sync_url="")
-        local.initialize(())
-        local.set_setting("k", "v")
-        local.close()
-        database = self._replica()
-        with mock.patch.object(db_module, "primary_reachable", return_value=False), \
-                mock.patch.object(db_module.libsql, "connect", wraps=db_module.libsql.connect) as connect:
-            self.assertEqual(database.setting("k"), "v")
-            self.assertTrue(database.offline)
-            self.assertNotIn("sync_url", connect.call_args.kwargs)
-            with self.assertRaises(db_module.OfflineError):
-                database.set_setting("k", "w")
-            with self.assertRaises(db_module.OfflineError):
-                with database.connect() as connection:
-                    connection.execute("UPDATE settings SET value='w'")
-            self.assertFalse(database.reconnect())
-            self.assertFalse(database.sync())
-        self.assertEqual(database.setting("k"), "v")
-        self.assertIsNotNone(database.last_sync_error)
-
-    def test_offline_without_replica_file_is_unavailable(self) -> None:
-        database = self._replica()
-        with mock.patch.object(db_module, "primary_reachable", return_value=False):
-            with self.assertRaises(db_module.OfflineError):
-                database.setting("k")
-        self.assertFalse(os.path.exists(self.path))
-
-    def test_failed_sync_records_error_and_does_not_raise(self) -> None:
-        raw = mock.MagicMock()
-        raw.sync.side_effect = ValueError("sync error: http dispatch error: boom")
-        database = self._replica()
-        with mock.patch.object(db_module, "primary_reachable", return_value=True), \
-                mock.patch.object(db_module.libsql, "connect", return_value=raw):
-            self.assertFalse(database.sync())
-        self.assertIn("boom", database.last_sync_error)
-        self.assertIsNone(database.last_sync_ok_at)
-        raw.sync.side_effect = None
-        with mock.patch.object(db_module, "primary_reachable", return_value=True):
-            self.assertTrue(database.sync())
-        self.assertIsNone(database.last_sync_error)
-        self.assertIsNotNone(database.last_sync_ok_at)
-
-    def _stale_replica_world(self):
-        """Primary file with 2 punches; replica file frozen with 1. The fake
-        replica connect bootstraps by copying the primary when the file is gone."""
-        import shutil
-
-        primary_path = os.path.join(self._tmp.name, "primary.db")
-        primary = db_module.Database(primary_path, sync_url="")
-        primary.initialize((DeviceConfig(
-            id="gachibowli-c3-400", site="Gachibowli", model="C3-400", ip="192.168.1.202",
-            port=4370, protocol="zk-pull", password_env="ESSL_C3_PASSWORD",
-        ),))
-        punch = DatabaseTest._punch
-        primary.insert_punches([punch(self, fingerprint="a")])
-        primary.close()
-        shutil.copy(primary_path, self.path)
-        primary = db_module.Database(primary_path, sync_url="")
-        primary.insert_punches([punch(self, fingerprint="b")])
-        primary.close()
-        real_connect = db_module.libsql.connect
-
-        class Raw:
-            def __init__(self, conn):
-                self._conn = conn
-
-            def __getattr__(self, name):
-                return getattr(self._conn, name)
-
-            def sync(self):  # frozen: never pulls anything
-                return None
-
-        def fake_connect(target, **kwargs):
-            if target == self.URL:
-                return real_connect(primary_path)
-            if "sync_url" in kwargs:
-                if not os.path.exists(target):
-                    shutil.copy(primary_path, target)
-                return Raw(real_connect(target, isolation_level=None))
-            return real_connect(target, **kwargs)
-
-        return fake_connect
-
-    def _count(self, database) -> int:
-        with database.connect() as connection:
-            return connection.execute("SELECT COUNT(*) AS n FROM punches").fetchone()["n"]
-
-    def test_replica_behind_compares_both_watermarks(self) -> None:
-        behind = db_module.replica_behind
-        self.assertFalse(behind(None, (5, "x")))
-        self.assertFalse(behind((5, "b"), None))
-        self.assertFalse(behind((5, "b"), (5, "b")))
-        self.assertFalse(behind((6, "c"), (5, "b")))  # ahead is fine
-        self.assertTrue(behind((4, "b"), (5, "b")))
-        self.assertTrue(behind((5, "a"), (5, "b")))
-        self.assertTrue(behind((0, ""), (1, None)))
-
-    def test_stale_replica_is_rebuilt_after_consecutive_behind_checks(self) -> None:
-        database = self._replica()
-        with mock.patch.object(db_module, "primary_reachable", return_value=True), \
-                mock.patch.object(db_module.libsql, "connect", side_effect=self._stale_replica_world()):
-            self.assertTrue(database.sync())  # first check only records the primary
-            self.assertEqual(self._count(database), 1)
-            self.assertTrue(database.sync())  # behind once: wait, could be a race
-            self.assertIsNone(database.last_rebuild_at)
-            self.assertTrue(database.sync())  # behind twice: rebuild
-            self.assertIsNotNone(database.last_rebuild_at)
-            self.assertEqual(self._count(database), 2)
-            self.assertTrue(database.sync())  # now caught up, no second rebuild
-        self.assertEqual(database._behind_checks, 0)
-
-    def test_unreachable_probe_returns_false_quickly(self) -> None:
-        self.assertFalse(db_module.primary_reachable("http://127.0.0.1:9", timeout=1))
-
-
-class TursoConfigTest(unittest.TestCase):
-    def test_url_without_token_fails_naming_the_variable(self) -> None:
-        env = {"TURSO_DATABASE_URL": "libsql://x.turso.io", "TURSO_AUTH_TOKEN": ""}
-        with mock.patch.dict(os.environ, env):
-            with self.assertRaisesRegex(RuntimeError, "TURSO_AUTH_TOKEN"):
-                db_module.Database("unused.db")
-
-    def test_unset_url_is_local_mode(self) -> None:
-        with mock.patch.dict(os.environ, {"TURSO_DATABASE_URL": ""}):
-            self.assertFalse(db_module.Database("unused.db").replica)
-
-
-if __name__ == "__main__":
-    unittest.main()
-
-
 class SharedLocalFileTest(unittest.TestCase):
     """Local-first U1 / KTD5, KTD6: two processes share one WAL file."""
 
@@ -1203,7 +1038,7 @@ class SharedLocalFileTest(unittest.TestCase):
         self.path = os.path.join(tmp.name, "essl.db")
 
     def _open(self, **kwargs) -> db_module.Database:
-        database = db_module.Database(self.path, sync_url="", **kwargs)
+        database = db_module.Database(self.path, **kwargs)
         self.addCleanup(database.close)
         return database
 
@@ -1256,3 +1091,7 @@ class SharedLocalFileTest(unittest.TestCase):
         database = self._open(must_exist=True)
         database.initialize(())
         self.assertEqual(database.setting("schema_version"), str(db_module.SCHEMA_VERSION))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -12,7 +12,7 @@ Four roles:
 
 - **employee** checks their own punches, effective hours and progress against the daily target. Lands on Today.
 - **manager** does the same, plus sees and exports the hours of everyone who reports to them, directly or indirectly. Lands on Team.
-- **hr** sees and exports every employee, manages the Directory (roster file import, add, edit, archive and restore, managers, roles up to hr), and reads device health. Nobody takes backups by hand: Turso keeps point-in-time history and a nightly export lands in R2. Lands on Employees.
+- **hr** sees and exports every employee, manages the Directory (roster file import, add, edit, archive and restore, managers, roles up to hr), and reads device health. Nobody takes backups by hand: a scrubbed snapshot of the database lands in R2 every 15 minutes, plus one kept per day. Lands on Employees.
 - **admin** has everything hr has, plus grants admin, adds, edits, retires and re-enables devices, and sets the daily target and HRMS API keys.
 
 Vocabulary: **Employees** is the HR/admin hours list (managers see the same page as **Team**); **Directory** is the list of people under People. Never "Everyone" or "Roster" for either; "roster" means only the import file.
@@ -25,11 +25,11 @@ Turn raw eSSL door-scanner punches into gross and effective hours per employee, 
 
 ## Positioning
 
-One system understands both eSSL device families — the X990 attendance protocol and the C3 access-controller protocol — and computes hours from their raw punches on every read, so a correction to the hours rule fixes every past day at once. Everything runs on one Linux host in the office: a collector that talks to the devices over the private network, the dashboard, and a nightly read-only export to Cloudflare R2. The database itself lives in Turso (hosted libSQL); each service keeps a local replica. People reach the dashboard from anywhere through a Cloudflare Tunnel; a read-only API feeds the customer's HRMS.
+One system understands both eSSL device families — the X990 attendance protocol and the C3 access-controller protocol — and computes hours from their raw punches on every read, so a correction to the hours rule fixes every past day at once. Everything runs on one Linux host in the office: a collector that talks to the devices over the private network, the dashboard, and a backup service that snapshots the database to Cloudflare R2 every 15 minutes. The database is one local SQLite file on the host, shared by the collector and the dashboard. People reach the dashboard from anywhere through a Cloudflare Tunnel; a read-only API feeds the customer's HRMS.
 
 ## Operating Context
 
-One Docker Compose stack on an office Linux host with routes to `192.168.1.201` (Uppal) and `192.168.1.202` (Gachibowli); device protocols are used only from that private network. Data lives in Turso; each service reads from its own embedded replica on a local volume, so reads keep working when the internet drops (writes show an offline page, and the collector spools punches until Turso is back). The dashboard has no published port; it is reachable only through the tunnel. Employees sign in with a work email and an emailed six-digit code — there is no password.
+One Docker Compose stack on an office Linux host with routes to `192.168.1.201` (Uppal) and `192.168.1.202` (Gachibowli); device protocols are used only from that private network. Data lives in one local SQLite file on the host's data folder, so everything except emailed sign-in codes and the off-site backup keeps working when the internet drops, and a punch shows on the dashboard as soon as the collector stores it. The dashboard has no published port; it is reachable only through the tunnel. Employees sign in with a work email and an emailed six-digit code — there is no password.
 
 ## Capabilities and Constraints
 
@@ -39,8 +39,8 @@ One Docker Compose stack on an office Linux host with routes to `192.168.1.201` 
 - Punches originate only from these devices. No screen, role, or API creates, edits, or deletes a punch — a broken day is shown as incomplete, not corrected in the app.
 - Hours are always recomputed from stored punches, never stored as a derived value.
 - Device deletion/clearing/reset operations are out of scope and must never be exposed. Retire is the only way to stop polling a device.
-- Communication passwords can be set by an admin on the Devices page; Turso, R2, tunnel and email credentials come only from the server's `.env` (mode 600), never browser fields or source code.
-- Only the nightly export holds an R2 token, scoped to the one export bucket (R2 has no write-only permission; bucket lock protects old exports). It reads Turso with a read-only token.
+- Communication passwords can be set by an admin on the Devices page; R2, tunnel and email credentials come only from the server's `.env` (mode 600), never browser fields or source code.
+- Only the backup service holds an R2 token, scoped to the one backup bucket (R2 has no write-only permission). The dashboard and the collector hold no cloud credentials. Snapshots never contain sessions or sign-in codes.
 
 ## People, device IDs and archive
 

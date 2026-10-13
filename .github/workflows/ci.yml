@@ -1,6 +1,6 @@
 name: CI
 
-# One image serves all app services: collector, web and nightly-export in docker-compose.yml
+# One image serves all app services: collector, web and backup in docker-compose.yml
 # build the same context and differ only in their command and environment.
 # So this workflow builds, smoke-tests and publishes a single image.
 #
@@ -21,11 +21,7 @@ jobs:
   test:
     name: Test suite (local libsql)
     runs-on: ubuntu-latest
-    # Local mode only (KTD2): no Turso URL or tokens, no secrets. The U8
-    # libsql contract test's Turso group skips without TURSO_TEST_*.
-    env:
-      TURSO_DATABASE_URL: ""
-      TURSO_AUTH_TOKEN: ""
+    # Local file only: no cloud credentials or secrets.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

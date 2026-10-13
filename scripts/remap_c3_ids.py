@@ -12,7 +12,7 @@ the same rules the collector now uses, so later history reads dedupe.
     python scripts/remap_c3_ids.py           # dry run: prints the changes
     python scripts/remap_c3_ids.py --apply   # writes them
 
-Uses ESSL_DB_PATH / TURSO_* like the apps. Safe to re-run: unchanged rows are skipped.
+Uses ESSL_DB_PATH (the local file) like the apps. Safe to re-run: unchanged rows are skipped.
 """
 
 from __future__ import annotations
@@ -68,12 +68,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     c3_ids = [d.id for d in DEVICES if d.protocol == "c3-pullsdk"]
-    database = Database(
-        os.getenv("ESSL_DB_PATH", "data/essl.db"),
-        sync_url=os.getenv("TURSO_DATABASE_URL", ""),
-        auth_token=os.getenv("TURSO_AUTH_TOKEN", ""),
-    )
-    database.sync()
+    database = Database(os.getenv("ESSL_DB_PATH", "data/essl.db"), must_exist=True)
     marks = ",".join("?" * len(c3_ids))
     with database.connect() as connection:
         rows = [dict(r) for r in connection.execute(
@@ -105,7 +100,6 @@ def main(argv: list[str] | None = None) -> int:
                     "UPDATE punches SET device_user_id = ?, fingerprint = ? WHERE id = ?",
                     (user_id, fingerprint, row_id),
                 )
-        database.sync()
         print("applied")
     database.close()
     return 0

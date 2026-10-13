@@ -112,40 +112,6 @@ def backup_keep_days() -> int:
     return _positive_int_env("ESSL_BACKUP_KEEP_DAYS", 30)
 
 
-def turso_settings() -> tuple[str, str] | None:
-    """(TURSO_DATABASE_URL, TURSO_AUTH_TOKEN), or None for local mode (KTD2).
-
-    A URL without a token is a startup error rather than a silent fall back to
-    an unsynced local file.
-    """
-    url = os.getenv("TURSO_DATABASE_URL")
-    if url in (None, ""):
-        return None
-    token = os.getenv("TURSO_AUTH_TOKEN")
-    if token in (None, ""):
-        raise RuntimeError("TURSO_AUTH_TOKEN must be set when TURSO_DATABASE_URL is set")
-    return url, token
-
-
-# Web replica pull default; every pull downloads all changed pages (Turso sync quota).
-WEB_SYNC_SECONDS = 300
-
-
-def turso_sync_seconds(default: int) -> int:
-    """Replica sync interval (KTD4); each process passes its own default
-    (web 300, collector 300)."""
-    value = os.getenv("TURSO_SYNC_SECONDS")
-    if value in (None, ""):
-        return default
-    try:
-        parsed = int(value)
-    except ValueError:
-        raise RuntimeError("TURSO_SYNC_SECONDS must be a whole number of seconds") from None
-    if parsed < 1:
-        raise RuntimeError("TURSO_SYNC_SECONDS must be at least 1")
-    return parsed
-
-
 def bootstrap_admin_email() -> str | None:
     """The work email promoted to admin on web boot while no admin exists.
 

@@ -1,6 +1,6 @@
 """libsql contract spike (plan U8, docs/plans/2026-10-10-001-...).
 
-Pins the libsql behaviour the Turso migration relies on, so a libsql upgrade
+Pins the libsql behaviour the local database relies on, so a libsql upgrade
 or swap fails here instead of in production.
 
 Observed with libsql 0.1.11 (bundled SQLite 3.42.0, paramstyle ``qmark``),
@@ -31,27 +31,11 @@ Errors (KTD6)
   ``'UNIQUE constraint failed: p.name'``, ``'FOREIGN KEY constraint failed'``,
   ``'CHECK constraint failed: n>0'``. Classification must be by message
   (``'constraint failed'``), not by type.
-- Network failures are ALSO ``ValueError`` (``'sync error: http dispatch
-  error: ...'``), so type alone cannot separate integrity from offline.
-
-Replica mode, unreachable primary (KTD10, KTD11)
-- ``libsql.connect(path, sync_url=..., auth_token=...)`` performs network
-  I/O at construction and RAISES ``ValueError('sync error: ...')`` when the
-  primary is unreachable -- also with ``offline=True``, and also when the
-  local file already exists with data. No file is created on failure.
-  So reads of an existing replica are NOT possible through a replica-mode
-  connection while offline.
-- Refused port / DNS failure: raises in ~0s. Black-holed address
-  (10.255.255.1): blocks ~134s (OS TCP timeout; ``timeout=`` arg ignored)
-  and HOLDS THE GIL -- other Python threads freeze for the whole duration.
-- Opening the same file as a plain local libsql file (no ``sync_url``)
-  reads it fine. (Not verified against a genuine synced replica with its
-  ``-info`` metadata; needs the Turso group.)
+- "database is locked" is also ``ValueError``; it maps to BusyError.
 
 Backup (KTD14)
 - After a libsql connection writes and closes the file, stdlib
   ``sqlite3.Connection.backup`` reads it and ``integrity_check`` is ``ok``.
-  (Genuine replica file: Turso group / U3.)
 
 Threads (KTD1)
 - One Connection used from several threads works (no thread-affinity
@@ -62,31 +46,13 @@ from __future__ import annotations
 
 import os
 import sqlite3
-import subprocess
-import sys
 import tempfile
-import textwrap
 import threading
 import unittest
-import uuid
 
 import libsql
 
-UNREACHABLE = "http://127.0.0.1:9"
-
-
-def _run_isolated(code: str, timeout: float = 30) -> str:
-    """Run libsql code in a subprocess so a hang (GIL held) can't wedge pytest."""
-    proc = subprocess.run(
-        [sys.executable, "-c", textwrap.dedent(code)],
-        capture_output=True, text=True, timeout=timeout,
-    )
-    if proc.returncode != 0:
-        raise AssertionError(proc.stderr)
-    return proc.stdout.strip()
-
-
-class OfflineContractTest(unittest.TestCase):
+class LocalContractTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -219,152 +185,3 @@ class OfflineContractTest(unittest.TestCase):
         finally:
             src.close()
             dst.close()
-
-    def _replica_connect(self, path: str, extra: str = "") -> str:
-        return _run_isolated(f"""
-            import libsql
-            try:
-                libsql.connect({path!r}, sync_url={UNREACHABLE!r}, auth_token="x"{extra})
-                print("OK")
-            except Exception as e:
-                print(type(e).__name__, "|", e)
-        """)
-
-    def test_replica_connect_raises_when_primary_unreachable(self) -> None:
-        fresh = os.path.join(self._tmp.name, "fresh.db")
-        out = self._replica_connect(fresh)
-        self.assertTrue(out.startswith("ValueError | sync error"), out)
-        self.assertFalse(os.path.exists(fresh))
-
-    def test_replica_connect_raises_even_with_existing_file_and_offline_flag(self) -> None:
-        self.conn.execute("INSERT INTO p (name, n) VALUES ('a', 1)")
-        self.conn.commit()
-        self.conn.close()
-        for extra in ("", ", offline=True"):
-            out = self._replica_connect(self.path, extra)
-            self.assertTrue(out.startswith("ValueError | sync error"), out)
-        # Same file opened locally (no sync_url) is still readable.
-        local = libsql.connect(self.path)
-        self.addCleanup(local.close)
-        self.assertEqual(local.execute("SELECT name FROM p").fetchall(), [("a",)])
-
-
-TURSO_URL = os.environ.get("TURSO_TEST_URL")
-TURSO_TOKEN = os.environ.get("TURSO_TEST_TOKEN")
-TURSO_RO_TOKEN = os.environ.get("TURSO_TEST_RO_TOKEN")
-
-
-@unittest.skipUnless(TURSO_URL and TURSO_TOKEN, "TURSO_TEST_URL/TURSO_TEST_TOKEN not set")
-class TursoContractTest(unittest.TestCase):
-    """Runs against a scratch Turso database. Creates and drops its own table."""
-
-    def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.table = f"u8_{uuid.uuid4().hex[:8]}"
-        self.conn = self._connect("rw.db", TURSO_TOKEN)
-        self.conn.execute(f"CREATE TABLE {self.table}_p (id INTEGER PRIMARY KEY, v TEXT)")
-        self.conn.execute(
-            f"CREATE TABLE {self.table}_c (id INTEGER PRIMARY KEY,"
-            f" pid INT REFERENCES {self.table}_p(id))"
-        )
-        self.conn.commit()
-        self.addCleanup(self._drop)
-
-    def _connect(self, name: str, token: str | None, **kw):
-        return libsql.connect(
-            os.path.join(self._tmp.name, name), sync_url=TURSO_URL, auth_token=token or "", **kw
-        )
-
-    def _drop(self) -> None:
-        self.conn.execute(f"DROP TABLE IF EXISTS {self.table}_c")
-        self.conn.execute(f"DROP TABLE IF EXISTS {self.table}_p")
-        self.conn.commit()
-        self.conn.close()
-
-    def test_read_your_writes_on_one_connection(self) -> None:
-        self.conn.execute(f"INSERT INTO {self.table}_p (v) VALUES ('a')")
-        self.conn.commit()
-        self.assertEqual(
-            self.conn.execute(f"SELECT v FROM {self.table}_p").fetchall(), [("a",)]
-        )
-
-    def test_reads_inside_transaction_see_primary(self) -> None:
-        other = self._connect("other.db", TURSO_TOKEN)
-        self.addCleanup(other.close)
-        other.sync()
-        self.conn.execute(f"INSERT INTO {self.table}_p (v) VALUES ('fresh')")
-        self.conn.commit()
-        # `other` has not synced since the insert; KTD7 assumes reads may be
-        # stale until the first write. Record what actually happens.
-        other.execute("BEGIN")
-        other.execute(f"UPDATE {self.table}_p SET v = v WHERE 0")
-        seen = other.execute(f"SELECT count(*) FROM {self.table}_p").fetchone()
-        other.execute("ROLLBACK")
-        self.assertIn(seen, [(0,), (1,)])
-        print(f"\n[U8] read inside tx after first write saw {seen[0]} row(s)")
-
-    def test_user_version_write_rejected(self) -> None:
-        # Turso refuses PRAGMA writes over Hrana; Database keeps the schema
-        # version in settings.schema_version instead (reads still work).
-        before = self.conn.execute("PRAGMA user_version").fetchone()[0]
-        with self.assertRaises(ValueError) as ctx:
-            self.conn.execute(f"PRAGMA user_version = {before + 1}")
-        self.assertIn("not allowed", str(ctx.exception))
-
-    def test_foreign_keys_enforced_on_forwarded_write(self) -> None:
-        self.conn.execute("PRAGMA foreign_keys=ON")
-        with self.assertRaises(ValueError) as ctx:
-            self.conn.execute(f"INSERT INTO {self.table}_c (pid) VALUES (999)")
-            self.conn.commit()
-        self.assertIn("FOREIGN KEY constraint failed", str(ctx.exception))
-
-    @unittest.skipUnless(TURSO_RO_TOKEN, "TURSO_TEST_RO_TOKEN not set")
-    def test_read_only_token_rejects_writes(self) -> None:
-        ro = self._connect("ro.db", TURSO_RO_TOKEN)
-        self.addCleanup(ro.close)
-        ro.sync()
-        with self.assertRaises(ValueError):
-            ro.execute(f"INSERT INTO {self.table}_p (v) VALUES ('no')")
-            ro.commit()
-
-    @unittest.skipUnless(TURSO_RO_TOKEN, "TURSO_TEST_RO_TOKEN not set")
-    def test_read_only_token_blocks_foreign_keys_pragma(self) -> None:
-        # A replica forwards PRAGMA foreign_keys to the primary as a write, so
-        # Database(read_only=True) (nightly export) must skip it.
-        ro = self._connect("rofk.db", TURSO_RO_TOKEN)
-        self.addCleanup(ro.close)
-        with self.assertRaises(ValueError):
-            ro.execute("PRAGMA foreign_keys=ON")
-            ro.sync()
-        from essl_hub.db import Database
-
-        db = Database(
-            os.path.join(self._tmp.name, "export.db"),
-            sync_url=TURSO_URL,
-            auth_token=TURSO_RO_TOKEN,
-            read_only=True,
-        )
-        self.addCleanup(db.close)
-        self.assertTrue(db.sync(), db.last_sync_error)
-
-
-    def test_rebuild_replica_bootstraps_fresh_copy(self) -> None:
-        from essl_hub.db import Database
-
-        path = os.path.join(self._tmp.name, "rebuild.db")
-        db = Database(path, sync_url=TURSO_URL, auth_token=TURSO_TOKEN)
-        self.addCleanup(db.close)
-        self.assertTrue(db.sync(), db.last_sync_error)
-        db.rebuild_replica()
-        self.assertIsNotNone(db.last_rebuild_at)
-        with db.connect() as connection:
-            tables = connection.execute(
-                "SELECT count(*) AS n FROM sqlite_master WHERE name = ?", (f"{self.table}_p",)
-            ).fetchone()["n"]
-        self.assertEqual(tables, 1)
-        self.assertTrue(db.sync(), db.last_sync_error)
-
-
-if __name__ == "__main__":
-    unittest.main()

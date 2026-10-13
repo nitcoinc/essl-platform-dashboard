@@ -3,13 +3,13 @@
 # eSSL Attendance Hub
 
 **Door-scanner punches in, working hours out.**
-A small, self-hosted attendance dashboard for eSSL X990 and C3-400 devices, backed by Turso and served through Cloudflare.
+A small, self-hosted attendance dashboard for eSSL X990 and C3-400 devices, backed by a local SQLite database with 15-minute backups to Cloudflare R2, served through Cloudflare.
 
 <sub>Built and maintained by the engineering team at <b>NITCO Inc.</b></sub>
 
 ![Python 3.12](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)
 ![Flask](https://img.shields.io/badge/Flask-3.1-000000?logo=flask)
-![Turso libSQL](https://img.shields.io/badge/database-Turso%20libSQL-4FF8D2)
+![SQLite](https://img.shields.io/badge/database-SQLite%20(libSQL)-003B57?logo=sqlite&logoColor=white)
 ![Docker Compose](https://img.shields.io/badge/deploy-Docker%20Compose-2496ED?logo=docker&logoColor=white)
 ![Cloudflare Tunnel](https://img.shields.io/badge/edge-Cloudflare%20Tunnel-F38020?logo=cloudflare&logoColor=white)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
@@ -60,9 +60,9 @@ git clone <this repo> /opt/essl && cd /opt/essl
 The installer walks you through everything:
 
 1. Checks Docker, the compose plugin and the CPU architecture, and says exactly what to run if one is missing.
-2. Creates `.env` (mode 600) and **asks for each missing value**: device IPs and passwords, Turso URL and tokens, R2 keys and a mail provider. A Tunnel token is optional (see [Tunnel](#1-tunnel)). Secrets are typed hidden.
+2. Creates `.env` (mode 600) and **asks for each missing value**: device IPs and passwords, R2 keys and a mail provider. A Tunnel token is optional (see [Tunnel](#1-tunnel)). Secrets are typed hidden.
 3. Generates a one-time **setup token** for the first administrator.
-4. Builds the images and checks the data volume.
+4. Builds the images, prepares the data folder (owner 10001, mode 700) and, on a fresh install, creates the database (`backup init`).
 5. **Tests both door devices** from inside the container (`Network` and `Protocol` must PASS).
 6. Starts the stack, waits until the web app answers, and prints the setup token and next steps.
 
@@ -83,7 +83,7 @@ Run the same command: `./deploy/install.sh`. On an existing install it:
 
 1. Fast-forwards to the latest `main`, then re-runs the new installer. It refuses to pull over local edits to tracked files.
 2. Backs up `.env` to `.env.bak.<time>` (keeps the last 5) and adds any settings the new release introduced, with their defaults.
-3. Uploads a fresh database snapshot to R2 before the schema can change (the nightly export, run once now). If that fails it asks before continuing.
+3. Uploads a fresh database snapshot to R2 before the schema can change (`backup now`). If that fails it asks before continuing. On an install still on Turso it stops here and prints the [upgrade steps](#upgrading-from-turso).
 4. Builds, restarts only changed containers, waits for the web app, and prunes old images. If the web app does not come up, it prints the `git checkout <previous>` command to roll back and exits non-zero.
 
 A lock file stops two runs overlapping. The very first time you move to this installer from an older checkout, run `git pull` once by hand.
@@ -94,10 +94,9 @@ A lock file stops two runs overlapping. The very first time you move to this ins
 | --- | --- | --- |
 | **Linux host, x86_64**, on the office LAN | Runs the stack; must reach both devices on TCP 4370 | Any recent Ubuntu or Debian. The `libsql` client ships x86_64 wheels only |
 | **Docker Engine + compose plugin** | Runs every service | `curl -fsSL https://get.docker.com \| sh` then `sudo usermod -aG docker "$USER" && newgrp docker` |
-| **Turso database** + two tokens | The database (hosted libSQL) | [Turso setup](#turso-setup), done once from a laptop |
 | **Cloudflare account** with your domain on its DNS | Tunnel (no open ports), Turnstile, R2 | [Cloudflare setup](#cloudflare-setup) |
 | **Cloudflare Tunnel**: one already on the host, or a token for the bundled one | The only way in from the internet | [Tunnel](#1-tunnel) |
-| **R2 bucket** + bucket-scoped API token | Nightly export copy | [R2 bucket](#2-r2-bucket-nightly-export) |
+| **R2 bucket** + bucket-scoped API token | Off-site backups every 15 minutes | [R2 bucket](#2-r2-bucket-backups) |
 | **Mail provider**: Resend or Cloudflare Email Sending | Sends sign-in codes | [Sign-in email](#3-sign-in-email) |
 | Device **IP addresses** and **comm passwords** | Pulling punches | Device menu / ZKAccess; `ESSL_X990_IP`, `ESSL_X990_PASSWORD`, `ESSL_C3_IP`, `ESSL_C3_PASSWORD`. Addresses in this README (`192.168.1.201`, `192.168.1.202`) are examples |
 | *Optional:* Turnstile keys, Frappe API key | Bot check on sign-in; Frappe HR push | [Protection](#4-protection-bots-and-ddos), [Frappe HR integration](#frappe-hr-integration) |
@@ -109,16 +108,16 @@ No Python is needed on the host: the installer and the device test run inside th
 | | |
 | --- | --- |
 | Runtime | Python 3.12 (in the image), Flask 3.1, gunicorn, htmx |
-| Database | Turso (libSQL) with an embedded replica per service |
+| Database | One local SQLite file (WAL), shared by web and collector; snapshots to R2 every 15 min |
 | Device libraries | `pyzk` (X990), `zkaccess-c3` plus a built-in chunked reader (C3-400) |
-| Host resources | Small: web + collector use about 140 MB RAM together; 1 vCPU, 1 GB RAM, 2 GB disk is plenty |
-| Network | Outbound HTTPS (Turso, Cloudflare); LAN TCP 4370 to both devices; **no inbound ports** |
+| Host resources | Small: web + collector use about 140 MB RAM together; 1 vCPU, 1 GB RAM, 2 GB disk is plenty. Data folder on a native Linux filesystem |
+| Network | Outbound HTTPS (Cloudflare); LAN TCP 4370 to both devices; **no inbound ports** |
 | Browsers | Current Chrome, Edge, Safari, Firefox; works on phones |
 
 ## Contents
 
 1. [How it runs](#how-it-runs)
-2. [Turso setup](#turso-setup)
+2. [Backups](#backups)
 3. [Cloudflare setup](#cloudflare-setup)
 4. [Install on the Linux host](#install-on-the-linux-host)
 5. [First administrator](#first-administrator)
@@ -130,9 +129,9 @@ No Python is needed on the host: the installer and the device test run inside th
    - [Sign-in branding](#sign-in-branding)
 8. [Cutover from the Postgres stack](#cutover-from-the-postgres-stack)
 9. [Sync health and offline behaviour](#sync-health-and-offline-behaviour)
-10. [Nightly export](#nightly-export)
-11. [Recovery](#recovery)
-12. [Turso plan limits](#turso-plan-limits)
+10. [Recovery](#recovery)
+11. [R2 plan limits](#r2-plan-limits)
+12. [Upgrading from Turso](#upgrading-from-turso)
 13. [Roles](#roles)
 14. [Roster columns](#roster-columns)
 15. [Device setup and troubleshooting](#device-setup-and-troubleshooting)
@@ -142,66 +141,76 @@ No Python is needed on the host: the installer and the device test run inside th
 
 ## How it runs
 
-Everything is one `docker-compose.yml` on one x86_64 host that can reach both device subnets. The database lives in **Turso** (hosted libSQL). Each app service keeps its own embedded replica file on the `essl-data` volume, reads from it locally and sends writes to Turso.
+Everything is one `docker-compose.yml` on one x86_64 host that can reach both device subnets. The database is **one local SQLite file** (`essl.db`, WAL mode) in the data folder, shared by the web app and the collector. Every read and write is local, so a punch shows on the dashboard as soon as the collector stores it. The `backup` service copies a scrubbed snapshot to Cloudflare R2 every 15 minutes; that is the off-site copy.
 
 ```
- office LAN                         office host (docker compose)                      internet
- ----------                         ----------------------------                      --------
+ office LAN                         office host (docker compose)                 internet
+ ----------                         ----------------------------                 --------
  X990  192.168.1.201 --TCP 4370--+
-                              +--> collector --- writes / sync ------------------+
- C3-400 192.168.1.202 -TCP 4370--+     |  collector-replica.db                       |
-                                    |  collector-spool.db  (punches while offline)|
-                                    |  collector-status.json                      v
-                                    |                                       +-----------+
-                                    |   web (gunicorn) --- writes / sync -->|   Turso   |
- browsers <-- Cloudflare Tunnel <-- cloudflared --> web                     |  primary  |
-                                         web-replica.db                     +-----------+
-                                                                                  ^
-                                    nightly-export --- read-only sync ------------+
-                                         export-replica.db
-                                         |  02:00 IST, gzip, 1 bucket
-                                         +-------------------------------> R2 nightly/
+                                 +--> collector --writes--+
+ C3-400 192.168.1.202 -TCP 4370--+                        v
+                                              /data (ESSL_DATA_DIR or volume essl-data)
+                                                essl.db  (+ -wal, -shm)
+                                                collector-spool.db, *-status.json
+                                                          ^       |
+ browsers <-- Cloudflare Tunnel <-- cloudflared --> web --+       |
+                                                                  |  every 15 min: snapshot,
+                                              backup ------------+  scrub, check, gzip
+                                                 +------------------------------> R2 recent/, nightly/
 ```
 
 | Service | Job |
 | --- | --- |
-| `collector` | Polls the devices every `ESSL_COLLECTOR_INTERVAL_SECONDS` and writes punches. Boots and polls without the internet; a punch write that fails goes to the local spool and is replayed in order later. Syncs its replica every `TURSO_COLLECTOR_SYNC_SECONDS`. |
-| `web` | Flask + gunicorn (`-w 1 --threads 4`). The screens and the read-only HRMS API. Owns the schema. Syncs its replica every `TURSO_WEB_SYNC_SECONDS`, so collector punches show up within about five minutes. Published on host loopback only (`127.0.0.1:ESSL_WEB_PORT`, default 8080). |
-| `nightly-export` | Once a night, syncs a read-only replica, strips sessions and login codes, integrity-checks, gzips and puts it to R2 under `nightly/`. |
+| `collector` | Polls the devices every `ESSL_COLLECTOR_INTERVAL_SECONDS` and writes punches to `essl.db`. Polls even when the internet is down. A punch write that fails (database busy or not set up) goes to the local spool and is replayed in order later. |
+| `web` | Flask + gunicorn (`-w 1 --threads 4`). The screens and the read-only HRMS API. Owns the schema. Published on host loopback only (`127.0.0.1:ESSL_WEB_PORT`, default 8080). |
+| `backup` | Every `ESSL_BACKUP_MINUTES` (15) takes a snapshot with SQLite's backup API, deletes sessions and login codes, runs `VACUUM` and `integrity_check`, gzips it and uploads it to R2. Also the admin CLI (`python -m essl_hub.backup <command>`, see [Backups](#backups)). The only service with cloud credentials. |
 | `cloudflared` | *Optional* bundled Cloudflare Tunnel (compose profile `tunnel`). Skip it when the host already runs cloudflared. |
 
-Every process holds one libSQL connection for its life (one replica file per process), so a process always reads its own writes. Status files on the shared volume (`collector-status.json`, `export-status.json`) feed the admin sync-health indicator even when Turso is unreachable. All containers run as UID/GID 10001. Postgres is gone from the runtime, and so are continuous file backups: Turso's point-in-time recovery plus the nightly export replace them.
+All three app services mount the same data folder at `/data`, so `essl.db`, its `-wal` and `-shm`, the collector spool and the status files (`collector-status.json`, `backup-status.json`) sit side by side. Web and collector **never create** `essl.db`: until an admin runs `init`, `restore` or `import-turso`, the web app shows a "Database not set up" page with the three commands and the collector spools and waits. All containers run as UID/GID 10001.
 
-## Turso setup
+### Data folder (`ESSL_DATA_DIR`)
 
-Do this once, from an **operator laptop**, not the office host. The host never needs the Turso CLI or a platform token.
+Set `ESSL_DATA_DIR` in `.env` to keep the database in a host folder you choose; leave it empty to use the Docker named volume `essl-data`.
 
-1. Install the CLI and sign in: see https://docs.turso.tech/cli/introduction, then `turso auth login`.
-2. Create the database in the location nearest India. List locations with `turso db locations` and pick the closest one:
+- **Absolute path** only, e.g. `/srv/essl-data`. Compose mounts the folder, not the file, so `-wal` and `-shm` sit next to the database.
+- **Native Linux filesystem only** (ext4, xfs, btrfs). NFS, SMB/CIFS and Docker Desktop file sharing break SQLite locking and can corrupt the file.
+- **Owner `10001:10001`, mode `700`.** `./deploy/install.sh` sets both. By hand: `sudo mkdir -p /srv/essl-data && sudo chown 10001:10001 /srv/essl-data && sudo chmod 700 /srv/essl-data`.
 
-   ```bash
-   turso db create essl --location <code>      # for the cutover, use --from-file instead (below)
-   turso db show essl --url                    # -> TURSO_DATABASE_URL
-   ```
+Changing `ESSL_DATA_DIR` on a running install points the stack at a different (likely empty) folder: the web app then shows "Database not set up". Stop the stack and move `essl.db` (with any `-wal`/`-shm`) across first, or `restore` into the new folder.
 
-3. Create the two database tokens:
+## Backups
 
-   ```bash
-   turso db tokens create essl                 # read-write -> TURSO_AUTH_TOKEN (collector, web)
-   turso db tokens create essl --read-only     # read-only  -> TURSO_EXPORT_AUTH_TOKEN (nightly-export)
-   ```
+The `backup` service writes to one private R2 bucket ([R2 bucket](#2-r2-bucket-backups)):
 
-   Keep them only in the host's `.env` (mode 600) and your password manager. `install.sh` refuses to start if the two are the same.
-4. **Optional dev branch for testing.** Never point dev or a scratch host at production. Branch a copy instead:
+- `recent/<timestamp>.db.gz`: every snapshot, kept for `ESSL_BACKUP_KEEP_HOURS` (48).
+- `nightly/<date>.db.gz`: the first successful snapshot after `ESSL_EXPORT_HOUR` (02:00 IST) each day, kept for `ESSL_BACKUP_KEEP_DAYS` (30).
+- `latest.json`: which database owns the bucket (`database_id`), the newest key, punch count and time.
 
-   ```bash
-   turso db create essl-dev --from-db essl
-   turso db show essl-dev --url
-   turso db tokens create essl-dev
-   ```
+The service prunes both prefixes itself; no R2 lifecycle rule is needed. A cycle whose snapshot is byte-identical to the last upload skips the upload. Snapshots never contain sessions or sign-in codes, so a restore signs everyone out. Each cycle is logged to `backup-status.json` and shows on the health page.
 
-   Use these values on the scratch host or in a dev shell. Destroy it with `turso db destroy essl-dev` when done.
-5. Set a **usage alert** in the Turso dashboard (see [Turso plan limits](#turso-plan-limits)).
+**Database ID guard.** `init` and `import-turso` give the database a random `database_id`; a snapshot carries it, so `restore` keeps it. If `latest.json` in R2 names a different database (a new install pointed at an old bucket, or a mistyped `ESSL_DATA_DIR`), uploads stop and the health page turns red with "different database". Then either `restore` (take the bucket's database) or `adopt` (make this database the owner). A database with no `database_id` (e.g. built by the Postgres migration script) is also blocked until `adopt`.
+
+### Admin commands
+
+Run on the host, from the repo folder:
+
+```bash
+docker compose run --rm backup python -m essl_hub.backup <command>
+```
+
+| Command | What it does |
+| --- | --- |
+| `init` | Creates a new empty database with a new `database_id`. New installs only (the installer runs it). |
+| `restore [--key <key>]` | Downloads the latest snapshot (or the exact R2 key, e.g. `recent/20261014T101500.db.gz`), verifies it and moves it into place. |
+| `list` | Lists snapshots in R2. |
+| `now` | Runs one backup cycle now (e.g. before a large roster import). Exit 0 on success. |
+| `status` | Shows the local `database_id`, the one in R2 `latest.json` and whether they match, plus the last and next cycle. |
+| `adopt [--yes]` | Makes this database the bucket's owner (asks you to type `adopt`). |
+| `import-turso` | One-time copy from Turso during the upgrade ([Upgrading from Turso](#upgrading-from-turso)). |
+
+`init`, `restore` and `import-turso` refuse while `essl.db`, `essl.db-wal` or `essl.db-shm` exists: a leftover WAL would replay another database's pages onto the new file. Stop the stack and move all three aside first. Every command and cycle holds a lock on `/data/backup.lock`, so `now` cannot collide with the running loop.
+
+**R2 is optional in compose, required by the installer.** With the `R2_*` values empty, the stack runs normally, nothing is copied off-site, and the health page shows Backups **Off**. `./deploy/install.sh` asks for all four values and will not continue without them; run without R2 only for dev or a scratch host.
 
 ## Cloudflare setup
 
@@ -227,7 +236,7 @@ ESSL_FORCE_HTTPS_COOKIES=false
 
 then `docker compose up -d web`. Trade-offs: sign-in cookies are no longer HTTPS-only (also through the tunnel), and anyone on the LAN can send a fake `CF-Connecting-IP` to dodge per-IP sign-in limits. Keep the host firewall closed to 8080 from outside the office.
 
-### 2. R2 bucket (nightly export)
+### 2. R2 bucket (backups)
 
 You need four values. There is **no URL to copy**: the app builds the endpoint `https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com` itself.
 
@@ -241,11 +250,10 @@ You need four values. There is **no URL to copy**: the app builds the endpoint `
 Steps:
 
 1. **R2 → Create bucket**, e.g. `essl-attendance`. Keep it private (no public access, no custom domain).
-2. **Bucket → Settings → Object lifecycle rules → Add rule**: prefix `nightly/`, delete after 90 days (your retention). Without it exports pile up forever.
-3. **Optional: Bucket → Settings → Bucket lock** on `nightly/` for your retention period. Even a leaked token then cannot delete or overwrite recent exports.
-4. **R2 → Manage R2 API Tokens → Create API token**: permission **Object Read & Write**, **Specify bucket** → only this bucket, TTL forever. Copy the Access Key ID and Secret Access Key. Ignore the "Token value" and the S3 endpoint shown there; the app needs neither.
+2. No lifecycle rule is needed: the backup service deletes `recent/` and `nightly/` objects past `ESSL_BACKUP_KEEP_HOURS` / `ESSL_BACKUP_KEEP_DAYS` itself. Do not add bucket lock on these prefixes, or pruning fails.
+3. **R2 → Manage R2 API Tokens → Create API token**: permission **Object Read & Write**, **Specify bucket** → only this bucket, TTL forever. Copy the Access Key ID and Secret Access Key. Ignore the "Token value" and the S3 endpoint shown there; the app needs neither.
 
-R2 has no write-only permission, so this token can also read and delete objects in this one bucket. It lives only in the `nightly-export` container. Exports include `devices.comm_password` (a restore needs it), so keep the bucket private and use bucket lock if you want old exports tamper-proof.
+R2 has no write-only permission, so this token can also read and delete objects in this one bucket. It lives only in the `backup` container. Snapshots include `devices.comm_password` (a restore needs it), so keep the bucket private.
 
 ### 3. Sign-in email
 
@@ -287,12 +295,12 @@ git clone <this repo> /opt/essl && cd /opt/essl
 
 Prefer editing by hand? Run `./deploy/install.sh --yes` once to create `.env`, fill every `# REQUIRED` value and one mail provider (`nano .env`), then run `./deploy/install.sh` again.
 
-The installer stops on a non-x86_64 host, checks every required value (Turso URL format, separate read-only export token), builds, tests the devices and starts. There is no first-install data step: Turso is the source of truth, and each service builds its replica from it on first start.
+The installer stops on a non-x86_64 host, checks every required value, builds, prepares the data folder, creates the database on a fresh install (`backup init`), tests the devices and starts.
 
 Check it is healthy:
 
 ```bash
-docker compose ps                       # collector, web, nightly-export, cloudflared running
+docker compose ps                       # collector, web, backup (and cloudflared) running
 docker compose logs -f collector        # one line per device per poll
 docker compose run --rm --no-deps collector python diagnose.py   # device test again, any time
 ```
@@ -353,7 +361,7 @@ Devices is admin-only; HR handles ID problems from **People → ID issues**.
 
 The devices table is the source of truth; `.env` IPs only seed the first two rows. On **Devices** (admin):
 
-- **Add device**: site, family (X990 attendance or C3-400 access controller), IP, port and an optional comm password (numeric for the X990). The id is generated from site and family (`kondapur-c3-400`, then `-2`, `-3` on a clash), never changes and is never reused. The card reads **Pending** until the collector picks it up, about 6 minutes (replica sync plus one poll).
+- **Add device**: site, family (X990 attendance or C3-400 access controller), IP, port and an optional comm password (numeric for the X990). The id is generated from site and family (`kondapur-c3-400`, then `-2`, `-3` on a clash), never changes and is never reused. The card reads **Pending** until the collector picks it up on its next poll, within about 2 minutes.
 - **Retire device** (asks to confirm): sets `retired_at`. The collector stops polling it, it never trips the stale-collector warning, and its punches stay on every day view. Retired cards collapse under **Retired**.
 - **Re-enable**: clears `retired_at`; polling resumes on the same id.
 
@@ -365,41 +373,37 @@ On **Settings → Sign-in branding** (admin) upload a logo and pick the sign-in 
 
 - Formats: PNG, JPEG or WebP, checked by file signature (the extension is ignored). SVG is refused.
 - Caps: logo 512 KB, background 1.5 MB (plus the global `ESSL_MAX_UPLOAD_MB`).
-- Images live in the database (`branding_assets`, schema v5), so every replica and the nightly export carry them. They are served publicly at `/brand/logo` and `/brand/background` with an ETag and a 5-minute cache; the page adds `?v=<hash>` so a change shows at once.
+- Images live in the database (`branding_assets`, schema v5), so every backup and restore carries them. They are served publicly at `/brand/logo` and `/brand/background` with an ETag and a 5-minute cache; the page adds `?v=<hash>` so a change shows at once.
 - **Reset** puts either asset back to the default. With nothing uploaded, sign-in looks as before. Email keeps `static/email-logo.png`.
 
 ## Cutover from the Postgres stack
 
-The old stack (Postgres + collector) keeps running until step 5. The C3-400 realtime queue holds only about 30 events and does not replay, so the gap between old and new collectors must stay short. Bulk data goes up as a file; only the gap is written row by row (KTD17).
+The old stack (Postgres + collector) keeps running until step 5. The C3-400 realtime queue holds only about 30 events and does not replay, so the gap between old and new collectors must stay short (KTD17).
 
-1. **Rehearse** the whole sequence on a scratch host against a Turso dev branch or scratch database, and time it. Run the [restore drill](#restore-drill) once before go-live.
+1. **Rehearse** the whole sequence on a scratch host and time it. Run the [restore drill](#restore-drill) once before go-live.
 2. **Schedule an off-hours window** (no one at the doors), longer than the rehearsal.
-3. **Full migrate to a local file while the old collector still runs.** On the operator laptop (or any machine that reaches the old Postgres). The `libsql` package ships Linux x86_64 wheels only; on another OS run these steps inside `docker run --rm -it --platform linux/amd64 -v "$PWD":/app -w /app python:3.12 bash`:
+3. **Full migrate to a local file while the old collector still runs.** On any Linux x86_64 machine that reaches the old Postgres (the `libsql` package ships Linux x86_64 wheels only; elsewhere use `docker run --rm -it --platform linux/amd64 -v "$PWD":/app -w /app python:3.12 bash`):
 
    ```bash
    python3 -m venv .venv && .venv/bin/pip install -r requirements.txt "psycopg[binary]"
-   .venv/bin/python scripts/migrate_postgres.py --source postgresql://user:pass@oldhost/essl --target essl-turso.db
-   turso db create essl --from-file essl-turso.db --location <code>
+   .venv/bin/python scripts/migrate_postgres.py --source postgresql://user:pass@oldhost/essl --target essl-migrated.db
    ```
 
-   Note the time you started. The script prints per-table counts and a device/settings diff, exits non-zero on any mismatch, and prints the `turso db create` command. Sessions and login codes are not copied, so everyone signs in once more. Then create the tokens ([Turso setup](#turso-setup) step 3).
-4. **Start the new stack**: fill `.env`, run `./deploy/install.sh`.
+   Note the time you started. The script prints per-table counts and a device/settings diff and exits non-zero on any mismatch. Sessions and login codes are not copied, so everyone signs in once more.
+4. **Start the new stack**: fill `.env`, run `./deploy/install.sh --check`, copy `essl-migrated.db` into the data folder as `essl.db` (owner 10001, mode 600, no `-wal`/`-shm` beside it), run `./deploy/install.sh`, then `docker compose run --rm backup python -m essl_hub.backup adopt` so backups accept the file.
 5. **Stop the old collector** as soon as `docker compose logs collector` shows the new one polling both devices. Do not run both against the C3 for long: each read drains its queue.
-6. **Backfill the gap** with delta mode, using the start time from step 3. Web and collector must be stopped:
+6. **Backfill the gap** with delta mode into the live file, using the start time from step 3. Web and collector must be stopped:
 
    ```bash
-   docker compose stop collector web        # on the host
+   docker compose stop collector web
+   docker compose run --rm --no-deps -v "$PWD/scripts:/app/scripts" backup sh -c \
+     'pip install --user "psycopg[binary]" && python scripts/migrate_postgres.py \
+        --source postgresql://user:pass@oldhost/essl --target /data/essl.db \
+        --punches-since "2026-10-09 18:00:00"'
+   docker compose up -d
    ```
 
-   Then on the operator laptop (same venv as step 3):
-
-   ```bash
-   export TURSO_DATABASE_URL=libsql://essl-<org>.turso.io TURSO_AUTH_TOKEN=<read-write token>
-   .venv/bin/python scripts/migrate_postgres.py --source postgresql://user:pass@oldhost/essl \
-       --punches-since "2026-10-09 18:00:00" --replica-path ./migrate-replica.db
-   ```
-
-   Back on the host: `docker compose up -d`. Punches are deduplicated by fingerprint, so overlap is harmless. Delete `migrate-replica.db*` afterwards.
+   Punches are deduplicated by fingerprint, so overlap is harmless.
 7. **Keep the old Postgres stack stopped but intact for 14 days.** That is the rollback path: stop the new collector, start the old stack. After 14 clean days, remove it.
 
 Then fix the Uppal row if it was migrated as `.42`.
@@ -408,101 +412,102 @@ Then fix the Uppal row if it was migrated as `.42`.
 
 ### Sync-health indicator
 
-Admins see an indicator top right on every page. It links to **Sync health** (`/health`, admin only, 404 for everyone else) and shows the worst of three signals, each read from the shared volume so it still loads when Turso is down:
+Admins see an indicator top right on every page. It links to **System health** (`/health`, admin only, 404 for everyone else) and shows the worst of two signals, each read from the data folder:
 
 | Signal | Green | Amber | Red |
 | --- | --- | --- | --- |
-| Web replica sync | last OK within 5 min | within 60 min | older, or never |
 | Collector | polled within 10 min, spool empty | punches spooled | no poll for 10 min, a dead-lettered punch, or the oldest spooled punch older than 60 min |
-| Nightly export | last OK within 2 days | within 7 days | older, or none yet |
+| Backups | last backup within 2 intervals (30 min) | within 6 intervals (90 min) | older, none yet, 3 failed cycles in a row, or blocked by a different database |
 
-The page also lists the last 14 exports. A local-database instance (dev) shows a neutral "Local database" chip.
+With no R2 configured, Backups shows a neutral **Off** chip that never colours the indicator. The page also lists the last 14 backup cycles and the recovery commands.
 
-### When the internet or Turso is down
+### When the internet is down
 
-- **Reads keep working.** Every page and the `/api/v1` pulls are served from the web replica, at most one sync interval stale when the outage began.
-- **Writes show an offline page (HTTP 503)**, never an error: sign-in code requests, Directory edits, role changes, device and settings edits. Already signed-in people stay signed in. Retry once the indicator is green.
-- **The collector keeps polling.** Punches go to `/data/collector-spool.db` and replay oldest-first once Turso is back; duplicates are ignored. A punch that keeps failing while syncs succeed moves to the spool's `dead` table (indicator red); it is kept, never dropped. Device-status, heartbeat and Frappe writes are skipped and recomputed next cycle.
-- **The export** records a failed night and retries the next night.
-- **First boot with no internet and no replica:** every page shows the offline page until the first sync.
+- **Everything local keeps working**: every page, every edit, the `/api/v1` pulls and the collector. Data is never more than a write away.
+- **Sign-in codes can't be emailed**, so new sign-ins wait; people already signed in stay signed in.
+- **Backups pause.** Each failed upload is logged and retried next cycle; the Backups signal turns amber, then red. Nothing is lost locally, and the next successful cycle uploads a current snapshot.
+- **Frappe push** retries next cycle.
 
-### Stuck replicas rebuild themselves
+### When the database is busy or missing
 
-A libsql 0.1.11 replica can stop advancing after Turso rolls to a new internal generation (seen live after a large first load), while its sync still reports success. After every sync, web and collector compare the newest punch and latest device poll in their replica with what Turso reported at the previous check. Two lagging checks in a row delete the replica file and pull a fresh copy (seconds for ~60k punches); the time shows as **Last replica rebuild** on Sync health. The nightly export always starts from a fresh replica. A rebuild now and then is harmless; one on every check means something else is wrong — check the logs for `behind primary`.
-
-## Nightly export
-
-`nightly-export` runs at `ESSL_EXPORT_HOUR` (default `2`, i.e. 02:00 IST). It syncs a read-only replica, copies it, deletes `sessions` and `login_codes`, runs `VACUUM` and `PRAGMA integrity_check`, gzips it and puts it to `R2_BUCKET` as `nightly/<timestamp>.db.gz`. Each run is appended to `/data/export-status.json` (last 30 kept) and shows on Sync health.
-
-Run one now (e.g. before a large roster import, or to test the token):
-
-```bash
-docker compose run --rm nightly-export python -m essl_hub.nightly_export --once
-```
-
-It exits 0 on success and non-zero on failure. Logs: `docker compose logs nightly-export`.
+- **Busy**: the web app and the collector share one file. A write that waits more than 5 s for the other process gets a "Busy, try again" page (HTTP 503) in the web app; in the collector the punches go to the spool and replay oldest-first. Duplicates are ignored. A punch that keeps failing for another reason moves to the spool's `dead` table (indicator red); it is kept, never dropped.
+- **Missing** (`essl.db` not there, e.g. a wrong `ESSL_DATA_DIR`): the web app shows "Database not set up" with the `init`, `restore` and `import-turso` commands; the collector spools and logs the same commands; the backup service waits. Nothing creates an empty database by accident.
 
 ## Recovery
 
-Turso is the source of truth. There is no in-app restore. Pick a path, run it from the operator laptop, then repoint the host.
+The local file is the source of truth; R2 holds the last 48 h of 15-minute snapshots and 30 daily ones. With uploads succeeding, a total loss of the host costs at most the edits since the last snapshot. Punches heal themselves: the X990 returns its whole log on every poll and the C3 history is re-read at start and every 6 h.
 
-### Turso unreachable, data intact
-
-Nothing to do. Reads continue, writes show the offline page, the collector spools. Once Turso is back the spool replays and the indicator turns green. If the collector shows dead-lettered punches, check `docker compose logs collector`; the rows stay in the spool's `dead` table.
-
-### Path 1: Turso point-in-time recovery (preferred)
-
-Restores to any moment inside your plan's PITR window (check it on your plan, see [Turso plan limits](#turso-plan-limits)):
+### Restore from R2
 
 ```bash
-turso db create essl-restored --from-db essl --timestamp 2026-10-09T18:00:00+05:30
+docker compose stop web collector backup
+# move the current files aside (keep them until you are sure)
+docker compose run --rm --no-deps --entrypoint sh backup -c \
+  'mkdir -p /data/old && mv /data/essl.db /data/essl.db-wal /data/essl.db-shm /data/old/ 2>/dev/null; true'
+docker compose run --rm backup python -m essl_hub.backup list            # pick a key, or take the latest
+docker compose run --rm backup python -m essl_hub.backup restore         # or: restore --key recent/<ts>.db.gz
+docker compose up -d
 ```
 
-### Path 2: a nightly export from R2
+`restore` verifies the snapshot (integrity check, schema version) before moving it into place and keeps its `database_id`, so backups resume without `adopt`. **Keep the spool** (`collector-spool.db`): it may hold punches not yet written. Everyone signs in again (sessions are not in snapshots); API keys and revocations come back as of the snapshot.
 
-Use when the moment you need is outside the PITR window, or the Turso database itself is gone. Download `nightly/<timestamp>.db.gz` from the R2 dashboard, then:
+### Backups blocked: "different database"
 
-```bash
-gunzip <timestamp>.db.gz
-turso db create essl-restored --from-file <timestamp>.db --location <code>
-```
+The bucket's `latest.json` names another database. Decide which is right:
 
-Exports exclude sessions and login codes, so everyone signs in again.
-
-### Then, for either path
-
-1. Mint new tokens for the new database: `turso db tokens create essl-restored` and `turso db tokens create essl-restored --read-only`.
-2. Stop the stack: `docker compose down`.
-3. Delete the old replicas but **keep the spool** (it may hold punches not yet in Turso):
-
-   ```bash
-   docker compose run --rm --no-deps --entrypoint sh web -c 'rm -f /data/*-replica.db*'
-   ```
-
-4. Update `.env`: `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`, `TURSO_EXPORT_AUTH_TOKEN`.
-5. Start the stack: `docker compose up -d`. The replicas rebuild from the new database and the collector replays its spool into it.
-6. Check the indicator turns green and recent hours look right. Keep the old database until you are sure, then `turso db destroy`.
+- The bucket is right (this host has a wrong or new file): stop the stack, move the files aside, `restore`.
+- This database is right (e.g. you rebuilt the bucket, or loaded a file from the Postgres migration): `docker compose run --rm backup python -m essl_hub.backup adopt`.
 
 ### Restore drill
 
-Do it once before cutover, then quarterly.
+Do it once after the upgrade, then quarterly, on a **scratch host** (never on production):
 
-1. Run an export now (`--once`, above) and confirm the object under `nightly/` in R2 and an OK row on Sync health.
-2. Restore it with path 2 to `essl-drill`, and do a path 1 restore to `essl-drill-pitr` from an hour ago.
-3. On a scratch host, copy `.env`, point it at `essl-drill` with fresh tokens, leave `TUNNEL_TOKEN` empty, `docker compose up -d`. Confirm sign-in works and yesterday's hours match production.
-4. Record the times. Destroy both drill databases and the scratch host. Never point a scratch stack at the production database.
+1. On production: `docker compose run --rm backup python -m essl_hub.backup now`, then `list`; confirm the new `recent/` key and an OK row on the health page.
+2. On the scratch host: copy `.env`, leave `TUNNEL_TOKEN` empty, point `R2_*` at the same bucket, `docker compose build`, then `docker compose run --rm backup python -m essl_hub.backup restore`.
+3. **Stop the scratch `backup` service at once** (`docker compose up -d web collector` only), so it never uploads into the production bucket. Sign in (set `ESSL_MAIL_PROVIDER=console` on the scratch host) and check yesterday's hours match production.
+4. Record the time it took, then destroy the scratch host.
 
-## Turso plan limits
+## R2 plan limits
 
-Turso plans cap rows read and written, storage, embedded-replica sync bandwidth and the point-in-time recovery window. These change; **check the current numbers on https://turso.tech/pricing** before cutover, and write the PITR window of your plan here: `PITR window: ____`.
+R2's free tier covers 10 GB stored, 1 million Class A (write/list) and 10 million Class B (read) operations a month, with no egress fees. These change; check https://developers.cloudflare.com/r2/pricing/ .
 
-What drives usage here:
+What this app uses, measured on a 44.5 MB database (11 MB gzipped):
 
-- Replica syncs: web every `TURSO_WEB_SYNC_SECONDS` (300), collector every `TURSO_COLLECTOR_SYNC_SECONDS` (300), export once a night. Raising them cuts sync traffic; the cost is staler reads.
-- Writes: punches, a device row only when its status or punches change, or every `ESSL_HEARTBEAT_WRITE_SECONDS` (15 min), the Frappe status on change or every 15 min, sign-ins and admin edits. Small at about 100 users.
-- The nightly export reads the whole database once.
+- **Storage**: about 48 h × 4 snapshots/h × 11 MB ≈ 2.1 GB in `recent/`, plus 30 × 11 MB ≈ 330 MB in `nightly/`. Grows with the database; lower `ESSL_BACKUP_KEEP_HOURS` if it ever nears the cap.
+- **Operations**: about 96 uploads plus a few lists and deletes a day, roughly 3,000 Class A a month.
+- **Uploads skip** when a snapshot is identical to the last one.
 
-Set a **usage alert** in the Turso dashboard well below your plan's limits, and check usage monthly. If you hit a limit, writes can be refused: the indicator and the offline page show it.
+Set a billing alert on the Cloudflare account if you leave the free tier.
+
+## Upgrading from Turso
+
+Earlier releases kept the database in Turso with an embedded replica per service and a nightly export. This release keeps it locally and backs it up to R2 every 15 minutes. `./deploy/install.sh` detects an old install (no `essl.db`, but `*-replica.db` files or `TURSO_DATABASE_URL` set), builds the new images, starts nothing and prints these steps.
+
+Until you upgrade, `docker compose stop nightly-export` stops the nightly full Turso download (the biggest use of the Turso sync quota); R2 snapshots pause until the upgrade.
+
+1. Stop the stack: `docker compose stop`.
+2. Optional: set `ESSL_DATA_DIR` in `.env` and prepare the folder ([Data folder](#data-folder-essl_data_dir)). The installer does this for you.
+3. Pull the new release and build it: `git pull && docker compose build`.
+4. Copy the database out of Turso once (keep `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` in `.env` for this step):
+
+   ```bash
+   docker compose run --rm backup python -m essl_hub.backup import-turso
+   ```
+
+   This is one full download (about 45 MB). It checks the file, compares the punch count with Turso, assigns a new `database_id` and moves it into place as `essl.db`.
+5. Start the new stack, which also removes the old `nightly-export` container:
+
+   ```bash
+   docker compose up -d --build --remove-orphans
+   ```
+
+6. Check the health page. Backups turn green after the first cycle, and `docker compose run --rm backup python -m essl_hub.backup list` shows the first `recent/` object. Everyone signs in again.
+7. After **a week** of clean backups:
+   - Delete the Turso database (`turso db destroy essl`). It still holds old sessions and sign-in codes.
+   - Remove the `TURSO_*` values from `.env`.
+   - Delete the old replica files: `docker compose run --rm --no-deps --entrypoint sh backup -c 'rm -f /data/*-replica.db*'` (if you moved to `ESSL_DATA_DIR`, run it against the old volume instead).
+
+Rolling back to the previous release after the cutover needs Turso, so keep the Turso database for that week. Existing `nightly/` objects from the old export stay readable by `restore --key` and are pruned after `ESSL_BACKUP_KEEP_DAYS`; restoring one needs `adopt` afterwards (they carry no `database_id`).
 
 ## Roles
 
@@ -611,16 +616,17 @@ All settings live in `.env`; `.env.example` documents each one. The daily target
 
 | Variable | Default | Used by |
 | --- | --- | --- |
-| `TURSO_DATABASE_URL` | required (unset = local mode, dev only) | collector, web, nightly-export |
-| `TURSO_AUTH_TOKEN` | required, read-write | collector, web |
-| `TURSO_EXPORT_AUTH_TOKEN` | required, read-only | nightly-export |
-| `TURSO_WEB_SYNC_SECONDS` / `TURSO_COLLECTOR_SYNC_SECONDS` | `300` / `300` | passed as `TURSO_SYNC_SECONDS` to web / collector |
-| `ESSL_DB_PATH` | set per service in compose (`/data/<service>-replica.db`) | replica file; local database file in dev |
+| `ESSL_DATA_DIR` | empty = Docker volume `essl-data` | all app services: absolute host path mounted at `/data`; native Linux filesystem, owner 10001, mode 700 |
+| `ESSL_DB_PATH` | `/data/essl.db` (set in compose) | web, collector, backup |
 | `ESSL_SPOOL_PATH` | `/data/collector-spool.db` | collector |
-| `ESSL_COLLECTOR_STATUS_PATH`, `ESSL_EXPORT_STATUS_PATH` | next to `ESSL_DB_PATH` | collector, nightly-export, web (reads) |
-| `R2_ACCOUNT_ID`, `R2_BUCKET` | required | nightly-export |
-| `R2_EXPORT_ACCESS_KEY_ID`, `R2_EXPORT_SECRET_ACCESS_KEY` | required, scoped to the one bucket | nightly-export |
-| `ESSL_EXPORT_HOUR` | `2` (IST) | nightly-export |
+| `ESSL_COLLECTOR_STATUS_PATH`, `ESSL_BACKUP_STATUS_PATH` | next to `ESSL_DB_PATH` | collector, backup, web (reads) |
+| `R2_ACCOUNT_ID`, `R2_BUCKET` | installer: required; compose: empty = backups Off | backup |
+| `R2_EXPORT_ACCESS_KEY_ID`, `R2_EXPORT_SECRET_ACCESS_KEY` | as above, token scoped to the one bucket | backup |
+| `ESSL_BACKUP_MINUTES` | `15` | backup: minutes between snapshots; also the health thresholds |
+| `ESSL_BACKUP_KEEP_HOURS` | `48` | backup: hours of `recent/` snapshots kept |
+| `ESSL_BACKUP_KEEP_DAYS` | `30` | backup: days of `nightly/` copies kept |
+| `ESSL_EXPORT_HOUR` | `2` (IST) | backup: the day's `nightly/` copy is the first snapshot after this hour |
+| `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN` | empty | backup, only for the one-time `import-turso` ([Upgrading from Turso](#upgrading-from-turso)) |
 | `ESSL_WEB_PORT` / `ESSL_WEB_BIND` | `8080` / `127.0.0.1` | web host port; bind `0.0.0.0` for LAN access |
 | `TUNNEL_TOKEN`, `COMPOSE_PROFILES` | optional; token + `tunnel` turns on the bundled cloudflared | cloudflared |
 | `ESSL_COLLECTOR_INTERVAL_SECONDS` | `60` | collector, Devices page |
@@ -640,22 +646,21 @@ All settings live in `.env`; `.env.example` documents each one. The daily target
 
 ## Development and tests
 
-Dev and tests run in **local mode**: with `TURSO_DATABASE_URL` unset, the app opens `ESSL_DB_PATH` as a plain local libSQL file, no Turso account needed.
+Dev and tests use a local file at `ESSL_DB_PATH`; no cloud account needed. Create it once with `python -m essl_hub.backup init`.
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 export ESSL_DB_PATH=./data/essl.db ESSL_FORCE_HTTPS_COOKIES=false
+mkdir -p data && .venv/bin/python -m essl_hub.backup init   # once
 .venv/bin/python -m essl_hub.collector_main             # collector
 .venv/bin/flask --app 'essl_hub.web:create_app()' run   # dashboard on :5000
 ```
-
-To try replica mode, point `TURSO_DATABASE_URL` / `TURSO_AUTH_TOKEN` at a dev branch ([Turso setup](#turso-setup) step 4), never at production.
 
 ```bash
 .venv/bin/python -m pytest -q
 ```
 
-The suite needs no network or database server. `tests/test_libsql_contract.py` pins the libSQL behaviour the app depends on; its Turso group runs only when `TURSO_TEST_URL` and `TURSO_TEST_TOKEN` (plus `TURSO_TEST_RO_TOKEN` for the read-only check) point at a scratch database, and is skipped otherwise (as in CI). `psycopg` is only for the one-time migration script.
+The suite needs no network or database server. `tests/test_libsql_contract.py` pins the libSQL behaviour the app depends on. `psycopg` is only for the one-time migration script.
 
 ---
 

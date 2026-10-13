@@ -237,12 +237,6 @@ class FrappeSync:
 
     def run_once(self) -> SyncReport:
         report = SyncReport()
-        if getattr(self.database, "offline", False):
-            # KTD13: no sync-log or status writes while Turso is unreachable;
-            # the next healthy run picks up every pending punch.
-            report.retry_error = "Turso is unreachable"
-            _logger.warning("Frappe sync skipped: Turso is unreachable")
-            return report
         try:
             while True:
                 batch = self.database.frappe_pending_punches(
@@ -275,8 +269,8 @@ class FrappeSync:
             "skipped": report.skipped,
             "error": report.retry_error,
         }
-        # Every write is replicated to each Turso replica; an unchanged
-        # status is only refreshed once per heartbeat.
+        # An unchanged status is only refreshed once per heartbeat, so idle
+        # cycles do not rewrite the database (and its snapshots).
         shape = (status["ok"], status["synced"], status["skipped"], status["error"])
         now = time.monotonic()
         if shape == self._status_shape and now - self._status_at < STATUS_HEARTBEAT_SECONDS:

@@ -82,7 +82,7 @@ class MigrateTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.path = os.path.join(tmp.name, "essl.db")
-        self.database = db_module.Database(self.path, sync_url="")
+        self.database = db_module.Database(self.path)
         self.addCleanup(self.database.close)
 
     def _verify(self, source, tables=tuple(migrate.TABLE_COLUMNS)):
@@ -164,14 +164,15 @@ class MigrateTest(unittest.TestCase):
             code = migrate.main(argv, reader_factory=lambda _u: source)
         return code, out.getvalue()
 
-    def test_main_full_builds_v3_file_and_prints_upload_command(self):
+    def test_main_full_builds_file_and_prints_adopt_command(self):
         self.database.close()
         target = os.path.join(os.path.dirname(self.path), "upload.db")
         code, out = self._main(["--source", "x", "--target", target], _source())
         self.assertEqual(code, 0)
         self.assertIn("punches: source=2 target=2", out)
-        self.assertIn(f"turso db create essl --from-file {Path(target).resolve()}", out)
-        check = db_module.Database(target, sync_url="")
+        self.assertIn(f"file ready: {Path(target).resolve()}", out)
+        self.assertIn("essl_hub.backup adopt", out)
+        check = db_module.Database(target)
         self.addCleanup(check.close)
         with check.connect() as c:
             self.assertEqual(
@@ -186,17 +187,16 @@ class MigrateTest(unittest.TestCase):
         for table in migrate.TABLE_COLUMNS:
             self.assertIn(f"{table}: source=0 target=0", out)
 
-    def test_delta_without_turso_env_refuses(self):
+    def test_delta_without_existing_target_refuses(self):
         import contextlib
-        from unittest import mock
         err = io.StringIO()
-        with mock.patch.dict(os.environ, {"TURSO_DATABASE_URL": "", "TURSO_AUTH_TOKEN": ""}), \
-                contextlib.redirect_stderr(err):
+        missing = os.path.join(os.path.dirname(self.path), "missing.db")
+        with contextlib.redirect_stderr(err):
             code, _ = self._main(
-                ["--source", "x", "--punches-since", "2026-09-02 00:00:00"], _source()
+                ["--source", "x", "--target", missing, "--punches-since", "2026-09-02 00:00:00"], _source()
             )
         self.assertEqual(code, 2)
-        self.assertIn("TURSO_DATABASE_URL", err.getvalue())
+        self.assertIn("does not exist", err.getvalue())
 
     def test_timestamps_keep_ist_wall_clock_in_canonical_format(self):
         migrate.migrate_full(_source(), self.database)

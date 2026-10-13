@@ -124,8 +124,6 @@ class SyncHealthShellTest(ShellTest):
         self.addCleanup(env.stop)
         now = _now_naive().replace(microsecond=0)
         self.now = now
-        self.database.replica = True
-        self.database.last_sync_ok_at = now
         with open(self.collector_path, "w") as f:
             json.dump({"last_poll": now.isoformat(sep=" "), "spool_depth": 0, "dead_count": 0}, f)
         r2 = patch.dict(os.environ, {"R2_ACCOUNT_ID": "a", "R2_BUCKET": "b",
@@ -165,7 +163,7 @@ class SyncHealthShellTest(ShellTest):
         response = self.client.get("/health")
         self.assertEqual(response.status_code, 200)
         html = response.text
-        for name in ("Web replica sync", "Collector", "Backups", "Recovery", "IST", "essl_hub.backup status",
+        for name in ("Collector", "Backups", "Recovery", "IST", "essl_hub.backup status",
                      "essl_hub.backup list", "essl_hub.backup restore", "essl_hub.backup adopt"):
             self.assertIn(name, html)
         self.assertIn("run-19.db.gz", html)
@@ -188,8 +186,7 @@ class SyncHealthShellTest(ShellTest):
         self._sign_in_as("admin")
         self.assertIn('class="sync-badge tone-bad"', self._home())
 
-    def test_local_mode_keeps_collector_and_backup_signals(self) -> None:
-        self.database.replica = False
+    def test_health_shows_collector_and_backup_signals(self) -> None:
         self._sign_in_as("admin")
         html = self._home()
         self.assertIn('class="sync-badge tone-ok"', html)
@@ -202,7 +199,6 @@ class SyncHealthShellTest(ShellTest):
         import os
         from unittest.mock import patch
 
-        self.database.replica = False
         with patch.dict(os.environ, {"R2_BUCKET": ""}):
             self._sign_in_as("admin")
             page = self.client.get("/health").text
@@ -216,7 +212,6 @@ class SyncHealthShellTest(ShellTest):
             json.dump({"last_ok_at": self.now.isoformat(sep=" "), "blocked": True,
                        "last_error": "R2 backups belong to a different database (x)",
                        "entries": [{"status": "blocked", "started": "s"}]}, f)
-        self.database.replica = False
         self._sign_in_as("admin")
         self.assertIn('class="sync-badge tone-bad"', self._home())
         page = self.client.get("/health").text

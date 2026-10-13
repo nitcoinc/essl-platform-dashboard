@@ -65,7 +65,7 @@ class FakeR2:
 
 
 def _insert_punch(path: str, n: int) -> None:
-    db = Database(path, sync_url="", must_exist=True)
+    db = Database(path, must_exist=True)
     try:
         with db.transaction() as c:
             c.execute(
@@ -518,7 +518,7 @@ class FakeReplica:
 
     def __init__(self, path: str, rows: int) -> None:
         self.path = path
-        seed = Database(path + ".seed", sync_url="")
+        seed = Database(path + ".seed")
         seed.migrate_schema()
         seed.close()
         for suffix in ("-wal", "-shm"):

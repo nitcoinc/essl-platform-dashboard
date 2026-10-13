@@ -35,8 +35,8 @@ DEVICE_FAMILIES = {
     "c3-400": ("C3-400", "c3-pullsdk"),
 }
 
-# Collector replica sync (TURSO_COLLECTOR_SYNC_SECONDS, 300s) plus one poll.
-PICKUP_MINUTES = 6
+# Collector reads device rows every poll (ESSL_COLLECTOR_INTERVAL_SECONDS, 60s), plus margin.
+PICKUP_MINUTES = 2
 
 
 def _validate_connection(

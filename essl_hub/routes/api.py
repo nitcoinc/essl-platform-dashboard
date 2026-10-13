@@ -147,8 +147,8 @@ def _authenticate_api_key() -> dict | None:
 
 
 def _touch_api_key(key_row: dict) -> None:
-    """Record key use at most once an hour, best-effort: a failed write (Turso
-    offline, or anything else) must never fail a read-only pull (KTD11)."""
+    """Record key use at most once an hour, best-effort: a failed write (database
+    busy, or anything else) must never fail a read-only pull (KTD11)."""
     last_used = key_row.get("last_used_at")
     if last_used is not None and _now_naive() - last_used < TOUCH_INTERVAL:
         return
