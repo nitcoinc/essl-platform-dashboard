@@ -1200,6 +1200,7 @@ class QuickViewTest(_QuickViewBase):
         self._sign_in(self._person("1", "Hema HR", "hr"))
         self.assertIn("Edit details", self._quick(self.ravi["id"], "?from=people").text)
         self.assertNotIn("Edit details", self._quick(self.ravi["id"]).text)
+        self.assertIn('class="button button-secondary button-sm" href="/people/', self._quick(self.ravi["id"], "?from=people").text)
 
     def test_manager_sees_subtree_only_and_unknown_is_404(self) -> None:
         boss = self._person("900", "Boss", "manager")
@@ -3241,6 +3242,45 @@ class PeopleManagementTest(unittest.TestCase):
         self._sign_in(self.admin)
         self.assertEqual(self._add_extra(self.admin, "A3").status_code, 302)
         self.assertEqual(self.database.extra_device_ids(self.admin["id"]), ["A2", "A3"])
+
+
+    # --- inline Device ID (U6) ---
+
+    def test_hr_edits_device_id_inline_and_hours_follow(self) -> None:
+        self._sign_in(self.hr)
+        row = self._edit_row(self.ravi)
+        self.assertIn('name="device_user_id"', row)
+        self.assertIn(f'aria-label="Edit {self.ravi["name"]}"', self.client.get(f"/people/{self.ravi['id']}/row", headers={"HX-Request": "true"}).text)
+        day = (_ist_now() - timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0)
+        self._punches(("NP0005", "Ravi", day.replace(hour=9), "entry"), ("NP0005", "Ravi", day.replace(hour=17), "exit"))
+        response = self._assign(self.ravi, device_user_id=" np0005 ", manager_id="", role="employee")
+        self.assertIn("NP0005", response.text)
+        self.assertNotIn('name="device_user_id"', response.text)
+        self.assertEqual(self.database.employee_by_id(self.ravi["id"])["device_user_id"], "NP0005")
+        csv_text = self.client.get(f"/export.csv?from={day.date().isoformat()}&to={day.date().isoformat()}").text
+        self.assertIn("09:00,17:00,2,8:00", next(line for line in csv_text.splitlines() if ",Ravi," in line))
+
+    def test_hr_inline_edit_on_admin_locks_device_id_and_refuses_forgery(self) -> None:
+        self._sign_in(self.hr)
+        row = self._edit_row(self.admin)
+        self.assertNotIn('name="device_user_id"', row)
+        self.assertIn("locked", row)
+        response = self._assign(self.admin, htmx=False, device_user_id="NP9999", manager_id="", role="admin")
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.database.employee_by_id(self.admin["id"])["device_user_id"], "2")
+
+    def test_duplicate_and_zero_inline_ids_show_errors_and_keep_other_fields(self) -> None:
+        self._sign_in(self.hr)
+        response = self._assign(self.ravi, device_user_id="3", manager_id=str(self.sita["id"]), role="manager")
+        self.assertIn("Ramesh already uses device ID 3", response.text)
+        self.assertIn('value="3"', response.text)
+        self.assertIn(f'<option value="{self.sita["id"]}" selected>', response.text)
+        self.assertIn('<option value="manager" selected>', response.text)
+        after = self.database.employee_by_id(self.ravi["id"])
+        self.assertEqual((after["device_user_id"], after["manager_id"], after["role"]), ("5", None, "employee"))
+        response = self._assign(self.ravi, device_user_id="NP0000", manager_id="", role="employee")
+        self.assertIn("Device ID can&#39;t be zero", response.text)
+        self.assertEqual(self.database.employee_by_id(self.ravi["id"])["device_user_id"], "5")
 
 
 class ScreensTest(unittest.TestCase):

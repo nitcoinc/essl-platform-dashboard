@@ -92,7 +92,7 @@ def _person_row(person: dict, names: dict, result) -> dict:
     }
 
 
-def _render_people(row_error: tuple[int, str] | None = None, status: int = 200):
+def _render_people(row_error: tuple[int, str] | None = None, status: int = 200, values: dict | None = None):
     query = (request.args.get("q") or "").strip()
     everyone = database.employees()
     context = {
@@ -101,6 +101,7 @@ def _render_people(row_error: tuple[int, str] | None = None, status: int = 200):
         "query": query,
         "rows": _people_rows(query, everyone),
         "row_error": row_error,
+        "row_values": values,
         "role_labels": ROLE_LABELS,
     }
     if row_error:
@@ -112,8 +113,10 @@ def _render_people(row_error: tuple[int, str] | None = None, status: int = 200):
     return _vary_htmx(make_response(render_template(template, oob=partial, **context), status))
 
 
-def _render_row(target_id: int, *, edit: bool, row_error: tuple[int, str] | None = None, focus: bool = False):
-    """One People row, as text or (edit=True) with the manager and role selects."""
+def _render_row(target_id: int, *, edit: bool, row_error: tuple[int, str] | None = None, focus: bool = False,
+                values: dict | None = None):
+    """One People row, as text or (edit=True) with the device ID input and
+    the manager and role selects."""
     person = database.employee_by_id(target_id)
     if person is None:
         abort(404)
@@ -131,6 +134,7 @@ def _render_row(target_id: int, *, edit: bool, row_error: tuple[int, str] | None
         employee=g.employee,
         csrf_token=g.csrf_token,
         row_error=row_error,
+        row_values=values,
         role_labels=ROLE_LABELS,
         focus_row=focus,
     )
@@ -181,18 +185,40 @@ def _change_assignment(target: dict, *, manager_raw: str | None, role_raw: str |
     return None
 
 
-def _assignment_response(target_id: int, result):
+def _assignment_response(target_id: int, result, values: dict | None = None):
     if request.headers.get("HX-Request"):
         # htmx swaps only 2xx responses, so the error fragment goes out as
         # 200 and carries the message in a role="alert" element. Success
         # swaps the row back to text; an error keeps it in edit mode.
         if result:
-            return _render_row(target_id, edit=True, row_error=(target_id, result[0]), focus=True)
+            return _render_row(target_id, edit=True, row_error=(target_id, result[0]), focus=True, values=values)
         return _render_row(target_id, edit=False, focus=True)
     if result is None:
         return redirect(url_for("people.people_view", q=request.args.get("q") or None))
     error, status = result
-    return _render_people(row_error=(target_id, error), status=status)
+    return _render_people(row_error=(target_id, error), status=status, values=values)
+
+
+def _device_id_change(target: dict, raw: str | None):
+    """Check an inline Device ID edit with the person form's rules (KTD5).
+    Returns (new_id or None when unchanged, (error, status) or None)."""
+    if raw is None:
+        return None, None
+    current = str(target["device_user_id"])
+    value = roster.normalize_device_id(raw, current)
+    if value == current:
+        return None, None
+    if not access.can_modify_employee(g.employee, target, "device_user_id"):
+        return None, ("Only an admin can change an admin's work email or device user ID.", 403)
+    message = roster.identity_error(target["name"], target["email"], value)
+    if message:
+        return None, (_sentence(message), 400)
+    holder = database.employee_by_device_user_id(value)
+    if holder is not None and holder["id"] != target["id"]:
+        return None, (f"{holder['name']} already uses device ID {value}.", 400)
+    if holder is not None:
+        return None, (f"{value} is already one of {target['name']}'s other device IDs. Remove it there first.", 400)
+    return value, None
 
 
 @bp.get("/people")
@@ -216,10 +242,20 @@ def people_assign(employee_id: int):
     target = database.employee_by_id(employee_id)
     if target is None:
         abort(404)
-    result = _change_assignment(
-        target, manager_raw=request.form.get("manager_id"), role_raw=request.form.get("role")
-    )
-    return _assignment_response(employee_id, result)
+    values = {key: request.form[key] for key in ("device_user_id", "manager_id", "role") if key in request.form}
+    new_id, result = _device_id_change(target, request.form.get("device_user_id"))
+    if result is None:
+        result = _change_assignment(
+            target, manager_raw=request.form.get("manager_id"), role_raw=request.form.get("role")
+        )
+    if result is None and new_id is not None:
+        try:
+            database.update_employee(target["id"], name=target["name"], email=target["email"], device_user_id=new_id)
+        except IntegrityError:
+            result = (f"Device ID {new_id} is already in use.", 400)
+        else:
+            forget_issue_count()
+    return _assignment_response(employee_id, result, values)
 
 
 @bp.post("/people/<int:employee_id>/role")

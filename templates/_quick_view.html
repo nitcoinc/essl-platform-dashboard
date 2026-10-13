@@ -17,5 +17,5 @@
 <footer class="qv-foot">
   <a class="button button-primary button-sm" href="{{ url_for('me.day_view', employee=subject.id) }}">Open full day</a>
   <a class="button button-secondary button-sm" href="{{ url_for('me.week_view', employee=subject.id) }}">Week</a>
-  {% if can_edit %}<a class="button button-tertiary button-sm" href="{{ url_for('people.person_edit', employee_id=subject.id) }}">Edit details</a>{% endif %}
+  {% if can_edit %}<a class="button button-secondary button-sm" href="{{ url_for('people.person_edit', employee_id=subject.id) }}">Edit details</a>{% endif %}
 </footer>
