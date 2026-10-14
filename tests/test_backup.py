@@ -333,6 +333,13 @@ class CycleTest(Base):
         status = bk.run_cycle(self.db_path, None, status_path=self.status_path, now=NOW)
         self.assertEqual(status, "failed")
         self.assertIn("R2", self.status()["last_error"])
+        self.assertIs(self.status()["r2_configured"], False)
+
+    def test_cycle_records_r2_configured_and_interval_for_web(self) -> None:
+        self.init_db()
+        self.cycle(NOW)
+        self.assertIs(self.status()["r2_configured"], True)
+        self.assertEqual(self.status()["interval_minutes"], 15)
 
     def test_status_entries_capped(self) -> None:
         self.init_db()

@@ -572,6 +572,9 @@ def run_cycle(
             entry.update(status=result, error=message)
             status.update(last_error=message, blocked=blocked)
         entry["finished"] = _ts(now or _now())
+        # The web container holds no R2 credentials (KTD9), so the health page
+        # learns whether backups are configured, and their interval, from here.
+        status.update(r2_configured=client is not None, interval_minutes=config.backup_minutes())
         status["entries"] = (status["entries"] + [entry])[-STATUS_CAP:]
         _write_json_atomic(status_path, status)
         return result
