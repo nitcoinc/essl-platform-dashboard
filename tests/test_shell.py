@@ -196,14 +196,29 @@ class SyncHealthShellTest(ShellTest):
         self.assertNotIn("Web replica sync", page)
 
     def test_no_r2_shows_backups_off_with_collector(self) -> None:
+        import json
+
+        # Off comes from the backup service's status file, not the web env.
+        with open(self.export_path, "w") as f:
+            json.dump({"r2_configured": False, "last_error": "R2 credentials are not configured",
+                       "entries": [{"status": "failed", "started": "s"}]}, f)
+        self._sign_in_as("admin")
+        page = self.client.get("/health").text
+        self.assertIn('chip-neutral">Off<', page)
+        self.assertIn("Last poll", page)
+
+    def test_web_without_r2_env_still_reads_backups_as_on(self) -> None:
         import os
         from unittest.mock import patch
 
-        with patch.dict(os.environ, {"R2_BUCKET": ""}):
+        # The web container never has R2_* (only the backup service does).
+        blank = {k: "" for k in ("R2_ACCOUNT_ID", "R2_BUCKET", "R2_EXPORT_ACCESS_KEY_ID",
+                                 "R2_EXPORT_SECRET_ACCESS_KEY")}
+        with patch.dict(os.environ, blank):
             self._sign_in_as("admin")
             page = self.client.get("/health").text
-        self.assertIn('chip-neutral">Off<', page)
-        self.assertIn("Last poll", page)
+        self.assertNotIn('chip-neutral">Off<', page)
+        self.assertIn("Last backup just now", page)
 
     def test_blocked_shows_red_and_error(self) -> None:
         import json

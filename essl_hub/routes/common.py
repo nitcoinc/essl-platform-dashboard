@@ -425,7 +425,7 @@ def _read_json(path: str) -> object:
 
 def current_sync_health(db: object) -> tuple[dict, list[dict]]:
     """Read the status files tolerantly and summarise; also returns backup entries."""
-    from ..backup import backup_status_path, r2_config
+    from ..backup import backup_status_path
 
     raw = _read_json(backup_status_path())
     status = raw if isinstance(raw, dict) else None
@@ -434,7 +434,9 @@ def current_sync_health(db: object) -> tuple[dict, list[dict]]:
         _read_json(config.collector_status_path()),
         status,
         _now_naive(),
-        r2_configured=r2_config() is not None,
-        backup_minutes=config.backup_minutes(),
+        # Written by the backup service; the web container has no R2 settings.
+        # No status file yet means the service hasn't run: "No backup yet", not Off.
+        r2_configured=(status or {}).get("r2_configured", True) is not False,
+        backup_minutes=int((status or {}).get("interval_minutes") or config.backup_minutes()),
     )
     return health, entries
