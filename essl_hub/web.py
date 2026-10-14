@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 
-from flask import Flask, Response, g, render_template, request
+from flask import Flask, Response, g, jsonify, render_template, request
 
 from . import access, auth, config, turnstile
-from .config import DEVICES, WEB_SYNC_SECONDS
-from .db import Database, OfflineError
+from .config import DEVICES
+from .db import SETUP_COMMANDS, BusyError, Database, DatabaseMissing, OfflineError
 from .routes import BLUEPRINTS
 from .routes import people as people_routes
 from .routes.common import SESSION_COOKIE, _htmx_partial, _theme, current_sync_health
@@ -15,25 +16,25 @@ from .routes.common import SESSION_COOKIE, _htmx_partial, _theme, current_sync_h
 _logger = logging.getLogger(__name__)
 
 
-def _prepare_database(database: Database) -> None:
-    """Boot steps that need the primary; each is skipped with a log line when
-    Turso is unreachable so reads from the replica still serve (KTD8, KTD11)."""
-    # The web app is the schema owner (KTD8): pull first so the migration
-    # check sees the primary's user_version, then migrate and seed.
-    database.sync()
+def _prepare_database(database: Database) -> bool:
+    """Boot steps on the local file: the web app is the schema owner (KTD8),
+    so it migrates and seeds, then checks the bootstrap admin. A busy or
+    unavailable database skips a step with a log line so serving still starts;
+    returns False then, so the steps run again on the next request."""
+    ok = True
     try:
         database.initialize(DEVICES)
     except OfflineError as exc:
-        _logger.warning("Turso unreachable; schema migration and seeding skipped: %s", exc)
+        _logger.warning("Database unavailable; schema migration and seeding skipped: %s", exc)
+        ok = False
     # Web process only: the collector never grants roles or reads the bootstrap
     # address, so it stays independent of dashboard configuration (R10, R14).
     try:
         database.ensure_bootstrap_admin(config.bootstrap_admin_email())
     except OfflineError as exc:
-        _logger.warning("Turso unreachable; bootstrap admin check skipped: %s", exc)
-    # Started inside the worker, never a forking master (KTD3, KTD4).
-    if database.replica:
-        database.start_sync_loop(config.turso_sync_seconds(WEB_SYNC_SECONDS))
+        _logger.warning("Database unavailable; bootstrap admin check skipped: %s", exc)
+        ok = False
+    return ok
 
 
 def create_app(database: Database | None = None) -> Flask:
@@ -45,8 +46,30 @@ def create_app(database: Database | None = None) -> Flask:
     )
     max_upload_mb = config.max_upload_mb()
     app.config["MAX_CONTENT_LENGTH"] = max_upload_mb * 1024 * 1024
-    database = database or Database()
-    _prepare_database(database)
+    # Local file only, never created here (KTD5): a missing file serves the
+    # not-set-up page until a backup command makes it.
+    database = database or Database(must_exist=True)
+    ready = {"done": False}
+    ready_lock = threading.Lock()
+
+    def ensure_prepared() -> bool:
+        """Run the boot steps once the file exists; False while it is missing."""
+        if ready["done"]:
+            return True
+        with ready_lock:
+            if not ready["done"]:
+                try:
+                    # Busy/offline: serve anyway, retry the boot steps next request.
+                    ready["done"] = _prepare_database(database)
+                except DatabaseMissing:
+                    return False
+        return True
+
+    if not ensure_prepared():
+        _logger.warning(
+            "Database %s not set up; serving the setup page until one of these runs: %s",
+            getattr(database, "path", "?"), "; ".join(SETUP_COMMANDS),
+        )
     app.extensions["essl_database"] = database
     app.extensions["essl_setup_token"] = config.setup_token()
     app.extensions["essl_max_upload_mb"] = max_upload_mb
@@ -82,10 +105,26 @@ def create_app(database: Database | None = None) -> Flask:
             return {}
         return {"sync_health": current_sync_health(database)[0]}
 
+    def not_set_up() -> tuple[Response | str, int]:
+        if request.path == "/api/health":
+            return jsonify({"ok": False, "error": "database not set up"}), 503
+        return render_template("offline.html", state="missing", commands=SETUP_COMMANDS), 503
+
+    @app.errorhandler(DatabaseMissing)
+    def database_missing(exc: DatabaseMissing) -> tuple[Response | str, int]:
+        _logger.warning("Database missing: %s", exc)
+        return not_set_up()
+
+    @app.errorhandler(BusyError)
+    def busy(exc: BusyError) -> tuple[str, int]:
+        # Another process held the write lock past busy_timeout (KTD6).
+        _logger.warning("Database busy: %s", exc)
+        return render_template("offline.html", state="busy"), 503
+
     @app.errorhandler(OfflineError)
     def offline(exc: OfflineError) -> tuple[str, int]:
-        # A write that cannot reach the primary is an outage, not a bug (KTD11).
-        _logger.warning("Write refused while offline: %s", exc)
+        # Database temporarily unavailable: an outage, not a bug.
+        _logger.warning("Database unavailable: %s", exc)
         return render_template("offline.html"), 503
 
     @app.after_request
@@ -97,6 +136,13 @@ def create_app(database: Database | None = None) -> Flask:
         if request.endpoint != "auth.favicon":
             response.headers["Cache-Control"] = "no-store"
         return response
+
+    @app.before_request
+    def require_database():
+        # Registered before load_employee so a missing file never reaches it.
+        if request.endpoint == "static" or ensure_prepared():
+            return None
+        return not_set_up()
 
     @app.before_request
     def load_employee() -> None:

@@ -186,30 +186,17 @@ class FrappeSyncTest(unittest.TestCase):
         now[0] = 61
         self.assertIsNotNone(sched.maybe_run())
 
-    # KTD13: with Turso unreachable the push logs and skips, writing nothing.
-    def test_offline_run_logs_and_skips_without_writes(self):
-        self.add(punch("a", "101", "2026-03-02 09:00:00", "entry"))
-        self.database.offline = True
-        with self.assertLogs(frappe_sync._logger, level="WARNING"):
-            report = self.sync().run_once()
-        self.assertEqual(report.synced, 0)
-        self.assertIn("unreachable", report.retry_error)
-        self.assertEqual(self.transport.calls, [])
-        self.database.offline = False
-        self.assertIsNone(self.database.setting(frappe_sync.STATUS_SETTING))
-        self.assertEqual(self.sync().run_once().synced, 1)
-
     def test_offline_error_mid_run_stops_without_crashing_the_scheduler(self):
         self.add(punch("a", "101", "2026-03-02 09:00:00", "entry"))
 
         def offline(*args, **kwargs):
-            raise db_module.OfflineError("Turso is unreachable")
+            raise db_module.OfflineError("database unavailable")
 
         self.database.record_frappe_sync = offline
         scheduler = frappe_sync.SyncScheduler(self.sync())
         with self.assertLogs(frappe_sync._logger, level="WARNING"):
             report = scheduler.maybe_run()
-        self.assertIn("unreachable", report.retry_error)
+        self.assertIn("unavailable", report.retry_error)
 
 
 class MigrationTest(unittest.TestCase):

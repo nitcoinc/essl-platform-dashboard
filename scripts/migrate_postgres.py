@@ -1,15 +1,14 @@
-"""Cutover from the legacy Postgres database to Turso (KTD17).
+"""Cutover from the legacy Postgres database to a local SQLite file (KTD17).
 
-Full mode (default) builds a schema-v3 local SQLite file from Postgres
+Full mode (default) builds a local SQLite file at --target from Postgres
 (devices, settings, employees, punches, api_keys), checkpoints and
-integrity-checks it, then prints the `turso db create --from-file` command to
-upload it from an operator laptop. Row-by-row remote inserts would take hours.
+integrity-checks it. Move it into the data folder as essl.db (with no -wal or
+-shm beside it), then run `backup adopt` so backups accept it.
 
-Delta mode (--punches-since) copies punches captured since a timestamp straight
-into the live Turso database (TURSO_DATABASE_URL / TURSO_AUTH_TOKEN) through
-its own embedded replica file (--replica-path), in batched multi-row
-INSERT OR IGNORE, skipping fingerprints it already has. Run it while web and
-collector are stopped.
+Delta mode (--punches-since) copies punches captured since a timestamp into an
+existing local file at --target, in batched multi-row INSERT OR IGNORE,
+skipping fingerprints it already has. Run it while web and collector are
+stopped.
 
 psycopg is not an app dependency: install it only for the run
 (`pip install "psycopg[binary]"`) in a throwaway container.
@@ -25,11 +24,9 @@ from typing import Callable, Iterable, Protocol
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from essl_hub.config import turso_settings  # noqa: E402
 from essl_hub.db import SCHEMA_VERSION, Database, _adapt_datetime, _parse_timestamp  # noqa: E402
 
-DEFAULT_TARGET = "essl-turso.db"
-DEFAULT_REPLICA_PATH = "/data/migrate-replica.db"
+DEFAULT_TARGET = "essl-migrated.db"
 DELTA_BATCH_ROWS = 200  # 14 columns per row stays far below SQLite's bind limit
 
 # Copy order respects foreign keys (punches -> devices).
@@ -227,38 +224,23 @@ def main(argv: list[str] | None = None, reader_factory: Callable[[str], SourceRe
     parser.add_argument("--source", required=True, help="Postgres URL of the old database")
     parser.add_argument(
         "--target", default=DEFAULT_TARGET,
-        help=f"full mode: local SQLite file to build (default: {DEFAULT_TARGET})",
+        help=f"local SQLite file to build (full) or add to (delta) (default: {DEFAULT_TARGET})",
     )
     parser.add_argument(
         "--punches-since",
         type=_parse_timestamp,
-        help="delta mode: copy only punches collected at/after this IST timestamp into Turso",
-    )
-    parser.add_argument(
-        "--replica-path", default=DEFAULT_REPLICA_PATH,
-        help=f"delta mode: embedded replica file (default: {DEFAULT_REPLICA_PATH})",
+        help="delta mode: copy only punches collected at/after this IST timestamp into --target",
     )
     args = parser.parse_args(argv)
     delta = args.punches_since is not None
-    if delta:
-        try:
-            settings = turso_settings()
-        except RuntimeError as error:
-            settings, message = None, str(error)
-        else:
-            message = "TURSO_DATABASE_URL and TURSO_AUTH_TOKEN must be set"
-        if settings is None:
-            print(f"ERROR: delta mode writes to Turso; {message}", file=sys.stderr)
-            return 2
-        sync_url, auth_token = settings
-        database = Database(args.replica_path, sync_url=sync_url, auth_token=auth_token)
-    else:
-        database = Database(args.target, sync_url="")  # local mode: plain file
+    if delta and not Path(args.target).exists():
+        print(f"ERROR: delta mode adds to an existing file; {args.target} does not exist", file=sys.stderr)
+        return 2
+    database = Database(args.target)
     source = reader_factory(args.source)
     try:
         if delta:
             added = migrate_punches_since(source, database, args.punches_since)
-            database.sync()
             print(f"delta: added {added} punches since {_adapt_datetime(args.punches_since)}")
         else:
             migrate_full(source, database)
@@ -273,8 +255,9 @@ def main(argv: list[str] | None = None, reader_factory: Callable[[str], SourceRe
     if mismatches:
         return 1
     if not delta:
-        print(f"schema v{SCHEMA_VERSION} file ready; upload it with:")
-        print(f"  turso db create essl --from-file {Path(args.target).resolve()}")
+        print(f"schema v{SCHEMA_VERSION} file ready: {Path(args.target).resolve()}")
+        print("  move it to the data folder as essl.db, then run:")
+        print("  docker compose run --rm backup python -m essl_hub.backup adopt")
     return 0
 
 

@@ -117,20 +117,25 @@ class SyncHealthShellTest(ShellTest):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.collector_path = os.path.join(tmp.name, "collector-status.json")
-        self.export_path = os.path.join(tmp.name, "export-status.json")
+        self.export_path = os.path.join(tmp.name, "backup-status.json")
         env = patch.dict(os.environ, {"ESSL_COLLECTOR_STATUS_PATH": self.collector_path,
-                                      "ESSL_EXPORT_STATUS_PATH": self.export_path})
+                                      "ESSL_BACKUP_STATUS_PATH": self.export_path})
         env.start()
         self.addCleanup(env.stop)
         now = _now_naive().replace(microsecond=0)
         self.now = now
-        self.database.replica = True
-        self.database.last_sync_ok_at = now
         with open(self.collector_path, "w") as f:
             json.dump({"last_poll": now.isoformat(sep=" "), "spool_depth": 0, "dead_count": 0}, f)
+        r2 = patch.dict(os.environ, {"R2_ACCOUNT_ID": "a", "R2_BUCKET": "b",
+                                     "R2_EXPORT_ACCESS_KEY_ID": "k", "R2_EXPORT_SECRET_ACCESS_KEY": "s"})
+        r2.start()
+        self.addCleanup(r2.stop)
         with open(self.export_path, "w") as f:
-            json.dump([{"status": "ok", "started": now.isoformat(sep=" "), "finished": now.isoformat(sep=" "),
-                        "key": f"exports/run-{i}.db.gz", "size": 2048} for i in range(20)], f)
+            json.dump({"last_ok_at": now.isoformat(sep=" "),
+                       "entries": [{"status": "ok", "started": now.isoformat(sep=" "),
+                                    "finished": now.isoformat(sep=" "),
+                                    "key": f"exports/run-{i}.db.gz", "size": 2048}
+                                   for i in range(20)]}, f)
 
     def test_admin_sees_green_indicator_with_icon_text_and_ist_title(self) -> None:
         self._sign_in_as("admin")
@@ -143,7 +148,7 @@ class SyncHealthShellTest(ShellTest):
                 self.assertIsNotNone(badge)
                 self.assertIn("IST", badge.group(1))
                 self.assertIn("#i-check", badge.group(2))
-                self.assertIn("Turso sync healthy", badge.group(2))
+                self.assertIn("All systems healthy", badge.group(2))
 
     def test_other_roles_see_no_indicator_and_health_404s(self) -> None:
         for role in ("employee", "manager", "hr"):
@@ -158,7 +163,8 @@ class SyncHealthShellTest(ShellTest):
         response = self.client.get("/health")
         self.assertEqual(response.status_code, 200)
         html = response.text
-        for name in ("Web replica sync", "Collector", "Nightly export", "Recovery", "IST"):
+        for name in ("Collector", "Backups", "Recovery", "IST", "essl_hub.backup status",
+                     "essl_hub.backup list", "essl_hub.backup restore", "essl_hub.backup adopt"):
             self.assertIn(name, html)
         self.assertIn("run-19.db.gz", html)
         self.assertIn("run-6.db.gz", html)
@@ -180,10 +186,33 @@ class SyncHealthShellTest(ShellTest):
         self._sign_in_as("admin")
         self.assertIn('class="sync-badge tone-bad"', self._home())
 
-    def test_local_mode_shows_neutral_chip(self) -> None:
-        self.database.replica = False
+    def test_health_shows_collector_and_backup_signals(self) -> None:
         self._sign_in_as("admin")
         html = self._home()
-        self.assertIn('class="sync-badge tone-neutral"', html)
-        self.assertIn("Local database", html)
-        self.assertIn("Local database", self.client.get("/health").text)
+        self.assertIn('class="sync-badge tone-ok"', html)
+        page = self.client.get("/health").text
+        self.assertIn("Last backup just now", page)
+        self.assertIn("Collector", page)
+        self.assertNotIn("Web replica sync", page)
+
+    def test_no_r2_shows_backups_off_with_collector(self) -> None:
+        import os
+        from unittest.mock import patch
+
+        with patch.dict(os.environ, {"R2_BUCKET": ""}):
+            self._sign_in_as("admin")
+            page = self.client.get("/health").text
+        self.assertIn('chip-neutral">Off<', page)
+        self.assertIn("Last poll", page)
+
+    def test_blocked_shows_red_and_error(self) -> None:
+        import json
+
+        with open(self.export_path, "w") as f:
+            json.dump({"last_ok_at": self.now.isoformat(sep=" "), "blocked": True,
+                       "last_error": "R2 backups belong to a different database (x)",
+                       "entries": [{"status": "blocked", "started": "s"}]}, f)
+        self._sign_in_as("admin")
+        self.assertIn('class="sync-badge tone-bad"', self._home())
+        page = self.client.get("/health").text
+        self.assertIn("belong to a different database", page)

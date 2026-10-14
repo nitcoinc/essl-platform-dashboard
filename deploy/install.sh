@@ -7,6 +7,7 @@
 #   ./deploy/install.sh --skip-devices   # skip the device connection test
 #   ./deploy/install.sh --no-pull        # use the code as it is (no git pull)
 #   ./deploy/install.sh --skip-backup    # no pre-update snapshot to R2
+#   (fresh install: creates the database; upgrade from Turso: stops with steps)
 #
 # Safe to re-run: it only fills empty values and restarts changed containers.
 set -euo pipefail
@@ -22,7 +23,7 @@ for arg in "$@"; do
     --no-pull) NO_PULL=1 ;;
     --skip-backup) SKIP_BACKUP=1 ;;
     PREV_COMMIT=*) ;;
-    -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "install: unknown option $arg (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -142,9 +143,6 @@ fi
 
 # key | question | secret?
 REQUIRED=(
-  "TURSO_DATABASE_URL|Turso database URL (turso db show essl --url)|"
-  "TURSO_AUTH_TOKEN|Turso read-write token (turso db tokens create essl)|secret"
-  "TURSO_EXPORT_AUTH_TOKEN|Turso read-only token (turso db tokens create essl --read-only)|secret"
   "R2_ACCOUNT_ID|Cloudflare R2 account ID|"
   "R2_BUCKET|R2 bucket name, e.g. essl-attendance|"
   "R2_EXPORT_ACCESS_KEY_ID|R2 API token Access Key ID|"
@@ -162,7 +160,7 @@ if [ "${#missing[@]}" -gt 0 ]; then
   echo "        Fill them in .env (README \"Prerequisites\" says where each comes from) and run again." >&2
   exit 1
 fi
-ok "Turso and R2 values present"
+ok "R2 values present"
 
 # Tunnel: bundled cloudflared only when a token is set; otherwise the host's own.
 if [ -n "$(env_value TUNNEL_TOKEN)" ]; then
@@ -172,12 +170,15 @@ else
   ok "no bundled tunnel; route your host's tunnel to http://localhost:$(env_value ESSL_WEB_PORT | grep . || echo 8080)"
 fi
 
-case "$(env_value TURSO_DATABASE_URL)" in
-  libsql://*|https://*) ;;
-  *) die "TURSO_DATABASE_URL must start with libsql:// or https:// (turso db show essl --url)" ;;
-esac
-[ "$(env_value TURSO_AUTH_TOKEN)" != "$(env_value TURSO_EXPORT_AUTH_TOKEN)" ] \
-  || die "TURSO_EXPORT_AUTH_TOKEN must be a separate read-only token (turso db tokens create essl --read-only)"
+# Data folder: an absolute host path bind-mounted at /data, or the essl-data volume.
+DATA_DIR="$(env_value ESSL_DATA_DIR)"
+if [ -n "$DATA_DIR" ]; then
+  case "$DATA_DIR" in /*) ;; *) die "ESSL_DATA_DIR must be an absolute path (got: $DATA_DIR)" ;; esac
+  mkdir -p "$DATA_DIR" 2>/dev/null || sudo mkdir -p "$DATA_DIR" || die "cannot create $DATA_DIR"
+  ok "data folder $DATA_DIR"
+else
+  ok "data folder: Docker volume essl-data"
+fi
 
 if [ -z "$(env_value CLOUDFLARE_API_TOKEN)" ] && [ -z "$(env_value RESEND_API_KEY)" ] && interactive; then
   echo "  Sign-in codes are emailed. No mail provider is set; Resend is the quickest (resend.com, verify your domain)."
@@ -198,29 +199,71 @@ if [ -z "$(env_value ESSL_SETUP_TOKEN)" ] && [ -z "$(env_value ESSL_BOOTSTRAP_AD
   ok "generated a one-time ESSL_SETUP_TOKEN for the first administrator"
 fi
 
-# --- 2b. Pre-update snapshot -------------------------------------------------
-# An update can migrate the schema. Before that, push a fresh export to R2 with
-# the image that is running now (same as the nightly one, outside the schedule).
-if [ "$CHECK_ONLY" = 0 ] && [ "$SKIP_BACKUP" = 0 ] && [ -n "$(docker compose ps -q web 2>/dev/null)" ]; then
+# --- 2b. Install state --------------------------------------------------------
+# Looks at the data folder through a throwaway container (works for the volume
+# and for a bind folder the host user cannot read).
+step "Detecting install state"
+docker compose build --quiet
+ok "images built"
+# Every service runs as 10001:10001 and needs /data owned by it, mode 700.
+docker compose run --rm --no-deps -u 0 --entrypoint sh backup -c \
+  'chown 10001:10001 /data && chmod 700 /data' >/dev/null \
+  || die "cannot set owner/mode on the data folder"
+data_files="$(docker compose run --rm --no-deps --entrypoint sh backup -c \
+  'cd /data && ls -1 essl.db essl.db-wal *-replica.db 2>/dev/null' || true)"
+if printf '%s\n' "$data_files" | grep -qx 'essl.db'; then
+  STATE=update
+  ok "normal update (essl.db present)"
+elif printf '%s\n' "$data_files" | grep -q -- '-replica\.db$' || [ -n "$(env_value TURSO_DATABASE_URL)" ]; then
+  STATE=turso
+  ok "upgrade from Turso (no essl.db; replica files or TURSO_DATABASE_URL found)"
+elif printf '%s\n' "$data_files" | grep -qx 'essl.db-wal'; then
+  die "the data folder has essl.db-wal but no essl.db; move it aside (it would replay onto a new file), then re-run"
+else
+  STATE=fresh
+  ok "fresh install (empty data folder)"
+fi
+
+# --- 2c. Pre-update snapshot -------------------------------------------------
+# An update can migrate the schema. Before that, push a snapshot to R2.
+if [ "$STATE" = update ] && [ "$CHECK_ONLY" = 0 ] && [ "$SKIP_BACKUP" = 0 ]; then
   step "Snapshot before update (R2)"
-  if docker compose run --rm --no-deps nightly-export python -m essl_hub.nightly_export --once; then
-    ok "snapshot uploaded to R2 nightly/"
+  if docker compose run --rm --no-deps backup python -m essl_hub.backup now; then
+    ok "snapshot uploaded to R2 recent/"
   else
-    warn "snapshot failed (see above). Turso point-in-time recovery still covers you."
+    warn "snapshot failed (see above). The last scheduled snapshot is still in R2."
     confirm "Continue the update without a fresh snapshot?" || die "stopped; fix R2 or re-run with --skip-backup"
   fi
 fi
 
-# --- 3. Build ---------------------------------------------------------------
-step "Building images (first run takes a few minutes)"
-docker compose build --quiet
-ok "images built"
-
-# Every service runs as 10001:10001 and must be able to write /data.
+# --- 3. Data folder ------------------------------------------------------------
 docker compose run --rm --no-deps --entrypoint sh web -c \
   'id -u | grep -qx 10001 && touch /data/.write-test && rm -f /data/.write-test' >/dev/null \
-  || die "the essl-data volume is not writable by UID 10001. Fix: docker compose run --rm --no-deps -u 0 --entrypoint chown web -R 10001:10001 /data"
-ok "data volume writable"
+  || die "the data folder is not writable by UID 10001. Fix: docker compose run --rm --no-deps -u 0 --entrypoint chown web -R 10001:10001 /data"
+ok "data folder writable"
+
+if [ "$STATE" = turso ]; then
+  step "Upgrade from Turso: one-time cutover needed"
+  echo "  Nothing was started. Run these, then check the health page:"
+  echo "    docker compose stop"
+  echo "    docker compose run --rm backup python -m essl_hub.backup import-turso"
+  echo "    docker compose up -d --build --remove-orphans"
+  echo "    docker compose run --rm backup python -m essl_hub.backup list"
+  echo "  After a week of clean backups: delete the Turso database, clear TURSO_* in .env,"
+  echo "  and delete the old *-replica.db* files. README \"Upgrading from Turso\"."
+  exit 0
+fi
+if [ "$STATE" = fresh ] && [ "$CHECK_ONLY" = 0 ]; then
+  step "Creating the database"
+  # Never start an empty database over existing backups: it would need adopt
+  # and orphan the real data. Exit 0 = backups exist, 3 = none, else unknown.
+  rc=0
+  docker compose run --rm --no-deps backup python -m essl_hub.backup has-backups || rc=$?
+  [ "$rc" = 0 ] && die "R2 already holds backups (latest.json). Restore them instead: docker compose run --rm backup python -m essl_hub.backup restore"
+  [ "$rc" = 3 ] || die "could not check R2 for existing backups (fix R2_* in .env), then re-run; to restore: docker compose run --rm backup python -m essl_hub.backup restore"
+  docker compose run --rm --no-deps backup python -m essl_hub.backup init
+  ok "database created"
+fi
 
 # --- 4. Devices -------------------------------------------------------------
 if [ "$SKIP_DEVICES" = 0 ]; then

@@ -34,13 +34,8 @@ class FakeDatabase:
         self.connection_info = list(_seeded_rows() if connection_info is None else connection_info)
         self.drift_checked: list | None = None
         self.offline = False
-        self.last_sync_ok_at = None
-        self.last_sync_error: str | None = None
         self.initialized = 0
         self.direction_fills: list[list[dict]] = []
-
-    def sync(self) -> bool:
-        return not self.offline
 
     def initialize(self, devices) -> None:
         self.initialized += 1
@@ -260,7 +255,7 @@ class WriteReductionTest(unittest.TestCase):
 
     def test_full_history_polls_with_nothing_new_issue_zero_updates(self) -> None:
         """Devices return their whole log every poll; already-stored punches
-        must not count as a change (Turso sync quota)."""
+        must not count as a change (no needless writes)."""
         import tempfile
 
         from essl_hub.db import Database
@@ -537,11 +532,10 @@ class DynamicDevicesCycleTest(unittest.TestCase):
 
     def _cycle(self) -> list[str]:
         self.polled = []
-        with patch.object(self.database, "sync", return_value=True):
-            collector_main.run_cycle(
-                self.database, self.spool, collector_main.static_devices(),
-                collector=self._collector, state=self.state,
-            )
+        collector_main.run_cycle(
+            self.database, self.spool, collector_main.static_devices(),
+            collector=self._collector, state=self.state,
+        )
         return sorted(self.polled)
 
     def _add_third(self) -> None:
@@ -599,16 +593,14 @@ class _SwitchableDatabase(FakeDatabase):
 
     def _check(self) -> None:
         if self.offline:
-            raise collector_main.frappe_sync.OfflineError("Turso is unreachable")
+            raise collector_main.frappe_sync.OfflineError("database unavailable")
         if self.error is not None:
             raise self.error
 
-    def sync(self) -> bool:
+    def initialize(self, devices) -> None:
         if self.offline:
-            self.last_sync_error = "Turso is unreachable"
-            return False
-        self.last_sync_error = None
-        return True
+            raise collector_main.frappe_sync.OfflineError("database unavailable")
+        super().initialize(devices)
 
     def record_poll(self, device_id, **kwargs) -> int:
         self._check()
@@ -701,14 +693,13 @@ class SpoolCycleTest(unittest.TestCase):
             stamp = datetime.fromisoformat(status[key])
             self.assertLess(abs(ist_now - stamp), timedelta(minutes=1), key)
 
-    def test_boot_with_turso_unreachable_polls_spools_and_reports_then_drains(self) -> None:
+    def test_boot_with_database_unavailable_polls_spools_and_reports_then_drains(self) -> None:
         database = _SwitchableDatabase()
         database.offline = True
         self.batches = [[_punch("fp-1")]]
         with self.assertLogs(collector_main._logger, level="WARNING"):
             status = self._cycle(database)
         self.assertTrue(status["offline"])
-        self.assertEqual(status["last_sync_error"], "Turso is unreachable")
         self.assertEqual(status["spool_depth"], 1)
         self.assertIsNotNone(status["last_poll"])
         self.assertEqual(database.initialized, 0)
@@ -719,26 +710,42 @@ class SpoolCycleTest(unittest.TestCase):
         self.assertEqual(status["spool_depth"], 0)
         self.assertEqual([p["fingerprint"] for p in database.inserted_punches], ["fp-1"])
 
-    def test_boot_against_an_unreachable_real_turso_url_does_not_block(self) -> None:
-        import time as _time
-
+    def test_missing_database_spools_and_waits_without_creating_the_file(self) -> None:
         from essl_hub.db import Database
 
-        database = Database(
-            os.path.join(self.tmp, "replica.db"),
-            sync_url="https://127.0.0.1:1",
-            auth_token="t",
-        )
+        path = os.path.join(self.tmp, "essl.db")
+        database = Database(path, must_exist=True)
         self.batches = [[_punch("fp-1")]]
-        started = _time.monotonic()
-        with self.assertLogs(level="WARNING"):
+        with self.assertLogs(collector_main._logger, level="WARNING") as logs:
             status = self._cycle(database)
-        self.assertLess(_time.monotonic() - started, 30)
-        self.assertTrue(status["offline"])
-        self.assertTrue(status["last_sync_error"])
+        self.assertFalse(os.path.exists(path))
+        self.assertFalse(self.state.ready)
+        self.assertTrue(any("essl_hub.backup init" in line for line in logs.output))
         self.assertEqual(status["spool_depth"], 1)
+        self.assertEqual(status["dead_count"], 0)
 
-    def test_a_row_failing_twenty_replays_while_syncs_succeed_moves_to_dead(self) -> None:
+        # A backup command creates the file; the next cycle migrates and replays.
+        Database(path).migrate_schema()
+        status = self._cycle(database)
+        self.assertTrue(self.state.ready)
+        self.assertEqual(status["spool_depth"], 0)
+        with database.connect() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) AS n FROM punches").fetchone()["n"], 1)
+
+    def test_a_busy_database_spools_and_replay_waits_uncounted(self) -> None:
+        from essl_hub.db import BusyError
+
+        database = _SwitchableDatabase()
+        database.error = BusyError("database is locked")
+        self.batches = [[_punch("fp-1")], [_punch("fp-2")]]
+        with self.assertLogs(collector_main._logger, level="WARNING"):
+            self._cycle(database)
+            status = self._cycle(database)
+        self.assertEqual(status["spool_depth"], 2)
+        self.assertEqual(status["dead_count"], 0)
+        self.assertEqual(self.spool.pending()[0].attempts, 0)
+
+    def test_a_row_failing_twenty_replays_moves_to_dead(self) -> None:
         database = _SwitchableDatabase()
         database.error = RuntimeError("bad row")
         self.batches = [[_punch("fp-1")]]
@@ -784,9 +791,6 @@ class SpoolCycleTest(unittest.TestCase):
             set(status),
             {
                 "last_poll",
-                "last_sync_ok_at",
-                "last_sync_error",
-                "replica_rebuilt_at",
                 "spool_depth",
                 "spool_oldest_at",
                 "dead_count",
@@ -807,12 +811,12 @@ class SpoolCycleTest(unittest.TestCase):
 
         def record_poll(device_id, **kwargs):
             if failing["on"]:
-                raise ValueError("sync error: http dispatch error")
+                raise ValueError("disk I/O error")
             return real_record_poll(device_id, **kwargs)
 
         def insert_punches(punches):
             if failing["on"]:
-                raise ValueError("sync error: http dispatch error")
+                raise ValueError("disk I/O error")
             return real_insert(punches)
 
         database.record_poll = record_poll

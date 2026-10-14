@@ -3,7 +3,7 @@
 A plain stdlib ``sqlite3`` file with no sync. Any failed punch write lands here
 as one batch and is replayed oldest-first on later cycles. Punch inserts are
 fingerprint-keyed, so replaying a half-finished batch is safe. A batch that
-fails ``MAX_ATTEMPTS`` replays while Turso is healthy moves to ``dead``: kept,
+fails ``MAX_ATTEMPTS`` replays moves to ``dead``: kept,
 never dropped, and visible in the collector status file.
 """
 

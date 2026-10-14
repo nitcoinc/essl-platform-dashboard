@@ -1,10 +1,30 @@
 {% extends "_auth_base.html" %}
-{% block title %}Temporarily offline{% endblock %}
+{% block title %}{% if state == "missing" %}Database not set up{% elif state == "busy" %}Busy, try again{% else %}Temporarily offline{% endif %}{% endblock %}
 {% block card %}
+{% if state == "missing" %}
+<div class="auth-title">
+  <h1>Database not set up</h1>
+  <p>The hub has no database file yet, so nothing can be shown.</p>
+</div>
+<p class="auth-note">An administrator runs one of these on the site server, then reloads this page:</p>
+<ul class="auth-note">
+  <li>New install: <code>{{ commands[0] }}</code></li>
+  <li>Recover from backup: <code>{{ commands[1] }}</code></li>
+  <li>Move from Turso (once): <code>{{ commands[2] }}</code></li>
+</ul>
+{% elif state == "busy" %}
+<div class="auth-title">
+  <h1>Busy, try again</h1>
+  <p>The database is busy saving other changes right now.</p>
+</div>
+<p class="auth-note">Nothing was lost. Try again in a few seconds.</p>
+<p class="auth-note"><a href="/">Back to the dashboard</a></p>
+{% else %}
 <div class="auth-title">
   <h1>Temporarily offline</h1>
-  <p>The hub cannot reach its database right now, so changes can't be saved.</p>
+  <p>The hub cannot use its database right now, so changes can't be saved.</p>
 </div>
-<p class="auth-note">Viewing attendance still works from the local copy. Try your change again in a few minutes.</p>
+<p class="auth-note">Try your change again in a few minutes.</p>
 <p class="auth-note"><a href="/">Back to the dashboard</a></p>
+{% endif %}
 {% endblock %}

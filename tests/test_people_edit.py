@@ -16,7 +16,7 @@ class PersonEditRealDatabaseTest(unittest.TestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.database = Database(os.path.join(tmp.name, "hub.db"), sync_url="")
+        self.database = Database(os.path.join(tmp.name, "hub.db"))
         self.addCleanup(self.database.close)
         self.database.migrate_schema()
         self.database.upsert_employee(device_user_id="admin@example.com", name="Admin", email="admin@example.com")
