@@ -172,6 +172,25 @@ def mail_provider() -> str:
     return "resend"
 
 
+def public_url() -> str | None:
+    """The dashboard's public base URL (``ESSL_PUBLIC_URL``), used to build the
+    absolute links in alert and fix-request emails. Background services have no
+    request to derive it from. Unset means emails with links cannot go live.
+    """
+    value = (os.getenv("ESSL_PUBLIC_URL") or "").strip().rstrip("/")
+    if not value:
+        return None
+    if not value.startswith(("https://", "http://")):
+        raise RuntimeError("ESSL_PUBLIC_URL must start with https:// or http://")
+    return value
+
+
+def hr_reply_to() -> str | None:
+    """Reply-To address for alert and fix-request emails (``ESSL_HR_REPLY_TO``)."""
+    value = (os.getenv("ESSL_HR_REPLY_TO") or "").strip()
+    return value or None
+
+
 TIMEZONE_NAME = "Asia/Kolkata"
 
 # Roster uploads are rate-limited at the HTTP layer independently of the row

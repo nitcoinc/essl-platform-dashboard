@@ -57,6 +57,23 @@ class MailProviderTest(unittest.TestCase):
         self.assertIn("ESSL_MAIL_PROVIDER", str(ctx.exception))
 
 
+class LinkConfigTest(unittest.TestCase):
+    def test_public_url_strips_trailing_slash_and_needs_a_scheme(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(config.public_url())
+        with patch.dict(os.environ, {"ESSL_PUBLIC_URL": " https://hub.example.com/ "}, clear=True):
+            self.assertEqual(config.public_url(), "https://hub.example.com")
+        with patch.dict(os.environ, {"ESSL_PUBLIC_URL": "hub.example.com"}, clear=True):
+            with self.assertRaises(RuntimeError):
+                config.public_url()
+
+    def test_hr_reply_to_is_optional(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(config.hr_reply_to())
+        with patch.dict(os.environ, {"ESSL_HR_REPLY_TO": "hr@example.com"}, clear=True):
+            self.assertEqual(config.hr_reply_to(), "hr@example.com")
+
+
 class CloudflareSendTest(unittest.TestCase):
     ENV = {
         "ESSL_MAIL_PROVIDER": "cloudflare",
