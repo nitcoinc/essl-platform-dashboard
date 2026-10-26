@@ -39,6 +39,21 @@ from essl_hub.db import OfflineError
 from essl_hub.web import create_app
 
 
+# Device columns added in schema v7, with their database defaults.
+_V7_DEVICE_DEFAULTS = {
+    "duplicate_window_seconds": 60,
+    "door_denied_since": None,
+    "door_params": None,
+    "door_params_read_at": None,
+    "door_params_previous": None,
+    "door_params_previous_for": None,
+    "door_params_request": None,
+    "door_params_requested_at": None,
+    "door_params_result": None,
+    "policy_updated_at": None,
+}
+
+
 class FakeDatabase:
     """In-memory stand-in for essl_hub.db.Database, implementing the same
     interface, so the whole web layer can be exercised without Postgres."""
@@ -54,6 +69,7 @@ class FakeDatabase:
         self._next_login_code_id = 1
         self.sessions: dict[str, dict] = {}
         self.api_keys_list: list[dict] = []
+        self.device_change_rows: list[dict] = []
         # `offline` makes every write raise OfflineError, the way an
         # unavailable database does.
         self.offline = False
@@ -86,6 +102,7 @@ class FakeDatabase:
                 "connection_updated_at": None,
                 "created_at": None,
                 "retired_at": None,
+                **_V7_DEVICE_DEFAULTS,
             }
         self.settings.setdefault("daily_target_minutes", "480")
 
@@ -140,7 +157,7 @@ class FakeDatabase:
             "serial_number": None, "firmware": None, "last_attempt": None,
             "last_success": None, "last_error": None, "records_seen": 0,
             "comm_password": comm_password, "connection_updated_at": now,
-            "created_at": now, "retired_at": None,
+            "created_at": now, "retired_at": None, **_V7_DEVICE_DEFAULTS,
         }
 
     def set_device_retired(self, device_id: str, retired: bool) -> None:
@@ -149,6 +166,92 @@ class FakeDatabase:
 
     def devices_at_address(self, ip: str, port: int) -> list[dict]:
         return [d for d in self.devices_by_id.values() if d["ip"] == ip and d["port"] == port]
+
+    # swipe policy and door parameters (v7) -------------------------------
+
+    def _change(self, device_id, actor_id, kind, old_value, new_value) -> None:
+        self.device_change_rows.append({
+            "id": len(self.device_change_rows) + 1, "device_id": device_id,
+            "actor_employee_id": actor_id, "kind": kind, "old_value": old_value,
+            "new_value": new_value, "created_at": _ist_now(),
+        })
+
+    def set_device_policy(self, device_id, *, window_seconds, wait_for_door_close, actor_id=None) -> bool:
+        self._check_online()
+        if isinstance(window_seconds, bool) or not isinstance(window_seconds, int) \
+                or not 0 <= window_seconds <= 300:
+            raise ValueError("window must be 0-300 seconds")
+        device = self.devices_by_id.get(device_id)
+        if device is None:
+            return False
+        old = {"duplicate_window_seconds": device["duplicate_window_seconds"],
+               "wait_for_door_close": device["door_denied_since"] is None}
+        now = _ist_now()
+        device["duplicate_window_seconds"] = window_seconds
+        device["door_denied_since"] = None if wait_for_door_close else (device["door_denied_since"] or now)
+        device["policy_updated_at"] = now
+        self._change(device_id, actor_id, "policy", old,
+                     {"duplicate_window_seconds": window_seconds,
+                      "wait_for_door_close": bool(wait_for_door_close)})
+        return True
+
+    def file_door_request(self, device_id, request, *, kind="door_write", requested_at=None, actor_id=None) -> bool:
+        self._check_online()
+        device = self.devices_by_id.get(device_id)
+        if device is None:
+            return False
+        current = device["door_params"] or {}
+        device["door_params_request"] = dict(request)
+        device["door_params_requested_at"] = requested_at or _ist_now()
+        self._change(device_id, actor_id, kind, {k: current.get(k) for k in request}, dict(request))
+        return True
+
+    def dismiss_door_request(self, device_id, *, actor_id=None) -> bool:
+        self._check_online()
+        device = self.devices_by_id.get(device_id)
+        if device is None:
+            return False
+        old = {"request": device["door_params_request"],
+               "requested_at": device["door_params_requested_at"],
+               "result": device["door_params_result"]}
+        device["door_params_request"] = None
+        device["door_params_requested_at"] = None
+        device["door_params_result"] = None
+        self._change(device_id, actor_id, "door_dismiss", old, None)
+        return True
+
+    def record_door_params(self, device_id, *, params, read_at, result=None, previous=None, previous_for=None) -> None:
+        device = self.devices_by_id[device_id]
+        device["door_params"] = dict(params)
+        device["door_params_read_at"] = read_at
+        if result is not None:
+            device["door_params_result"] = dict(result)
+        if previous is not None and previous_for is not None \
+                and device["door_params_previous_for"] != previous_for:
+            device["door_params_previous"] = dict(previous)
+            device["door_params_previous_for"] = previous_for
+
+    def clear_door_request(self, device_id, requested_at) -> bool:
+        device = self.devices_by_id[device_id]
+        if device["door_params_requested_at"] != requested_at:
+            return False
+        device["door_params_request"] = None
+        device["door_params_requested_at"] = None
+        return True
+
+    def device_windows(self) -> dict[str, int]:
+        return {d["id"]: d["duplicate_window_seconds"] for d in self.devices_by_id.values()}
+
+    def record_device_change(self, device_id, *, kind, old_value, new_value, actor_id=None) -> None:
+        self._check_online()
+        self._change(device_id, actor_id, kind, old_value, new_value)
+
+    def device_changes(self, device_id, limit=20) -> list[dict]:
+        rows = [r for r in self.device_change_rows if r["device_id"] == device_id]
+        return [
+            {**r, "actor_name": (self.employees_by_id.get(r["actor_employee_id"]) or {}).get("name")}
+            for r in reversed(rows)
+        ][:limit]
 
     # punches --------------------------------------------------------------
 

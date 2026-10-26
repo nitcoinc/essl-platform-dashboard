@@ -11,6 +11,20 @@ from essl_hub.config import DeviceConfig
 from essl_hub import db as db_module
 
 
+V7_DEVICE_COLUMNS = (
+    "duplicate_window_seconds",
+    "door_denied_since",
+    "door_params",
+    "door_params_read_at",
+    "door_params_previous",
+    "door_params_previous_for",
+    "door_params_request",
+    "door_params_requested_at",
+    "door_params_result",
+    "policy_updated_at",
+)
+
+
 class DatabaseTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -80,6 +94,7 @@ class DatabaseTest(unittest.TestCase):
                 "frappe_sync_log",
                 "branding_assets",
                 "employee_device_ids",
+                "device_changes",
             },
         )
 
@@ -227,7 +242,8 @@ class DatabaseTest(unittest.TestCase):
             self.assertEqual(
                 set(row.keys()),
                 {"id", "site", "model", "protocol", "ip", "port", "comm_password",
-                 "connection_updated_at"},
+                 "connection_updated_at", "duplicate_window_seconds", "door_denied_since",
+                 "door_params_request", "door_params_requested_at"},
             )
 
     def _retire(self, device_id: str) -> None:
@@ -370,7 +386,7 @@ class DatabaseTest(unittest.TestCase):
             ).fetchone()
         self.assertIn("archived_at", columns)
         self.assertIsNotNone(table)
-        self.assertEqual((version, marker), (6, "6"))
+        self.assertEqual((version, marker), (db_module.SCHEMA_VERSION, str(db_module.SCHEMA_VERSION)))
         self.assertIsNone(old.employee_by_device_user_id("118")["archived_at"])
 
     def test_fresh_database_has_v6_schema(self) -> None:
@@ -380,6 +396,208 @@ class DatabaseTest(unittest.TestCase):
                 "PRAGMA table_info(employee_device_ids)").fetchall()}
         self.assertIn("archived_at", columns)
         self.assertEqual(extra, {"device_user_id", "employee_id", "created_at"})
+
+    def test_v6_to_v7_adds_policy_door_state_and_audit_and_reruns_safely(self) -> None:
+        self.database.close()
+        path = os.path.join(self._tmp.name, "v6.db")
+        old = db_module.Database(path)
+        self.addCleanup(old.close)
+        with mock.patch.object(db_module, "SCHEMA_VERSION", 6), \
+                mock.patch.dict(db_module.MIGRATIONS, {}, clear=False):
+            db_module.MIGRATIONS.pop(7)
+            old.initialize(self.devices)
+        with old.connect() as connection:
+            columns = {r["name"] for r in connection.execute("PRAGMA table_info(devices)").fetchall()}
+        self.assertNotIn("duplicate_window_seconds", columns)
+        old.migrate_schema()
+        with old.transaction() as connection:  # simulate a re-run of step 7
+            connection.execute("UPDATE settings SET value='6' WHERE key='schema_version'")
+            connection.execute("PRAGMA user_version=6")
+        old.migrate_schema()
+        old.migrate_schema()
+        with old.connect() as connection:
+            columns = {r["name"] for r in connection.execute("PRAGMA table_info(devices)").fetchall()}
+            version = connection.execute("PRAGMA user_version").fetchone()["user_version"]
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='device_changes'"
+            ).fetchone()
+        self.assertTrue(set(V7_DEVICE_COLUMNS) <= columns)
+        self.assertIsNotNone(table)
+        self.assertEqual(version, 7)
+        for device in old.devices():
+            self.assertEqual(device["duplicate_window_seconds"], 60)
+            self.assertIsNone(device["door_denied_since"])
+        self.assertEqual(old.device_windows(), {"uppal-x990": 60, "gachibowli-c3-400": 60})
+
+    def test_fresh_database_has_v7_schema(self) -> None:
+        with self.database.connect() as connection:
+            columns = {r["name"] for r in connection.execute("PRAGMA table_info(devices)").fetchall()}
+            changes = {r["name"] for r in connection.execute(
+                "PRAGMA table_info(device_changes)").fetchall()}
+        self.assertTrue(set(V7_DEVICE_COLUMNS) <= columns)
+        self.assertEqual(
+            changes,
+            {"id", "device_id", "actor_employee_id", "kind", "old_value", "new_value", "created_at"},
+        )
+
+    def test_device_policy_window_range(self) -> None:
+        for bad in (-1, 301, True, "10"):
+            with self.assertRaises(ValueError):
+                self.database.set_device_policy(
+                    "uppal-x990", window_seconds=bad, wait_for_door_close=True)
+        self.assertEqual(self.database.device_windows()["uppal-x990"], 60)
+        for good in (0, 300):
+            self.assertTrue(self.database.set_device_policy(
+                "uppal-x990", window_seconds=good, wait_for_door_close=True))
+            self.assertEqual(self.database.device_windows()["uppal-x990"], good)
+        self.assertFalse(self.database.set_device_policy(
+            "missing", window_seconds=10, wait_for_door_close=True))
+
+    def test_device_policy_door_close_and_audit_row(self) -> None:
+        admin = self._employee("1", "admin@x.com")
+        c3 = "gachibowli-c3-400"
+        self.database.set_device_policy(c3, window_seconds=10, wait_for_door_close=False, actor_id=admin)
+        device = self.database.device_by_id(c3)
+        since = device["door_denied_since"]
+        self.assertIsNotNone(since)
+        self.assertIsNotNone(device["policy_updated_at"])
+        # Still unchecked: the start of capture does not move.
+        with self.database.transaction() as connection:
+            connection.execute("UPDATE devices SET door_denied_since=? WHERE id=?",
+                               (datetime(2026, 10, 1, 9, 0), c3))
+        self.database.set_device_policy(c3, window_seconds=10, wait_for_door_close=False, actor_id=admin)
+        self.assertEqual(self.database.device_by_id(c3)["door_denied_since"], datetime(2026, 10, 1, 9, 0))
+        self.database.set_device_policy(c3, window_seconds=5, wait_for_door_close=True, actor_id=admin)
+        self.assertIsNone(self.database.device_by_id(c3)["door_denied_since"])
+        changes = self.database.device_changes(c3)
+        self.assertEqual(len(changes), 3)
+        self.assertEqual(changes[0]["kind"], "policy")
+        self.assertEqual(changes[0]["actor_employee_id"], admin)
+        self.assertEqual(changes[0]["actor_name"], "admin@x.com")
+        self.assertEqual(changes[0]["old_value"],
+                         {"duplicate_window_seconds": 10, "wait_for_door_close": False})
+        self.assertEqual(changes[0]["new_value"],
+                         {"duplicate_window_seconds": 5, "wait_for_door_close": True})
+        self.assertEqual(changes[-1]["old_value"],
+                         {"duplicate_window_seconds": 60, "wait_for_door_close": True})
+
+    def test_policy_rolls_back_with_failed_audit_row(self) -> None:
+        with mock.patch.object(db_module, "_insert_device_change", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self.database.set_device_policy(
+                    "uppal-x990", window_seconds=5, wait_for_door_close=True)
+        self.assertEqual(self.database.device_windows()["uppal-x990"], 60)
+
+    def test_connection_info_carries_policy_and_request(self) -> None:
+        t1 = datetime(2026, 10, 26, 10, 0, 0)
+        self.database.file_door_request("gachibowli-c3-400", {"Door1Intertime": 0}, requested_at=t1)
+        info = {row["id"]: row for row in self.database.device_connection_info()}
+        c3 = info["gachibowli-c3-400"]
+        self.assertEqual(c3["duplicate_window_seconds"], 60)
+        self.assertIsNone(c3["door_denied_since"])
+        self.assertEqual(c3["door_params_request"], {"Door1Intertime": 0})
+        self.assertEqual(c3["door_params_requested_at"], t1)
+
+    def test_door_request_replaced_then_guarded_clear_keeps_newer(self) -> None:
+        c3 = "gachibowli-c3-400"
+        t1 = datetime(2026, 10, 26, 10, 0, 0)
+        t2 = datetime(2026, 10, 26, 10, 5, 0)
+        self.database.file_door_request(c3, {"Door1Intertime": 0}, requested_at=t1)
+        self.database.file_door_request(c3, {"Door1Intertime": 2}, requested_at=t2)
+        self.assertFalse(self.database.clear_door_request(c3, t1))
+        device = self.database.device_by_id(c3)
+        self.assertEqual(device["door_params_request"], {"Door1Intertime": 2})
+        self.assertEqual(device["door_params_requested_at"], t2)
+        self.assertTrue(self.database.clear_door_request(c3, t2))
+        device = self.database.device_by_id(c3)
+        self.assertIsNone(device["door_params_request"])
+        self.assertIsNone(device["door_params_requested_at"])
+
+    def test_door_request_validates_and_audits_old_values(self) -> None:
+        c3 = "gachibowli-c3-400"
+        for bad in ({"Door1Intertime": "0"}, {"Door1Intertime": True}, {1: 0}):
+            with self.assertRaises(ValueError):
+                self.database.file_door_request(c3, bad)
+        with self.assertRaises(ValueError):
+            self.database.file_door_request(c3, {}, kind="policy")
+        self.assertIsNone(self.database.device_by_id(c3)["door_params_request"])
+        self.database.record_door_params(
+            c3, params={"Door1Intertime": 1, "InterLock": 0}, read_at=datetime(2026, 10, 26, 9, 0))
+        self.database.file_door_request(c3, {"Door1Intertime": 0})
+        self.database.file_door_request(c3, {}, kind="door_read")
+        changes = self.database.device_changes(c3)
+        self.assertEqual([c["kind"] for c in changes], ["door_read", "door_write"])
+        self.assertEqual(changes[1]["old_value"], {"Door1Intertime": 1})
+        self.assertEqual(changes[1]["new_value"], {"Door1Intertime": 0})
+        self.assertEqual(changes[0]["new_value"], {})
+
+    def test_dismiss_clears_request_and_result_files_nothing(self) -> None:
+        c3 = "gachibowli-c3-400"
+        self.database.file_door_request(c3, {"Door1Intertime": 0},
+                                         requested_at=datetime(2026, 10, 26, 10, 0))
+        self.database.record_door_params(
+            c3, params={"Door1Intertime": 1}, read_at=datetime(2026, 10, 26, 10, 1),
+            result={"status": "failed", "keys": {"Door1Intertime": "panel kept 1"}})
+        self.assertTrue(self.database.dismiss_door_request(c3, actor_id=None))
+        device = self.database.device_by_id(c3)
+        self.assertIsNone(device["door_params_request"])
+        self.assertIsNone(device["door_params_requested_at"])
+        self.assertIsNone(device["door_params_result"])
+        self.assertEqual(device["door_params"], {"Door1Intertime": 1})
+        changes = self.database.device_changes(c3)
+        self.assertEqual([c["kind"] for c in changes], ["door_dismiss", "door_write"])
+        self.assertEqual(changes[0]["old_value"]["request"], {"Door1Intertime": 0})
+        self.assertIsNone(changes[0]["new_value"])
+
+    def test_recording_door_result_leaves_policy_untouched(self) -> None:
+        c3 = "gachibowli-c3-400"
+        self.database.set_device_policy(c3, window_seconds=10, wait_for_door_close=False)
+        before = self.database.device_by_id(c3)
+        self.database.record_door_params(
+            c3, params={"Door1Intertime": 0}, read_at=datetime(2026, 10, 26, 10, 1),
+            result={"status": "applied"})
+        after = self.database.device_by_id(c3)
+        for column in ("duplicate_window_seconds", "door_denied_since", "policy_updated_at"):
+            self.assertEqual(after[column], before[column])
+        self.assertEqual(after["door_params"], {"Door1Intertime": 0})
+        self.assertEqual(after["door_params_read_at"], datetime(2026, 10, 26, 10, 1))
+        self.assertEqual(after["door_params_result"], {"status": "applied"})
+        # A plain read (no result) keeps the last result.
+        self.database.record_door_params(
+            c3, params={"Door1Intertime": 0}, read_at=datetime(2026, 10, 26, 16, 0))
+        self.assertEqual(self.database.device_by_id(c3)["door_params_result"], {"status": "applied"})
+
+    def test_previous_snapshot_kept_once_per_request(self) -> None:
+        c3 = "gachibowli-c3-400"
+        t1 = datetime(2026, 10, 26, 10, 0, 0)
+        t2 = datetime(2026, 10, 26, 11, 0, 0)
+        read = datetime(2026, 10, 26, 10, 1)
+        self.database.record_door_params(
+            c3, params={"Door1Intertime": 0}, read_at=read,
+            previous={"Door1Intertime": 1}, previous_for=t1)
+        self.database.record_door_params(
+            c3, params={"Door1Intertime": 0}, read_at=read,
+            previous={"Door1Intertime": 0}, previous_for=t1)
+        device = self.database.device_by_id(c3)
+        self.assertEqual(device["door_params_previous"], {"Door1Intertime": 1})
+        self.assertEqual(device["door_params_previous_for"], t1)
+        # Reads without a request never touch the snapshot.
+        self.database.record_door_params(c3, params={"Door1Intertime": 5}, read_at=read)
+        self.assertEqual(self.database.device_by_id(c3)["door_params_previous"], {"Door1Intertime": 1})
+        self.database.record_door_params(
+            c3, params={"Door1Intertime": 3}, read_at=read,
+            previous={"Door1Intertime": 5}, previous_for=t2)
+        device = self.database.device_by_id(c3)
+        self.assertEqual(device["door_params_previous"], {"Door1Intertime": 5})
+        self.assertEqual(device["door_params_previous_for"], t2)
+
+    def test_record_device_change_appends_and_rejects_unknown_kind(self) -> None:
+        self.database.record_device_change(
+            "uppal-x990", kind="policy", old_value=None, new_value={"x": 1})
+        self.assertEqual(len(self.database.device_changes("uppal-x990")), 1)
+        with self.assertRaises(ValueError):
+            self.database.record_device_change(
+                "uppal-x990", kind="other", old_value=None, new_value=None)
 
     def _employee(self, device_user_id: str, email: str) -> int:
         self.database.upsert_employee(device_user_id=device_user_id, name=email, email=email)

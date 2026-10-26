@@ -18,7 +18,7 @@ _TZ = ZoneInfo(TIMEZONE_NAME)
 _logger = logging.getLogger(__name__)
 
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # libsql exposes no declared column types (U8), so read-side conversion is by
 # column name. Every TIMESTAMP column in the schema is listed here.
@@ -38,9 +38,24 @@ TIMESTAMP_COLUMNS = frozenset(
         "synced_at",
         "archived_at",
         "last_punch",
+        "door_denied_since",
+        "door_params_read_at",
+        "door_params_previous_for",
+        "door_params_requested_at",
+        "policy_updated_at",
     }
 )
-JSON_COLUMNS = frozenset({"raw_json"})
+JSON_COLUMNS = frozenset(
+    {
+        "raw_json",
+        "door_params",
+        "door_params_previous",
+        "door_params_request",
+        "door_params_result",
+        "old_value",
+        "new_value",
+    }
+)
 
 
 class RuleViolation(ValueError):
@@ -455,7 +470,40 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         END
         """,
     ),
+    # v7: per-device swipe policy (KTD3, KTD5), C3 door-parameter state kept
+    # for the collector (KTD6, KTD9), and an append-only audit log (KTD11).
+    7: (
+        "ALTER TABLE devices ADD COLUMN duplicate_window_seconds INTEGER NOT NULL DEFAULT 60",
+        "ALTER TABLE devices ADD COLUMN door_denied_since TIMESTAMP",
+        "ALTER TABLE devices ADD COLUMN door_params TEXT",
+        "ALTER TABLE devices ADD COLUMN door_params_read_at TIMESTAMP",
+        "ALTER TABLE devices ADD COLUMN door_params_previous TEXT",
+        "ALTER TABLE devices ADD COLUMN door_params_previous_for TIMESTAMP",
+        "ALTER TABLE devices ADD COLUMN door_params_request TEXT",
+        "ALTER TABLE devices ADD COLUMN door_params_requested_at TIMESTAMP",
+        "ALTER TABLE devices ADD COLUMN door_params_result TEXT",
+        "ALTER TABLE devices ADD COLUMN policy_updated_at TIMESTAMP",
+        """
+        CREATE TABLE IF NOT EXISTS device_changes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT NOT NULL REFERENCES devices(id),
+            actor_employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            kind TEXT NOT NULL CHECK (kind IN
+                ('policy', 'door_write', 'door_read', 'door_restore', 'door_dismiss')),
+            old_value TEXT,
+            new_value TEXT,
+            created_at TIMESTAMP NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_device_changes_device ON device_changes(device_id, created_at)",
+    ),
 }
+
+# Quick-swipe window bounds in seconds (KTD3); 0 counts every swipe.
+DUPLICATE_WINDOW_MAX = 300
+DEVICE_CHANGE_KINDS = frozenset(
+    {"policy", "door_write", "door_read", "door_restore", "door_dismiss"}
+)
 
 _ADD_COLUMN = re.compile(r"^\s*ALTER TABLE (\w+) ADD COLUMN (\w+)", re.IGNORECASE)
 
@@ -700,8 +748,196 @@ class Database:
     def device_connection_info(self) -> list[dict[str, object]]:
         with self.connect() as connection:
             rows = connection.execute(
-                "SELECT id, site, model, protocol, ip, port, comm_password, connection_updated_at "
+                "SELECT id, site, model, protocol, ip, port, comm_password, connection_updated_at, "
+                "duplicate_window_seconds, door_denied_since, door_params_request, "
+                "door_params_requested_at "
                 "FROM devices WHERE retired_at IS NULL ORDER BY site, created_at, id"
+            ).fetchall()
+        return list(rows)
+
+    # --- Swipe policy and C3 door parameters (v7) -------------------------
+
+    def set_device_policy(
+        self,
+        device_id: str,
+        *,
+        window_seconds: int,
+        wait_for_door_close: bool,
+        actor_id: int | None = None,
+    ) -> bool:
+        """Set the quick-swipe window (KTD3) and "Wait for door close" (KTD5),
+        with the audit row in the same transaction (KTD11). Unchecking starts
+        ``door_denied_since`` once; re-checking clears it. False if no device."""
+        if (
+            isinstance(window_seconds, bool)
+            or not isinstance(window_seconds, int)
+            or not 0 <= window_seconds <= DUPLICATE_WINDOW_MAX
+        ):
+            raise ValueError(f"window must be 0-{DUPLICATE_WINDOW_MAX} seconds")
+        now = _now()
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT duplicate_window_seconds, door_denied_since FROM devices WHERE id = ?",
+                (device_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            connection.execute(
+                "UPDATE devices SET duplicate_window_seconds = ?, "
+                "door_denied_since = CASE WHEN ? THEN NULL "
+                "ELSE COALESCE(door_denied_since, ?) END, policy_updated_at = ? WHERE id = ?",
+                (window_seconds, 1 if wait_for_door_close else 0, now, now, device_id),
+            )
+            _insert_device_change(
+                connection, device_id, actor_id, "policy",
+                {
+                    "duplicate_window_seconds": row["duplicate_window_seconds"],
+                    "wait_for_door_close": row["door_denied_since"] is None,
+                },
+                {
+                    "duplicate_window_seconds": window_seconds,
+                    "wait_for_door_close": bool(wait_for_door_close),
+                },
+            )
+        return True
+
+    def file_door_request(
+        self,
+        device_id: str,
+        request: dict[str, int],
+        *,
+        kind: str = "door_write",
+        requested_at: datetime | None = None,
+        actor_id: int | None = None,
+    ) -> bool:
+        """File a door-parameter request for the collector (KTD6), replacing
+        any pending one; an empty map is "Read from device". The audit row
+        holds the last-read value of each requested key as old (KTD11).
+        Whitelist checks live in essl_hub.door_params (KTD8)."""
+        if kind not in ("door_write", "door_read", "door_restore"):
+            raise ValueError(f"not a door request kind: {kind}")
+        if not isinstance(request, dict) or any(
+            not isinstance(key, str) or isinstance(value, bool) or not isinstance(value, int)
+            for key, value in request.items()
+        ):
+            raise ValueError("door request must map keys to integers")
+        requested_at = requested_at or _now()
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT door_params FROM devices WHERE id = ?", (device_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            current = row["door_params"] if isinstance(row["door_params"], dict) else {}
+            connection.execute(
+                "UPDATE devices SET door_params_request = ?, door_params_requested_at = ? "
+                "WHERE id = ?",
+                (dict(request), requested_at, device_id),
+            )
+            _insert_device_change(
+                connection, device_id, actor_id, kind,
+                {key: current.get(key) for key in request},
+                dict(request),
+            )
+        return True
+
+    def dismiss_door_request(self, device_id: str, *, actor_id: int | None = None) -> bool:
+        """Clear the pending request and the last result; files nothing."""
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT door_params_request, door_params_requested_at, door_params_result "
+                "FROM devices WHERE id = ?",
+                (device_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            connection.execute(
+                "UPDATE devices SET door_params_request = NULL, door_params_requested_at = NULL, "
+                "door_params_result = NULL WHERE id = ?",
+                (device_id,),
+            )
+            _insert_device_change(
+                connection, device_id, actor_id, "door_dismiss",
+                {
+                    "request": row["door_params_request"],
+                    "requested_at": row["door_params_requested_at"],
+                    "result": row["door_params_result"],
+                },
+                None,
+            )
+        return True
+
+    def record_door_params(
+        self,
+        device_id: str,
+        *,
+        params: dict[str, int],
+        read_at: datetime,
+        result: dict | None = None,
+        previous: dict[str, int] | None = None,
+        previous_for: datetime | None = None,
+    ) -> None:
+        """Collector side: store a door read and, for a request, its per-key
+        result. ``previous`` is kept once per request (KTD9): a second call for
+        the same ``previous_for`` leaves the first snapshot. Never touches the
+        policy columns (the web owns them)."""
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE devices SET door_params = ?, door_params_read_at = ? WHERE id = ?",
+                (dict(params), read_at, device_id),
+            )
+            if result is not None:
+                connection.execute(
+                    "UPDATE devices SET door_params_result = ? WHERE id = ?",
+                    (dict(result), device_id),
+                )
+            if previous is not None and previous_for is not None:
+                connection.execute(
+                    "UPDATE devices SET door_params_previous = ?, door_params_previous_for = ? "
+                    "WHERE id = ? AND door_params_previous_for IS NOT ?",
+                    (dict(previous), previous_for, device_id, previous_for),
+                )
+
+    def clear_door_request(self, device_id: str, requested_at: datetime) -> bool:
+        """Clear the request only if it is still the one filed at
+        ``requested_at`` (KTD6), so a newer web request survives."""
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE devices SET door_params_request = NULL, door_params_requested_at = NULL "
+                "WHERE id = ? AND door_params_requested_at = ?",
+                (device_id, requested_at),
+            )
+            return cursor.rowcount > 0
+
+    def device_windows(self) -> dict[str, int]:
+        """Quick-swipe window per device, retired ones included (KTD3)."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT id, duplicate_window_seconds FROM devices"
+            ).fetchall()
+        return {row["id"]: int(row["duplicate_window_seconds"]) for row in rows}
+
+    def record_device_change(
+        self,
+        device_id: str,
+        *,
+        kind: str,
+        old_value: dict | None,
+        new_value: dict | None,
+        actor_id: int | None = None,
+    ) -> None:
+        """Append one audit row on its own (KTD11)."""
+        with self.transaction() as connection:
+            _insert_device_change(connection, device_id, actor_id, kind, old_value, new_value)
+
+    def device_changes(self, device_id: str, limit: int = 20) -> list[dict[str, object]]:
+        """Newest audit rows first, with the actor's name when known."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT c.*, e.name AS actor_name FROM device_changes c "
+                "LEFT JOIN employees e ON e.id = c.actor_employee_id "
+                "WHERE c.device_id = ? ORDER BY c.created_at DESC, c.id DESC LIMIT ?",
+                (device_id, limit),
             ).fetchall()
         return list(rows)
 
@@ -1509,6 +1745,24 @@ def reports_message(count: int) -> str:
 
 def _now() -> datetime:
     return datetime.now(_TZ).replace(tzinfo=None)
+
+
+def _insert_device_change(
+    connection: _Connection,
+    device_id: str,
+    actor_id: int | None,
+    kind: str,
+    old_value: dict | None,
+    new_value: dict | None,
+) -> None:
+    """Append an audit row inside the caller's transaction (KTD11)."""
+    if kind not in DEVICE_CHANGE_KINDS:
+        raise ValueError(f"unknown device change kind: {kind}")
+    connection.execute(
+        "INSERT INTO device_changes (device_id, actor_employee_id, kind, old_value, "
+        "new_value, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (device_id, actor_id, kind, old_value, new_value, _now()),
+    )
 
 
 _PUNCH_COLUMNS = (
