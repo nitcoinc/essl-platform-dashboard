@@ -4,11 +4,12 @@ import os
 import tempfile
 import threading
 import unittest
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from unittest import mock
 
 from essl_hub.config import DeviceConfig
 from essl_hub import db as db_module
+from essl_hub.hashing import sha256_hex
 
 
 V7_DEVICE_COLUMNS = (
@@ -22,6 +23,17 @@ V7_DEVICE_COLUMNS = (
     "door_params_requested_at",
     "door_params_result",
     "policy_updated_at",
+)
+
+V8_TABLES = (
+    "attendance_baselines",
+    "attendance_alerts",
+    "mail_outbox",
+    "fix_report_links",
+    "fix_requests",
+    "fix_request_lines",
+    "punch_corrections",
+    "fix_request_events",
 )
 
 
@@ -95,6 +107,7 @@ class DatabaseTest(unittest.TestCase):
                 "branding_assets",
                 "employee_device_ids",
                 "device_changes",
+                *V8_TABLES,
             },
         )
 
@@ -423,7 +436,7 @@ class DatabaseTest(unittest.TestCase):
             ).fetchone()
         self.assertTrue(set(V7_DEVICE_COLUMNS) <= columns)
         self.assertIsNotNone(table)
-        self.assertEqual(version, 7)
+        self.assertEqual(version, db_module.SCHEMA_VERSION)
         for device in old.devices():
             self.assertEqual(device["duplicate_window_seconds"], 60)
             self.assertIsNone(device["door_denied_since"])
@@ -1310,6 +1323,464 @@ class DatabaseTest(unittest.TestCase):
         )
         self.database.set_device_retired("kondapur-c3-400", False)
         self.assertIsNone(self.database.device_by_id("kondapur-c3-400")["retired_at"])
+
+
+DAY = date(2026, 10, 26)
+
+
+class MissedPunchSchemaTest(unittest.TestCase):
+    """Schema v8: alerts, outbox, report links, fix requests (plan U1)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = os.path.join(self._tmp.name, "essl.db")
+        self.database = db_module.Database(self.path)
+        self.addCleanup(self.database.close)
+        self.database.initialize(())
+        self.asha = self._person("101", "Asha", "employee")
+        self.hari = self._person("102", "Hari", "hr")
+        self.hema = self._person("103", "Hema", "hr")
+        self.adam = self._person("104", "Adam", "admin")
+
+    def _person(self, uid: str, name: str, role: str) -> int:
+        self.database.upsert_employee(device_user_id=uid, name=name, email=f"{name.lower()}@x.com")
+        employee_id = self.database.employee_by_device_user_id(uid)["id"]
+        self.database.set_employee_role(employee_id, role)
+        return employee_id
+
+    def _count(self, table: str) -> int:
+        with self.database.connect() as connection:
+            return connection.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+
+    def _file(self, *lines, employee=None, day=DAY, source="link"):
+        return self.database.file_fix_lines(
+            employee or self.asha, day, list(lines), source=source, punch_set_hash="h1")
+
+    @staticmethod
+    def _add_in(hour: int = 13, minute: int = 40, note=None) -> dict:
+        return {"kind": "add_in", "event_time": datetime(2026, 10, 26, hour, minute), "note": note}
+
+    # --- migration and types ----------------------------------------------
+
+    def test_v7_to_v8_creates_tables_keeps_data_and_reruns_safely(self) -> None:
+        path = os.path.join(self._tmp.name, "v7.db")
+        old = db_module.Database(path)
+        self.addCleanup(old.close)
+        device = DeviceConfig(
+            id="uppal-x990", site="Uppal", model="X990", ip="10.0.0.1", port=4370,
+            protocol="zk-attendance", password_env="ESSL_X990_PASSWORD",
+        )
+        with mock.patch.object(db_module, "SCHEMA_VERSION", 7), \
+                mock.patch.dict(db_module.MIGRATIONS, {}, clear=False):
+            db_module.MIGRATIONS.pop(8)
+            old.initialize((device,))
+            old.insert_punches([{
+                "fingerprint": "fp-v7", "device_id": "uppal-x990", "site": "Uppal",
+                "device_user_id": "7", "event_timestamp": datetime(2026, 10, 20, 9, 0),
+            }])
+            old.set_setting("daily_target_minutes", "450")
+        with old.connect() as connection:
+            names = {r["name"] for r in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        self.assertFalse(set(V8_TABLES) & names)
+        old.migrate_schema()
+        with old.transaction() as connection:  # simulate a re-run of step 8
+            connection.execute("UPDATE settings SET value='7' WHERE key='schema_version'")
+            connection.execute("PRAGMA user_version=7")
+        old.migrate_schema()
+        old.migrate_schema()
+        with old.connect() as connection:
+            names = {r["name"] for r in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            version = connection.execute("PRAGMA user_version").fetchone()["user_version"]
+            fingerprints = [r["fingerprint"] for r in connection.execute(
+                "SELECT fingerprint FROM punches").fetchall()]
+        self.assertTrue(set(V8_TABLES) <= names)
+        self.assertEqual(version, 8)
+        self.assertEqual(fingerprints, ["fp-v7"])
+        self.assertEqual(old.setting("daily_target_minutes"), "450")
+        self.assertEqual(old.device_windows(), {"uppal-x990": 60})
+
+    def test_work_day_round_trips_as_a_date_and_datetimes_still_bind_as_timestamps(self) -> None:
+        self.assertTrue(self.database.record_alert(
+            employee_id=self.asha, work_day=DAY, kind="live", mode="shadow", status="recorded"))
+        with self.database.connect() as connection:
+            raw = connection.execute(
+                "SELECT CAST(work_day AS TEXT) AS day_text, created_at FROM attendance_alerts"
+            ).fetchone()
+            row = connection.execute("SELECT work_day FROM attendance_alerts").fetchone()
+        self.assertEqual(raw["day_text"], "2026-10-26")
+        self.assertIsInstance(raw["created_at"], datetime)
+        self.assertEqual(type(row["work_day"]), date)
+        self.assertEqual(row["work_day"], DAY)
+        self.assertEqual(db_module._bind([DAY, datetime(2026, 10, 26, 9, 5)]),
+                         ("2026-10-26", "2026-10-26 09:05:00"))
+
+    # --- baselines -------------------------------------------------------------
+
+    def test_baseline_snapshots_latest_and_prune(self) -> None:
+        self.assertIsNone(self.database.latest_baseline_at())
+        self.assertEqual(self.database.latest_baselines(), {})
+        for week in range(6):
+            snapshot = self.database.record_baselines([
+                {"employee_id": self.asha, "punched_days": 20 + week, "clean_days": 12,
+                 "metrics": {"limit_minutes": 90 + week}},
+                {"employee_id": self.hari, "punched_days": 3, "clean_days": 1, "metrics": None},
+            ])
+            self.assertEqual(snapshot, week + 1)
+        latest = self.database.latest_baselines()
+        self.assertEqual(latest[self.asha]["metrics"], {"limit_minutes": 95})
+        self.assertEqual(latest[self.asha]["punched_days"], 25)
+        self.assertIsNone(latest[self.hari]["metrics"])
+        self.assertIsInstance(self.database.latest_baseline_at(), datetime)
+        self.assertEqual(self.database.prune_baselines(), 4)
+        with self.database.connect() as connection:
+            kept = [r["snapshot_id"] for r in connection.execute(
+                "SELECT DISTINCT snapshot_id FROM attendance_baselines ORDER BY snapshot_id")]
+        self.assertEqual(kept, [3, 4, 5, 6])
+
+    # --- alerts and outbox ----------------------------------------------------
+
+    def test_second_alert_for_same_day_and_kind_reports_already_recorded(self) -> None:
+        mail = {"recipients": ["asha@x.com"], "subject": "S", "text_body": "T", "html_body": "<p>T</p>"}
+        self.assertTrue(self.database.record_alert(
+            employee_id=self.asha, work_day=DAY, kind="live", mode="live", status="queued",
+            site="Uppal", detail={"out_minutes": 120}, mail=mail))
+        self.assertFalse(self.database.record_alert(
+            employee_id=self.asha, work_day=DAY, kind="live", mode="live", status="queued", mail=mail))
+        self.assertEqual(self._count("mail_outbox"), 1)
+        # Another kind, or another day, is a separate alert.
+        self.assertTrue(self.database.record_alert(
+            employee_id=self.asha, work_day=DAY, kind="morning", mode="shadow", status="recorded"))
+        self.assertTrue(self.database.record_alert(
+            employee_id=self.asha, work_day=DAY + timedelta(days=1), kind="live", mode="shadow",
+            status="breaker", site="Uppal"))
+        alerts = self.database.alerts_for_day(DAY)
+        self.assertEqual([(a["kind"], a["employee_name"]) for a in alerts],
+                         [("live", "Asha"), ("morning", "Asha")])
+        self.assertEqual(alerts[0]["detail"], {"out_minutes": 120})
+        self.assertIsNotNone(alerts[0]["outbox_id"])
+        counts = {(r["site"], r["kind"], r["status"]): r["n"]
+                  for r in self.database.alert_counts(DAY)}
+        self.assertEqual(counts, {("Uppal", "live", "queued"): 1, (None, "morning", "recorded"): 1,
+                                  ("Uppal", "live", "breaker"): 1})
+        with self.assertRaises(ValueError):
+            self.database.record_alert(
+                employee_id=self.asha, work_day=DAY, kind="weekly", mode="live", status="queued")
+
+    def test_outbox_retries_with_backoff_then_fails_and_nulls_bodies(self) -> None:
+        start = datetime(2026, 10, 26, 10, 0)
+        with mock.patch.object(db_module, "_now", return_value=start):
+            self.database.record_alert(
+                employee_id=self.asha, work_day=DAY, kind="live", mode="live", status="queued",
+                mail={"recipients": ["Asha@x.com", "asha@X.com", " "], "subject": "S",
+                      "text_body": "token-body", "html_body": "<p>token-body</p>"})
+            [row] = self.database.due_mail()
+            self.assertEqual(row["recipients"], ["Asha@x.com"])
+            self.assertEqual(self.database.mark_mail_failed(row["id"], "boom"), "pending")
+            self.assertEqual(self.database.due_mail(), [])
+        with mock.patch.object(db_module, "_now", return_value=start + timedelta(minutes=5)):
+            self.assertEqual(len(self.database.due_mail()), 1)
+            self.assertEqual(self.database.mark_mail_failed(row["id"], "boom"), "pending")
+        with mock.patch.object(db_module, "_now", return_value=start + timedelta(minutes=14)):
+            self.assertEqual(self.database.due_mail(), [])
+        with mock.patch.object(db_module, "_now", return_value=start + timedelta(minutes=15)):
+            self.assertEqual(self.database.mark_mail_failed(row["id"], "x" * 900), "failed")
+            self.assertEqual(self.database.due_mail(), [])
+        with self.database.connect() as connection:
+            stored = connection.execute("SELECT * FROM mail_outbox").fetchone()
+        self.assertEqual((stored["status"], stored["attempts"]), ("failed", 3))
+        self.assertIsNone(stored["text_body"])
+        self.assertIsNone(stored["html_body"])
+        self.assertEqual(len(stored["last_error"]), 500)
+        self.assertEqual(self.database.alerts_for_day(DAY)[0]["status"], "failed")
+        self.assertEqual(self.database.mark_mail_failed(row["id"], "again"), "failed")
+        self.assertIsNone(self.database.mark_mail_failed(9999, "none"))
+
+    def test_sent_mail_nulls_bodies_and_marks_the_alert_sent(self) -> None:
+        self.database.record_alert(
+            employee_id=self.asha, work_day=DAY, kind="morning", mode="live", status="queued",
+            mail={"recipients": ["asha@x.com"], "subject": "S", "text_body": "T"})
+        hr_mail = self.database.enqueue_mail(["hari@x.com"], "Fix request", "text", "<p>html</p>")
+        due = self.database.due_mail()
+        self.assertEqual(len(due), 2)
+        for row in due:
+            self.database.mark_mail_sent(row["id"])
+        with self.database.connect() as connection:
+            rows = connection.execute("SELECT * FROM mail_outbox ORDER BY id").fetchall()
+        self.assertEqual({r["status"] for r in rows}, {"sent"})
+        self.assertTrue(all(r["text_body"] is None and r["html_body"] is None for r in rows))
+        self.assertTrue(all(isinstance(r["sent_at"], datetime) for r in rows))
+        self.assertEqual(self.database.alerts_for_day(DAY)[0]["status"], "sent")
+        self.assertEqual(rows[1]["id"], hr_mail)
+        with self.assertRaises(ValueError):
+            self.database.enqueue_mail([], "S", "T")
+
+    def test_prune_alerts_and_outbox_by_age(self) -> None:
+        now = datetime(2026, 10, 26, 12, 0)
+        with mock.patch.object(db_module, "_now", return_value=now - timedelta(days=40)):
+            self.database.enqueue_mail(["a@x.com"], "old", "t")
+        with mock.patch.object(db_module, "_now", return_value=now):
+            self.database.enqueue_mail(["a@x.com"], "new", "t")
+            for day in (DAY - timedelta(days=91), DAY - timedelta(days=90), DAY):
+                self.database.record_alert(
+                    employee_id=self.asha, work_day=day, kind="live", mode="shadow", status="recorded")
+            self.assertEqual(self.database.prune_mail(30), 1)
+            self.assertEqual(self.database.prune_alerts(90), 1)
+        self.assertEqual(self._count("mail_outbox"), 1)
+        self.assertEqual(self._count("attendance_alerts"), 2)
+
+    # --- report links ----------------------------------------------------------
+
+    def test_report_link_is_found_only_by_hash_and_not_after_expiry(self) -> None:
+        now = datetime(2026, 10, 27, 9, 0)
+        expires = datetime(2026, 11, 2, 6, 0)
+        with mock.patch.object(db_module, "_now", return_value=now):
+            token = self.database.create_report_link(self.asha, DAY, expires_at=expires)
+            link = self.database.report_link(token)
+            self.assertEqual((link["employee_id"], link["work_day"]), (self.asha, DAY))
+            self.assertIsNone(self.database.report_link(sha256_hex(token)))
+            self.assertIsNone(self.database.report_link(token + "x"))
+            self.assertIsNone(self.database.report_link(""))
+        with self.database.connect() as connection:
+            stored = connection.execute("SELECT token_hash FROM fix_report_links").fetchone()
+        self.assertEqual(stored["token_hash"], sha256_hex(token))
+        self.assertNotEqual(stored["token_hash"], token)
+        with mock.patch.object(db_module, "_now", return_value=expires):
+            self.assertIsNone(self.database.report_link(token))
+            self.assertEqual(self.database.prune_report_links(), 1)
+        self.assertEqual(self._count("fix_report_links"), 0)
+
+    # --- fix requests -----------------------------------------------------------
+
+    def test_second_report_adds_lines_to_the_one_pending_request(self) -> None:
+        first = self._file(self._add_in(note="Forgot to swipe"))
+        self.assertTrue(first["first_lines"])
+        second = self._file({"kind": "ignore", "target_fingerprint": "fp-dup"}, source="session")
+        self.assertEqual(second, {"request_id": first["request_id"], "first_lines": False})
+        request = self.database.fix_request(first["request_id"])
+        self.assertEqual(request["status"], "pending")
+        self.assertEqual(request["work_day"], DAY)
+        self.assertEqual(request["employee_name"], "Asha")
+        self.assertEqual([(l["kind"], l["direction"]) for l in request["lines"]],
+                         [("add_in", "entry"), ("ignore", None)])
+        self.assertEqual(request["lines"][0]["event_time"], datetime(2026, 10, 26, 13, 40))
+        self.assertEqual(self.database.pending_fix_request(self.asha, DAY)["id"], first["request_id"])
+        self.assertEqual(self.database.pending_fix_request_count(), 1)
+        self.assertEqual([e["kind"] for e in self.database.fix_request_events(first["request_id"])],
+                         ["filed", "lines_added"])
+        # The partial unique index refuses a second pending row outright.
+        with self.assertRaises(db_module.IntegrityError):
+            with self.database.transaction() as connection:
+                connection.execute(
+                    "INSERT INTO fix_requests (employee_id, work_day, status, source, created_at) "
+                    "VALUES (?, ?, 'pending', 'link', ?)", (self.asha, DAY, db_module._now()))
+
+    def test_eleventh_line_is_refused_and_nothing_is_written(self) -> None:
+        with self.assertRaises(db_module.FixLineLimit):
+            self._file(*[self._add_in(9, minute) for minute in range(11)])
+        self.assertEqual(self._count("fix_requests"), 0)
+        request_id = self._file(*[self._add_in(9, minute) for minute in range(10)])["request_id"]
+        with self.assertRaises(db_module.FixLineLimit):
+            self._file(self._add_in(10, 0))
+        self.assertEqual(len(self.database.fix_request(request_id)["lines"]), 10)
+
+    def test_malformed_lines_are_refused(self) -> None:
+        bad = (
+            {"kind": "add_in"},
+            {"kind": "add_out", "event_time": datetime(2026, 10, 26, 18), "direction": "entry"},
+            {"kind": "flip"},
+            {"kind": "flip", "target_fingerprint": "fp", "direction": "sideways"},
+            {"kind": "teleport", "target_fingerprint": "fp"},
+            {**self._add_in(), "note": "x" * 501},
+        )
+        for line in bad:
+            with self.subTest(line=line), self.assertRaises(ValueError):
+                self._file(line)
+        with self.assertRaises(ValueError):
+            self._file()
+        self.assertEqual(self._count("fix_requests"), 0)
+
+    def test_close_day_then_reopen_with_lines(self) -> None:
+        closed = self.database.close_fix_day(self.asha, DAY, "closed_correct", source="link")
+        self.assertEqual(self.database.latest_fix_request(self.asha, DAY)["status"], "closed_correct")
+        self.assertEqual(self.database.close_fix_day(self.asha, DAY, "closed_left", source="session"), closed)
+        self.assertEqual(self.database.latest_fix_request(self.asha, DAY)["status"], "closed_left")
+        filed = self._file(self._add_in())
+        self.assertEqual(filed, {"request_id": closed, "first_lines": True})
+        request = self.database.fix_request(closed)
+        self.assertEqual(request["status"], "pending")
+        self.assertIsNone(request["decided_at"])
+        with self.assertRaises(db_module.RuleViolation):
+            self.database.close_fix_day(self.asha, DAY, "closed_correct", source="link")
+        self.assertEqual([e["kind"] for e in self.database.fix_request_events(closed)],
+                         ["closed", "closed", "reopened", "lines_added"])
+
+    def test_report_on_a_decided_day_starts_a_linked_request(self) -> None:
+        first = self._file(self._add_in())["request_id"]
+        line = self.database.fix_request(first)["lines"][0]["id"]
+        self.database.decide_fix_lines(
+            first, [{"line_id": line, "status": "rejected"}], actor_id=self.hari, note="Badge log says 13:55")
+        self.assertEqual(self.database.fix_request(first)["status"], "rejected")
+        second = self._file(self._add_in(13, 55))
+        self.assertNotEqual(second["request_id"], first)
+        self.assertTrue(second["first_lines"])
+        self.assertEqual(self.database.fix_request(second["request_id"])["previous_request_id"], first)
+        days = self.database.fix_request_days([self.asha, self.hari], DAY, DAY)
+        self.assertEqual(days, {(self.asha, DAY): ["rejected", "pending"]})
+
+    # --- deciding -----------------------------------------------------------------
+
+    def test_approving_writes_corrections_audit_and_status(self) -> None:
+        request_id = self._file(
+            self._add_in(),
+            {"kind": "flip", "target_fingerprint": "fp-out", "direction": "entry"},
+            {"kind": "ignore", "target_fingerprint": "fp-dup"},
+        )["request_id"]
+        add, flip, ignore = (l["id"] for l in self.database.fix_request(request_id)["lines"])
+        result = self.database.decide_fix_lines(request_id, [
+            {"line_id": add, "status": "approved", "event_time": datetime(2026, 10, 26, 13, 35)},
+            {"line_id": flip, "status": "approved"},
+            {"line_id": ignore, "status": "approved"},
+        ], actor_id=self.hari)
+        self.assertEqual(result, {"status": "approved", "decided": [add, flip, ignore], "skipped": []})
+        request = self.database.fix_request(request_id)
+        self.assertEqual((request["status"], request["decided_by_name"]), ("approved", "Hari"))
+        self.assertEqual({l["status"] for l in request["lines"]}, {"approved"})
+        self.assertEqual(request["lines"][0]["hr_event_time"], datetime(2026, 10, 26, 13, 35))
+        corrections = self.database.corrections_for(
+            [self.asha], datetime(2026, 10, 26, 6), datetime(2026, 10, 27, 6))
+        self.assertEqual(
+            [(c["kind"], c["fingerprint"], c["event_timestamp"], c["direction"], c["work_day"])
+             for c in corrections],
+            [("add", None, datetime(2026, 10, 26, 13, 35), "entry", DAY),
+             ("set_direction", "fp-out", None, "entry", DAY),
+             ("ignore", "fp-dup", None, None, DAY)],
+        )
+        events = self.database.fix_request_events(request_id)
+        approved = [e for e in events if e["kind"] == "line_approved"]
+        self.assertEqual(len(approved), 3)
+        self.assertEqual(approved[0]["actor_name"], "Hari")
+        self.assertEqual(approved[0]["old_value"]["event_time"], "2026-10-26 13:40:00")
+        self.assertEqual(approved[0]["new_value"]["correction"]["event_timestamp"], "2026-10-26 13:35:00")
+        self.assertEqual(events[-1]["kind"], "decided")
+        # Another person's or another window's corrections are not returned.
+        self.assertEqual(self.database.corrections_for([self.hari], datetime(2026, 10, 26, 6),
+                                                        datetime(2026, 10, 27, 6)), [])
+        self.assertEqual(self.database.corrections_for([self.asha], datetime(2026, 10, 28, 6),
+                                                        datetime(2026, 10, 29, 6)), [])
+        self.assertEqual(self.database.pending_fix_request_count(), 0)
+
+    def test_flip_without_direction_takes_the_opposite_of_the_stored_one(self) -> None:
+        with self.database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO devices (id, site, model, ip, port, protocol) "
+                "VALUES ('c3', 'Gachibowli', 'C3-400', '10.0.0.2', 4370, 'c3-pullsdk')")
+        self.database.insert_punches([{
+            "fingerprint": "fp-c3", "device_id": "c3", "site": "Gachibowli", "device_user_id": "101",
+            "event_timestamp": datetime(2026, 10, 26, 13, 40), "trusted_direction": "exit",
+        }])
+        request_id = self._file({"kind": "flip", "target_fingerprint": "fp-c3"})["request_id"]
+        line = self.database.fix_request(request_id)["lines"][0]["id"]
+        self.database.decide_fix_lines(request_id, [{"line_id": line, "status": "approved"}],
+                                       actor_id=self.hari)
+        [correction] = self.database.corrections_for(
+            [self.asha], datetime(2026, 10, 26, 6), datetime(2026, 10, 27, 6))
+        self.assertEqual((correction["kind"], correction["direction"]), ("set_direction", "entry"))
+
+    def test_mixed_decisions_give_partial_and_rejection_needs_a_note(self) -> None:
+        request_id = self._file(self._add_in(), self._add_in(18, 0))["request_id"]
+        first, second = (l["id"] for l in self.database.fix_request(request_id)["lines"])
+        decisions = [{"line_id": first, "status": "approved"}, {"line_id": second, "status": "rejected"}]
+        with self.assertRaises(ValueError):
+            self.database.decide_fix_lines(request_id, decisions, actor_id=self.hari, note="  ")
+        result = self.database.decide_fix_lines(request_id, decisions, actor_id=self.hari,
+                                                note="Second swipe was a visitor")
+        self.assertEqual(result["status"], "partial")
+        request = self.database.fix_request(request_id)
+        self.assertEqual(request["decision_note"], "Second swipe was a visitor")
+        self.assertEqual(self._count("punch_corrections"), 1)
+
+    def test_lines_left_pending_keep_the_request_pending(self) -> None:
+        request_id = self._file(self._add_in(), self._add_in(18, 0))["request_id"]
+        first, _ = (l["id"] for l in self.database.fix_request(request_id)["lines"])
+        result = self.database.decide_fix_lines(
+            request_id, [{"line_id": first, "status": "approved"}], actor_id=self.hari)
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(self.database.fix_request(request_id)["status"], "pending")
+
+    def test_nobody_decides_their_own_request(self) -> None:
+        request_id = self._file(self._add_in(), employee=self.hari)["request_id"]
+        line = self.database.fix_request(request_id)["lines"][0]["id"]
+        with self.assertRaises(db_module.RuleViolation):
+            self.database.decide_fix_lines(request_id, [{"line_id": line, "status": "approved"}],
+                                           actor_id=self.hari)
+        with self.assertRaises(db_module.RuleViolation):
+            self.database.decide_fix_lines(9999, [], actor_id=self.hema)
+        other = self._file(self._add_in())["request_id"]
+        with self.assertRaises(ValueError):
+            self.database.decide_fix_lines(other, [{"line_id": line, "status": "approved"}],
+                                           actor_id=self.hema)
+
+    def test_a_failure_mid_decision_leaves_nothing_written(self) -> None:
+        request_id = self._file(self._add_in(), self._add_in(18, 0))["request_id"]
+        first, second = (l["id"] for l in self.database.fix_request(request_id)["lines"])
+        real = db_module._insert_fix_event
+        calls = []
+
+        def fail_on_second_line(connection, request_id, line_id, *args):
+            calls.append(line_id)
+            if line_id == second:
+                raise RuntimeError("disk full")
+            return real(connection, request_id, line_id, *args)
+
+        with mock.patch.object(db_module, "_insert_fix_event", side_effect=fail_on_second_line):
+            with self.assertRaises(RuntimeError):
+                self.database.decide_fix_lines(request_id, [
+                    {"line_id": first, "status": "approved"},
+                    {"line_id": second, "status": "approved"},
+                ], actor_id=self.hari)
+        self.assertEqual(calls, [first, second])
+        request = self.database.fix_request(request_id)
+        self.assertEqual(request["status"], "pending")
+        self.assertEqual({l["status"] for l in request["lines"]}, {"pending"})
+        self.assertEqual(self._count("punch_corrections"), 0)
+        self.assertEqual([e["kind"] for e in self.database.fix_request_events(request_id)], ["filed"])
+
+    def test_second_decider_skips_a_line_already_decided(self) -> None:
+        request_id = self._file(self._add_in())["request_id"]
+        line = self.database.fix_request(request_id)["lines"][0]["id"]
+        self.database.decide_fix_lines(request_id, [{"line_id": line, "status": "approved"}],
+                                       actor_id=self.hari)
+        again = self.database.decide_fix_lines(
+            request_id, [{"line_id": line, "status": "rejected"}], actor_id=self.hema, note="No")
+        self.assertEqual(again["decided"], [])
+        self.assertEqual(again["skipped"], [{"line_id": line, "status": "approved",
+                                             "decided_by": self.hari, "decided_by_name": "Hari"}])
+        self.assertEqual(again["status"], "approved")
+        self.assertEqual(self._count("punch_corrections"), 1)
+        self.assertIsNone(self.database.fix_request(request_id)["decision_note"])
+
+    def test_review_list_pending_first_then_recent_decisions(self) -> None:
+        decided = self._file(self._add_in(), day=DAY - timedelta(days=1))["request_id"]
+        line = self.database.fix_request(decided)["lines"][0]["id"]
+        self.database.decide_fix_lines(decided, [{"line_id": line, "status": "approved"}],
+                                       actor_id=self.hari)
+        pending = self._file(self._add_in(), self._add_in(18, 0))["request_id"]
+        self.database.close_fix_day(self.hari, DAY, "closed_left", source="session")
+        rows = self.database.fix_requests_for_review()
+        self.assertEqual([(r["id"], r["status"], r["line_count"]) for r in rows],
+                         [(pending, "pending", 2), (decided, "approved", 1)])
+        self.assertEqual(rows[0]["employee_name"], "Asha")
+        self.assertEqual(rows[1]["decided_by_name"], "Hari")
+
+    def test_active_hr_and_admin_lists_skip_archived_people(self) -> None:
+        self.assertEqual([p["name"] for p in self.database.active_hr_users()], ["Hari", "Hema"])
+        self.database.archive_employee(self.hema)
+        self.assertEqual([p["name"] for p in self.database.active_hr_users()], ["Hari"])
+        self.assertEqual([p["name"] for p in self.database.active_admins()], ["Adam"])
+        self.assertEqual(self.database.active_admins()[0]["device_ids"], ["104"])
 
 
 class SharedLocalFileTest(unittest.TestCase):

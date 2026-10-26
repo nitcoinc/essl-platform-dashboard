@@ -70,6 +70,15 @@ class FakeDatabase:
         self.sessions: dict[str, dict] = {}
         self.api_keys_list: list[dict] = []
         self.device_change_rows: list[dict] = []
+        # Missed-punch alerts and fix requests (v8).
+        self.report_links: list[dict] = []
+        self.outbox: list[dict] = []
+        self.alerts: list[dict] = []
+        self.baselines: dict[int, dict] = {}
+        self.fix_requests: dict[int, dict] = {}
+        self.fix_lines: dict[int, dict] = {}
+        self.corrections: list[dict] = []
+        self.fix_events: list[dict] = []
         # `offline` makes every write raise OfflineError, the way an
         # unavailable database does.
         self.offline = False
@@ -568,6 +577,302 @@ class FakeDatabase:
     def api_keys(self):
         return sorted(self.api_keys_list, key=lambda k: k["created_at"], reverse=True)
 
+    # alerts, outbox and report links (v8) -----------------------------------
+
+    def _with_role(self, role: str) -> list[dict]:
+        return sorted(
+            (self._ids(e) for e in self.employees_by_id.values()
+             if e["role"] == role and not e.get("archived_at")),
+            key=lambda e: e["name"],
+        )
+
+    def active_hr_users(self) -> list[dict]:
+        return self._with_role("hr")
+
+    def active_admins(self) -> list[dict]:
+        return self._with_role("admin")
+
+    def latest_baselines(self) -> dict[int, dict]:
+        return dict(self.baselines)
+
+    def alert_counts(self, since) -> list[dict]:
+        counts: dict[tuple, int] = {}
+        for alert in self.alerts:
+            if alert["work_day"] >= since:
+                key = (alert.get("site"), alert["kind"], alert["mode"], alert["status"])
+                counts[key] = counts.get(key, 0) + 1
+        return [
+            {"site": site, "kind": kind, "mode": mode, "status": status, "n": n}
+            for (site, kind, mode, status), n in sorted(counts.items(), key=lambda i: str(i[0]))
+        ]
+
+    def enqueue_mail(self, recipients, subject, text_body, html_body=None) -> int:
+        self._check_online()
+        unique: dict[str, str] = {}
+        for address in recipients:
+            address = (address or "").strip()
+            if address:
+                unique.setdefault(address.lower(), address)
+        if not unique:
+            raise ValueError("an email needs at least one recipient")
+        row = {
+            "id": len(self.outbox) + 1, "recipients": list(unique.values()), "subject": subject,
+            "text_body": text_body, "html_body": html_body, "status": "pending", "attempts": 0,
+            "last_error": None, "next_attempt_at": _ist_now(), "created_at": _ist_now(),
+            "sent_at": None,
+        }
+        self.outbox.append(row)
+        return row["id"]
+
+    def create_report_link(self, employee_id, work_day, *, expires_at) -> str:
+        import secrets
+        from essl_hub.hashing import sha256_hex
+
+        self._check_online()
+        token = secrets.token_urlsafe(32)
+        self.report_links.append({
+            "id": len(self.report_links) + 1, "token_hash": sha256_hex(token),
+            "employee_id": employee_id, "work_day": work_day, "expires_at": expires_at,
+            "created_at": _ist_now(),
+        })
+        return token
+
+    def report_link(self, token):
+        from essl_hub.hashing import sha256_hex
+
+        if not token:
+            return None
+        digest = sha256_hex(token)
+        return next(
+            (dict(l) for l in self.report_links
+             if l["token_hash"] == digest and l["expires_at"] > _ist_now()),
+            None,
+        )
+
+    # fix requests and corrections (v8) ----------------------------------------
+
+    def _fix_event(self, request_id, line_id, actor_id, kind, old_value, new_value) -> None:
+        self.fix_events.append({
+            "id": len(self.fix_events) + 1, "request_id": request_id, "line_id": line_id,
+            "actor_employee_id": actor_id, "kind": kind, "old_value": old_value,
+            "new_value": new_value, "created_at": _ist_now(),
+        })
+
+    def _name(self, employee_id):
+        return (self.employees_by_id.get(employee_id) or {}).get("name")
+
+    def _request_lines(self, request_id) -> list[dict]:
+        return [dict(l, decided_by_name=self._name(l["decided_by"]))
+                for l in sorted(self.fix_lines.values(), key=lambda l: l["id"])
+                if l["request_id"] == request_id]
+
+    def pending_fix_request(self, employee_id, work_day):
+        return next(
+            (dict(r) for r in self.fix_requests.values()
+             if (r["employee_id"], r["work_day"], r["status"]) == (employee_id, work_day, "pending")),
+            None,
+        )
+
+    def latest_fix_request(self, employee_id, work_day):
+        rows = [r for r in self.fix_requests.values()
+                if (r["employee_id"], r["work_day"]) == (employee_id, work_day)]
+        return dict(max(rows, key=lambda r: r["id"])) if rows else None
+
+    def file_fix_lines(self, employee_id, work_day, lines, *, source, punch_set_hash=None):
+        from essl_hub import db as db_module
+
+        self._check_online()
+        if source not in db_module.FIX_SOURCES:
+            raise ValueError(f"unknown fix request source: {source}")
+        prepared = [db_module._fix_line_values(line) for line in lines]
+        if not prepared:
+            raise ValueError("a fix request needs at least one line")
+        latest = self.latest_fix_request(employee_id, work_day)
+        if latest is not None and latest["status"] in db_module.FIX_CLOSED_STATUSES | {"pending"}:
+            request_id = latest["id"]
+            existing = len(self._request_lines(request_id))
+        else:
+            request_id, existing = len(self.fix_requests) + 1, 0
+        if existing + len(prepared) > db_module.FIX_MAX_LINES:
+            raise db_module.FixLineLimit(f"A request holds at most {db_module.FIX_MAX_LINES} lines.")
+        now = _ist_now()
+        if latest is not None and latest["id"] == request_id:
+            event = "lines_added"
+            if latest["status"] != "pending":
+                self.fix_requests[request_id].update(
+                    status="pending", source=source, punch_set_hash=punch_set_hash,
+                    decided_at=None, decided_by=None)
+                self._fix_event(request_id, None, employee_id, "reopened",
+                                {"status": latest["status"]}, {"status": "pending"})
+        else:
+            event = "filed"
+            self.fix_requests[request_id] = {
+                "id": request_id, "employee_id": employee_id, "work_day": work_day,
+                "status": "pending", "punch_set_hash": punch_set_hash, "source": source,
+                "previous_request_id": latest["id"] if latest else None, "decision_note": None,
+                "created_at": now, "decided_at": None, "decided_by": None,
+            }
+        line_ids = []
+        for kind, target, event_time, direction, note in prepared:
+            line_id = len(self.fix_lines) + 1
+            self.fix_lines[line_id] = {
+                "id": line_id, "request_id": request_id, "kind": kind,
+                "target_fingerprint": target, "event_time": event_time, "direction": direction,
+                "note": note, "status": "pending", "hr_event_time": None, "hr_direction": None,
+                "decided_by": None, "decided_at": None, "created_at": now,
+            }
+            line_ids.append(line_id)
+        self._fix_event(request_id, None, employee_id, event, None, {"lines": line_ids})
+        return {"request_id": request_id, "first_lines": existing == 0}
+
+    def close_fix_day(self, employee_id, work_day, status, *, source) -> int:
+        from essl_hub import db as db_module
+
+        self._check_online()
+        if status not in db_module.FIX_CLOSED_STATUSES:
+            raise ValueError(f"not a closing status: {status}")
+        latest = self.latest_fix_request(employee_id, work_day)
+        if latest is not None and latest["status"] == "pending":
+            raise db_module.RuleViolation("A fix request for this day is waiting for HR.")
+        now = _ist_now()
+        if latest is not None and latest["status"] in db_module.FIX_CLOSED_STATUSES:
+            request_id = latest["id"]
+            self.fix_requests[request_id].update(status=status, source=source, decided_at=now)
+        else:
+            request_id = len(self.fix_requests) + 1
+            self.fix_requests[request_id] = {
+                "id": request_id, "employee_id": employee_id, "work_day": work_day,
+                "status": status, "punch_set_hash": None, "source": source,
+                "previous_request_id": latest["id"] if latest else None, "decision_note": None,
+                "created_at": now, "decided_at": now, "decided_by": None,
+            }
+        self._fix_event(request_id, None, employee_id, "closed", None, {"status": status})
+        return request_id
+
+    def fix_request(self, request_id):
+        row = self.fix_requests.get(request_id)
+        if row is None:
+            return None
+        employee = self.employees_by_id.get(row["employee_id"]) or {}
+        return {
+            **row, "employee_name": employee.get("name"), "employee_email": employee.get("email"),
+            "employee_manager_id": employee.get("manager_id"),
+            "decided_by_name": self._name(row["decided_by"]),
+            "lines": self._request_lines(request_id),
+        }
+
+    def fix_request_events(self, request_id) -> list[dict]:
+        return [dict(e, actor_name=self._name(e["actor_employee_id"]))
+                for e in self.fix_events if e["request_id"] == request_id]
+
+    def fix_requests_for_review(self, recent: int = 20) -> list[dict]:
+        def view(row):
+            return {**row, "employee_name": self._name(row["employee_id"]),
+                    "decided_by_name": self._name(row["decided_by"]),
+                    "line_count": len(self._request_lines(row["id"]))}
+
+        rows = sorted(self.fix_requests.values(), key=lambda r: r["id"])
+        pending = [view(r) for r in rows if r["status"] == "pending"]
+        decided = [view(r) for r in reversed(rows) if r["status"] in ("approved", "partial", "rejected")]
+        return pending + decided[:recent]
+
+    def pending_fix_request_count(self) -> int:
+        return sum(r["status"] == "pending" for r in self.fix_requests.values())
+
+    def decide_fix_lines(self, request_id, decisions, *, actor_id, note=None):
+        from essl_hub import db as db_module
+
+        self._check_online()
+        decisions = list(decisions)
+        note = (note or "").strip() or None
+        if note is None and any(d["status"] == "rejected" for d in decisions):
+            raise ValueError("A note is required when rejecting.")
+        request = self.fix_requests.get(request_id)
+        if request is None:
+            raise db_module.RuleViolation("No such fix request.")
+        if actor_id == request["employee_id"]:
+            raise db_module.RuleViolation("Nobody decides their own fix request.")
+        now = _ist_now()
+        decided, skipped, corrections, events = [], [], [], []
+        updates = {}
+        for decision in decisions:
+            line = self.fix_lines.get(decision["line_id"])
+            if line is None or line["request_id"] != request_id:
+                raise ValueError(f"line {decision['line_id']} is not on request {request_id}")
+            if line["status"] != "pending":
+                skipped.append({"line_id": line["id"], "status": line["status"],
+                                "decided_by": line["decided_by"],
+                                "decided_by_name": self._name(line["decided_by"])})
+                continue
+            adds = line["kind"] in ("add_in", "add_out")
+            hr_time = decision.get("event_time") if adds else None
+            hr_direction = decision.get("direction") if line["kind"] != "ignore" else None
+            correction = None
+            if decision["status"] == "approved":
+                if adds:
+                    correction = {"kind": "add", "fingerprint": None,
+                                  "event_timestamp": hr_time or line["event_time"],
+                                  "direction": hr_direction or line["direction"]}
+                elif line["kind"] == "ignore":
+                    correction = {"kind": "ignore", "fingerprint": line["target_fingerprint"],
+                                  "event_timestamp": None, "direction": None}
+                else:
+                    direction = hr_direction or line["direction"]
+                    if direction is None:
+                        stored = next((p.get("trusted_direction") for p in self.punches
+                                       if p["fingerprint"] == line["target_fingerprint"]), None)
+                        direction = {"entry": "exit", "exit": "entry"}.get(stored)
+                    if direction is None:
+                        raise ValueError(f"line {line['id']} needs a direction to flip to")
+                    correction = {"kind": "set_direction", "fingerprint": line["target_fingerprint"],
+                                  "event_timestamp": None, "direction": direction}
+                corrections.append({
+                    **correction, "employee_id": request["employee_id"],
+                    "work_day": request["work_day"], "request_line_id": line["id"], "created_at": now,
+                })
+            updates[line["id"]] = {"status": decision["status"], "hr_event_time": hr_time,
+                                   "hr_direction": hr_direction, "decided_by": actor_id,
+                                   "decided_at": now}
+            events.append((line["id"], "line_approved" if decision["status"] == "approved"
+                           else "line_rejected", {"status": decision["status"], "correction": correction}))
+            decided.append(line["id"])
+        # All checks passed: apply together, like the real transaction.
+        for line_id, values in updates.items():
+            self.fix_lines[line_id].update(values)
+        for correction in corrections:
+            self.corrections.append({"id": len(self.corrections) + 1, **correction})
+        for line_id, kind, new_value in events:
+            self._fix_event(request_id, line_id, actor_id, kind, {"status": "pending"},
+                            {**new_value, "note": note})
+        if note is not None and decided:
+            request["decision_note"] = note
+        statuses = {l["status"] for l in self._request_lines(request_id)}
+        if decided and statuses and "pending" not in statuses and request["status"] == "pending":
+            final = ("approved" if statuses == {"approved"}
+                     else "rejected" if statuses == {"rejected"} else "partial")
+            request.update(status=final, decided_at=now, decided_by=actor_id)
+            self._fix_event(request_id, None, actor_id, "decided", {"status": "pending"},
+                            {"status": final, "note": note})
+        return {"status": request["status"], "decided": decided, "skipped": skipped}
+
+    def corrections_for(self, employee_ids, start: datetime, end: datetime) -> list[dict]:
+        wanted = set(employee_ids)
+        first_day, last_day = start.date() - timedelta(days=1), end.date()
+        return [
+            dict(c) for c in self.corrections
+            if c["employee_id"] in wanted and (
+                (c["kind"] == "add" and start <= c["event_timestamp"] < end)
+                or (c["kind"] != "add" and first_day <= c["work_day"] <= last_day))
+        ]
+
+    def fix_request_days(self, employee_ids, start, end) -> dict:
+        wanted = set(employee_ids)
+        days: dict = {}
+        for row in sorted(self.fix_requests.values(), key=lambda r: r["id"]):
+            if row["employee_id"] in wanted and start <= row["work_day"] <= end:
+                days.setdefault((row["employee_id"], row["work_day"]), []).append(row["status"])
+        return days
+
     # settings ---------------------------------------------------------------
 
     def setting(self, key: str, default=None):
@@ -575,6 +880,42 @@ class FakeDatabase:
 
     def set_setting(self, key: str, value: str) -> None:
         self.settings[key] = value
+
+
+class FakeFixRequestsTest(unittest.TestCase):
+    """The FakeDatabase fix-request mirror behaves like essl_hub.db (U1)."""
+
+    def setUp(self) -> None:
+        self.db = FakeDatabase()
+        for uid, name, role in (("101", "Asha", "employee"), ("102", "Hari", "hr")):
+            self.db.upsert_employee(device_user_id=uid, name=name, email=f"{name.lower()}@x.com")
+            self.db.set_employee_role(self.db.employee_by_device_user_id(uid)["id"], role)
+        self.day = datetime(2026, 10, 26).date()
+
+    def test_file_decide_and_read_back(self) -> None:
+        from essl_hub.db import FixLineLimit
+
+        line = {"kind": "add_in", "event_time": datetime(2026, 10, 26, 13, 40)}
+        first = self.db.file_fix_lines(1, self.day, [line], source="link")
+        self.assertEqual(first, {"request_id": 1, "first_lines": True})
+        self.assertFalse(self.db.file_fix_lines(1, self.day, [line], source="session")["first_lines"])
+        with self.assertRaises(FixLineLimit):
+            self.db.file_fix_lines(1, self.day, [line] * 9, source="link")
+        lines = self.db.fix_request(1)["lines"]
+        result = self.db.decide_fix_lines(1, [
+            {"line_id": lines[0]["id"], "status": "approved"},
+            {"line_id": lines[1]["id"], "status": "rejected"},
+        ], actor_id=2, note="Duplicate")
+        self.assertEqual(result["status"], "partial")
+        again = self.db.decide_fix_lines(1, [{"line_id": lines[0]["id"], "status": "approved"}],
+                                         actor_id=2)
+        self.assertEqual(again["skipped"][0]["decided_by_name"], "Hari")
+        corrections = self.db.corrections_for([1], datetime(2026, 10, 26, 6), datetime(2026, 10, 27, 6))
+        self.assertEqual([(c["kind"], c["direction"]) for c in corrections], [("add", "entry")])
+        self.assertEqual(self.db.fix_request_days([1], self.day, self.day), {(1, self.day): ["partial"]})
+        token = self.db.create_report_link(1, self.day, expires_at=_ist_now() + timedelta(days=1))
+        self.assertEqual(self.db.report_link(token)["employee_id"], 1)
+        self.assertEqual([p["name"] for p in self.db.active_hr_users()], ["Hari"])
 
 
 def _make_app():
