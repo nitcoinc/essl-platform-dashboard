@@ -21,7 +21,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable
 
 from .db import TIMESTAMP_FORMAT, Database, OfflineError
@@ -211,12 +211,17 @@ class FrappeSync:
 
     def update_shift_types(self, report: SyncReport) -> None:
         """Set Shift Type.last_sync_of_checkin to the oldest successful device
-        poll, only moving forward, like the official sync tool."""
+        poll, only moving forward, like the official sync tool. It stops just
+        before a punch still held back as a direction guess, so Auto
+        Attendance waits for it."""
         if not self.config.shift_types:
             return
         sync_at = self.database.min_device_last_success()
         if sync_at is None:
             return
+        held = self.database.frappe_oldest_held_punch()
+        if held is not None and held <= sync_at:
+            sync_at = held - timedelta(seconds=1)
         value = sync_at.strftime(TIMESTAMP_FORMAT)
         for shift in self.config.shift_types:
             key = f"frappe_shift_sync:{shift}"

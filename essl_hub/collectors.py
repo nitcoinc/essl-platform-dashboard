@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
-from .config import DeviceConfig, numeric_comm_password, password_for
+from .config import C3_PROTOCOL, X990_PROTOCOL, DeviceConfig, numeric_comm_password, password_for
 from .door_params import (
     DOOR_REQUEST_TTL,
     READ_BATCH,
@@ -210,9 +210,9 @@ def read_c3_table(panel: Any, table_name: str) -> list[dict[str, Any]]:
 
 
 def collect(device: DeviceConfig) -> CollectionResult:
-    if device.protocol == "zk-attendance":
+    if device.protocol == X990_PROTOCOL:
         return collect_x990(device)
-    if device.protocol == "c3-pullsdk":
+    if device.protocol == C3_PROTOCOL:
         return collect_c3(device)
     raise ValueError(f"Unsupported device protocol: {device.protocol}")
 

@@ -616,7 +616,11 @@ Each cycle (at most every `FRAPPE_SYNC_INTERVAL_SECONDS`) new punches are POSTed
 - `failed`: other 4xx validation error, not retried.
 - Network errors, 5xx, 401/403/429: nothing recorded, run stops, retried next cycle.
 
-After a run with nothing left pending, each `FRAPPE_SHIFT_TYPES` entry gets `last_sync_of_checkin` = oldest successful device poll (only moves forward), so Auto Attendance does not mark absences for punches not yet collected. Last run status is in `settings.frappe_last_sync` (JSON).
+Two kinds of punch are held back:
+- C3 *door denied* rows are never sent; payroll cannot see the flag.
+- A C3 live-queue exit is read as in/out 15, so its direction is a guess, and Frappe keeps the log type it is first sent. These rows wait until the next history read confirms the real byte, at most 24 h.
+
+After a run with nothing left pending, each `FRAPPE_SHIFT_TYPES` entry gets `last_sync_of_checkin` = oldest successful device poll (only moves forward), stopping just before any punch still held. Auto Attendance therefore does not mark absences for punches not yet collected or confirmed. Last run status is in `settings.frappe_last_sync` (JSON).
 
 ### Pull alternative
 `GET /api/v1/checkins?since=<local ISO datetime>&limit=<1..1000, default 500>` with `Authorization: Bearer <key>` returns records shaped as the method's arguments (`employee_field_value`, `employee_fieldname`, `timestamp`/`time`, `device_id`, `log_type`). `since` is exclusive; pass back `next_since`. Pages never split one second. A Frappe-side scheduled job can feed each record to `add_log_based_on_employee_field`.

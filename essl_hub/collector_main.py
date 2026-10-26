@@ -17,6 +17,7 @@ from .collectors import (
     collect,
 )
 from .config import (
+    C3_PROTOCOL,
     DEVICES,
     TIMEZONE_NAME,
     DeviceConfig,
@@ -415,7 +416,7 @@ def run_cycle(
             _logger.warning("poll cycle for %s failed; retrying next interval", device.id, exc_info=True)
         # Door writes need the database to record and clear them, so the step
         # waits for it; it never runs while the boot work is still failing.
-        if ready and door_step is not None and device.protocol == "c3-pullsdk":
+        if ready and door_step is not None and device.protocol == C3_PROTOCOL:
             try:
                 door_once(
                     database, device, door_step=door_step, history_read=history_read, state=state

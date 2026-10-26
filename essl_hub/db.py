@@ -6,13 +6,13 @@ import os
 import re
 import threading
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Iterable, Iterator
 from zoneinfo import ZoneInfo
 
 import libsql
 
-from .config import DeviceConfig, TIMEZONE_NAME, db_path
+from .config import C3_PROTOCOL, DeviceConfig, TIMEZONE_NAME, db_path
 
 _TZ = ZoneInfo(TIMEZONE_NAME)
 _logger = logging.getLogger(__name__)
@@ -498,6 +498,20 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         "CREATE INDEX IF NOT EXISTS idx_device_changes_device ON device_changes(device_id, created_at)",
     ),
 }
+
+# The C3 library's "unknown" in/out value: a realtime exit (byte 1) arrives as
+# 15 and its direction is a guess until a history read gives the real byte.
+C3_UNDECODED_BYTE = 15
+# How long such a guess waits for that confirmation before Frappe gets it
+# anyway (history is re-read every ESSL_C3_HISTORY_HOURS, default 6).
+FRAPPE_GUESS_HOLD = timedelta(hours=24)
+# Params: C3_UNDECODED_BYTE, now - FRAPPE_GUESS_HOLD. COALESCE keeps NOT (...)
+# true for rows with no byte or no source (SQL NULL would hide them).
+_FRAPPE_HELD_SQL = (
+    "(COALESCE(p.raw_direction_byte, -1) = ? "
+    "AND COALESCE(json_extract(p.raw_json, '$.source'), '') = 'realtime_fallback' "
+    "AND p.event_timestamp > ?)"
+)
 
 # Quick-swipe window bounds in seconds (KTD3); 0 counts every swipe.
 DUPLICATE_WINDOW_MAX = 300
@@ -1019,11 +1033,13 @@ class Database:
         """Set trusted_direction on stored C3 punches from a history download
         carrying the same fingerprints: rows with none, and realtime-sourced
         rows whose guess the history byte contradicts (KTD4; history is
-        authoritative). Collector metadata, not a punch edit: history-sourced
-        and non-C3 rows are never touched, and nothing is inserted. Returns
-        the rows updated."""
+        authoritative). A realtime row read as in/out 15 also takes the
+        history's real byte, which confirms its direction for Frappe
+        (``frappe_pending_punches``). Collector metadata, not a punch edit:
+        history-sourced and non-C3 rows are never touched, and nothing is
+        inserted. Returns the rows updated."""
         wanted = {
-            str(p["fingerprint"]): str(p["trusted_direction"])
+            str(p["fingerprint"]): (str(p["trusted_direction"]), p.get("raw_direction_byte"))
             for p in punches
             if p.get("trusted_direction") in ("entry", "exit") and p.get("fingerprint")
         }
@@ -1033,30 +1049,34 @@ class Database:
         # rows still open to repair are compared.
         with self.connect() as connection:
             stored = {
-                row["fingerprint"]: row["trusted_direction"]
+                row["fingerprint"]: (row["trusted_direction"], row["raw_direction_byte"])
                 for row in connection.execute(
-                    "SELECT fingerprint, trusted_direction FROM punches "
+                    "SELECT fingerprint, trusted_direction, raw_direction_byte FROM punches "
                     "WHERE (trusted_direction IS NULL "
                     "OR json_extract(raw_json, '$.source') = 'realtime_fallback') "
-                    "AND device_id IN (SELECT id FROM devices WHERE protocol = 'c3-pullsdk')"
+                    "AND device_id IN (SELECT id FROM devices WHERE protocol = ?)",
+                    (C3_PROTOCOL,),
                 ).fetchall()
             }
-        updates = [
-            (direction, fingerprint)
-            for fingerprint, direction in wanted.items()
-            if fingerprint in stored and stored[fingerprint] != direction
-        ]
+        updates = []
+        for fingerprint, (direction, byte) in wanted.items():
+            if fingerprint not in stored:
+                continue
+            old_direction, old_byte = stored[fingerprint]
+            new_byte = byte if old_byte == C3_UNDECODED_BYTE and byte is not None else old_byte
+            if (old_direction, old_byte) != (direction, new_byte):
+                updates.append((direction, new_byte, fingerprint))
         if not updates:
             return 0
         updated = 0
         with self.transaction() as connection:
-            for direction, fingerprint in updates:
+            for direction, byte, fingerprint in updates:
                 cursor = connection.execute(
-                    "UPDATE punches SET trusted_direction = ? "
+                    "UPDATE punches SET trusted_direction = ?, raw_direction_byte = ? "
                     "WHERE fingerprint = ? AND (trusted_direction IS NULL "
                     "OR json_extract(raw_json, '$.source') = 'realtime_fallback') "
-                    "AND device_id IN (SELECT id FROM devices WHERE protocol = 'c3-pullsdk')",
-                    (direction, fingerprint),
+                    "AND device_id IN (SELECT id FROM devices WHERE protocol = ?)",
+                    (direction, byte, fingerprint, C3_PROTOCOL),
                 )
                 updated += cursor.rowcount
         return updated
@@ -1689,15 +1709,19 @@ class Database:
 
     def frappe_pending_punches(self, *, since: datetime | None, limit: int) -> list[dict]:
         """Punches with no frappe_sync_log row, oldest first. Door-denied C3
-        rows (KTD5) stay local: payroll cannot see their flag."""
+        rows (KTD5) stay local: payroll cannot see their flag. A C3 realtime
+        row read as in/out 15 carries a guessed direction, so it waits until a
+        history read confirms the real byte (Frappe keeps the log type it is
+        first sent), or FRAPPE_GUESS_HOLD has passed."""
         sql = (
             f"SELECT p.id, p.device_id, {_MAIN_ID_SQL} AS device_user_id, "
             "p.event_timestamp, p.trusted_direction "
             "FROM punches p LEFT JOIN frappe_sync_log f ON f.punch_id = p.id "
             "WHERE f.punch_id IS NULL "
-            "AND COALESCE(p.raw_state, '') NOT LIKE '%door denied:%'"
+            "AND COALESCE(p.raw_state, '') NOT LIKE '%door denied:%' "
+            f"AND NOT {_FRAPPE_HELD_SQL}"
         )
-        params: list[object] = []
+        params: list[object] = [C3_UNDECODED_BYTE, _now() - FRAPPE_GUESS_HOLD]
         if since is not None:
             sql += " AND p.event_timestamp >= ?"
             params.append(since)
@@ -1717,6 +1741,19 @@ class Database:
                 "error = excluded.error, synced_at = excluded.synced_at",
                 (punch_id, status, checkin_name, error, _now()),
             )
+
+    def frappe_oldest_held_punch(self) -> datetime | None:
+        """The earliest unsent punch held back as a direction guess, so the
+        shift sync never moves past it (frappe_sync.update_shift_types)."""
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT MIN(p.event_timestamp) AS event_timestamp FROM punches p "
+                "LEFT JOIN frappe_sync_log f ON f.punch_id = p.id "
+                f"WHERE f.punch_id IS NULL AND {_FRAPPE_HELD_SQL}",
+                (C3_UNDECODED_BYTE, _now() - FRAPPE_GUESS_HOLD),
+            ).fetchone()
+        # Aliased to the column name so it is read back as a datetime.
+        return row["event_timestamp"] if row else None
 
     def frappe_sync_counts(self) -> dict[str, int]:
         with self.connect() as connection:

@@ -33,7 +33,7 @@ from essl_hub.collectors import (  # noqa: E402
     c3_identity,
     c3_user_id,
 )
-from essl_hub.config import DEVICES  # noqa: E402
+from essl_hub.config import C3_PROTOCOL, DEVICES  # noqa: E402
 from essl_hub.db import Database  # noqa: E402
 
 
@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--apply", action="store_true", help="write the changes")
     args = parser.parse_args(argv)
 
-    c3_ids = [d.id for d in DEVICES if d.protocol == "c3-pullsdk"]
+    c3_ids = [d.id for d in DEVICES if d.protocol == C3_PROTOCOL]
     database = Database(os.getenv("ESSL_DB_PATH", "data/essl.db"), must_exist=True)
     marks = ",".join("?" * len(c3_ids))
     with database.connect() as connection:

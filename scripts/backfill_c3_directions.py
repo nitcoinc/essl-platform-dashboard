@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from essl_hub.collector_main import merge_device_configs  # noqa: E402
 from essl_hub.collectors import collect  # noqa: E402
-from essl_hub.config import DEVICES  # noqa: E402
+from essl_hub.config import C3_PROTOCOL, DEVICES  # noqa: E402
 from essl_hub.db import Database  # noqa: E402
 
 
@@ -60,7 +60,7 @@ def main(argv: list[str] | None = None, *, database: Database | None = None, dow
         database = Database(os.getenv("ESSL_DB_PATH", "data/essl.db"), must_exist=True)
     # Every non-retired C3 row in the DB, not just the seeded ones.
     rows = database.device_connection_info()
-    c3_devices = [d for d in merge_device_configs(DEVICES, rows) if d.protocol == "c3-pullsdk"]
+    c3_devices = [d for d in merge_device_configs(DEVICES, rows) if d.protocol == C3_PROTOCOL]
     ids = [d.id for d in c3_devices]
     marks = ",".join("?" * len(ids))
     with database.connect() as connection:

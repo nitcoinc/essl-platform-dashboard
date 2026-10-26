@@ -682,6 +682,30 @@ class DatabaseTest(unittest.TestCase):
         pending = self.database.frappe_pending_punches(since=None, limit=10)
         self.assertEqual([p["event_timestamp"] for p in pending], [datetime(2026, 9, 10, 9, 5, 0)])
 
+    def test_frappe_holds_a_guessed_realtime_direction_until_history_confirms(self) -> None:
+        from unittest.mock import patch
+
+        realtime = {"pin": "118", "in_out_state": 15, "source": "realtime_fallback"}
+        guess = self._punch(fingerprint="rt", trusted_direction="exit", raw_direction_byte=15, raw=realtime)
+        self.database.insert_punches([guess])
+        soon = guess["event_timestamp"] + timedelta(hours=1)
+        with patch.object(db_module, "_now", return_value=soon):
+            self.assertEqual(self.database.frappe_pending_punches(since=None, limit=10), [])
+            self.database.fill_punch_directions([
+                self._punch(fingerprint="rt", trusted_direction="exit", raw_direction_byte=1),
+            ])
+            self.assertEqual(len(self.database.frappe_pending_punches(since=None, limit=10)), 1)
+
+    def test_frappe_sends_an_unconfirmed_guess_after_the_hold(self) -> None:
+        from unittest.mock import patch
+
+        realtime = {"pin": "118", "in_out_state": 15, "source": "realtime_fallback"}
+        guess = self._punch(fingerprint="rt", trusted_direction="exit", raw_direction_byte=15, raw=realtime)
+        self.database.insert_punches([guess])
+        late = guess["event_timestamp"] + db_module.FRAPPE_GUESS_HOLD + timedelta(minutes=1)
+        with patch.object(db_module, "_now", return_value=late):
+            self.assertEqual(len(self.database.frappe_pending_punches(since=None, limit=10)), 1)
+
     def test_main_id_change_requeues_skipped_punches(self) -> None:
         asha = self._employee("asha@x.com", "asha@x.com")
         self.database.insert_punches([self._punch(fingerprint="b", device_user_id="777")])
@@ -1213,7 +1237,7 @@ class DatabaseTest(unittest.TestCase):
         self.assertEqual(self.database.insert_punches([history]), 0)
         with self.database.connect() as connection:
             rows = connection.execute("SELECT trusted_direction, raw_direction_byte FROM punches").fetchall()
-        self.assertEqual([(r["trusted_direction"], r["raw_direction_byte"]) for r in rows], [("exit", 15)])
+        self.assertEqual([(r["trusted_direction"], r["raw_direction_byte"]) for r in rows], [("exit", 1)])
         self.assertEqual(self.database.fill_punch_directions([history]), 0)
 
     def test_fill_punch_directions_leaves_set_directions_and_x990_rows(self) -> None:
@@ -1243,13 +1267,15 @@ class DatabaseTest(unittest.TestCase):
             self._punch(fingerprint="rt", trusted_direction="entry", raw_direction_byte=0),
             self._punch(fingerprint="rt-ok", trusted_direction="exit", raw_direction_byte=1),
         ])
-        self.assertEqual(updated, 1)
+        # Both take the real byte; the matching guess is confirmed, not changed.
+        self.assertEqual(updated, 2)
         with self.database.connect() as connection:
             rows = {r["fingerprint"]: (r["trusted_direction"], r["raw_direction_byte"]) for r in connection.execute(
                 "SELECT fingerprint, trusted_direction, raw_direction_byte FROM punches").fetchall()}
-        self.assertEqual(rows, {"rt": ("entry", 15), "rt-ok": ("exit", 15)})
+        self.assertEqual(rows, {"rt": ("entry", 0), "rt-ok": ("exit", 1)})
         self.assertEqual(self.database.fill_punch_directions([
-            self._punch(fingerprint="rt", trusted_direction="entry"),
+            self._punch(fingerprint="rt", trusted_direction="entry", raw_direction_byte=0),
+            self._punch(fingerprint="rt-ok", trusted_direction="exit", raw_direction_byte=1),
         ]), 0)
 
     def test_fill_punch_directions_never_overwrites_a_history_sourced_row(self) -> None:

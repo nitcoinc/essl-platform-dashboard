@@ -43,21 +43,21 @@ bp = Blueprint("admin", __name__)
 
 # The two device families the collector speaks. Keyed by the form value.
 DEVICE_FAMILIES = {
-    "x990": ("X990", "zk-attendance"),
-    "c3-400": ("C3-400", "c3-pullsdk"),
+    "x990": ("X990", config.X990_PROTOCOL),
+    "c3-400": ("C3-400", config.C3_PROTOCOL),
 }
 
 # Collector reads device rows every poll (ESSL_COLLECTOR_INTERVAL_SECONDS, 60s), plus margin.
 PICKUP_MINUTES = 2
 
-C3_PROTOCOL = "c3-pullsdk"
+C3_PROTOCOL = config.C3_PROTOCOL
 # Quick-swipe window presets (U5); 0 counts every swipe.
 WINDOW_PRESETS = (0, 5, 10, 60)
 # Pre-implementation Check: the C3's directions are trusted after U3, the
 # X990 has none, so a double tap there needs a small window.
 WINDOW_ADVICE = {
     C3_PROTOCOL: "Recommended for this C3: 10 s.",
-    "zk-attendance": "Recommended for the X990: 5-10 s. It records no direction, so a "
+    config.X990_PROTOCOL: "Recommended for the X990: 5-10 s. It records no direction, so a "
     "double tap inside the window is not counted.",
 }
 _INTEGER = re.compile(r"-?\d+")
@@ -87,7 +87,7 @@ def _validate_connection(
         return ip, port, f"{ip} is not a valid IP address"
     if port is None or not 1 <= port <= 65535:
         return ip, port, "Port must be a whole number between 1 and 65535"
-    if protocol == "zk-attendance" and password is not None:
+    if protocol == config.X990_PROTOCOL and password is not None:
         try:
             config.numeric_comm_password(site, password)
         except ValueError as exc:
