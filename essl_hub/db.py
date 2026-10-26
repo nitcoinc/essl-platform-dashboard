@@ -1117,6 +1117,24 @@ class Database:
             ).fetchall()
         return list(rows)
 
+    def first_punch_at(self, device_user_ids: Iterable[str]) -> datetime | None:
+        """Earliest punch across one person's IDs (``device_ids_of``); None
+        when they never punched. Bounds the history pager and picker."""
+        ids = sorted(set(device_user_ids))
+        if not ids:
+            return None
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT MIN(event_timestamp) AS first FROM punches "
+                "WHERE device_user_id IN (SELECT value FROM json_each(?))",
+                (json.dumps(ids),),
+            ).fetchone()
+        value = row["first"] if row else None
+        if value is None:
+            return None
+        # MIN() drops the column's declared type, so timestamps come back as text.
+        return value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+
     def punches_for_device_users_range(
         self, device_user_ids: Iterable[str], start: datetime, end: datetime
     ) -> list[dict[str, object]]:

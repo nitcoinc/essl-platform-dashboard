@@ -283,6 +283,11 @@ class FakeDatabase:
             for p in rows
         ]
 
+    def first_punch_at(self, device_user_ids):
+        wanted = set(device_user_ids)
+        stamps = [p["event_timestamp"] for p in self.punches if p.get("device_user_id") in wanted]
+        return min(stamps) if stamps else None
+
     def punches_for_device_users_range(self, device_user_ids, start: datetime, end: datetime):
         wanted = set(device_user_ids)
         rows = [
@@ -1424,11 +1429,14 @@ class DayStripTest(_QuickViewBase):
         self.assertEqual(len(selected), 1)
         self.assertIn("date=2026-09-06", selected[0])
 
-    def test_out_of_window_and_malformed_dates_are_400(self) -> None:
+    def test_future_and_malformed_dates_are_400(self) -> None:
+        # KTD2: no 7-day guard any more; only future and malformed dates fail.
         self._sign_in(self._person("1", "Hema HR", "hr"))
-        for value in ("2026-09-02", "2026-09-10", "nope"):
+        for value in ("2026-09-10", "nope", "2026-13-01"):
             self.assertEqual(self._quick(self.ravi["id"], f"?date={value}").status_code, 400, value)
-        self.assertEqual(self._quick(self.ravi["id"], "?date=2026-09-03").status_code, 200)
+        self.assertEqual(self._quick(self.ravi["id"], "?strip_end=nope").status_code, 400)
+        for value in ("2026-09-02", "2026-09-03"):
+            self.assertEqual(self._quick(self.ravi["id"], f"?date={value}").status_code, 200, value)
 
     def test_from_people_carried_in_strip_targets(self) -> None:
         self._sign_in(self._person("1", "Hema HR", "hr"))
@@ -1456,9 +1464,137 @@ class DayStripTest(_QuickViewBase):
         selected = [c for c in chips if 'aria-current="date"' in c]
         self.assertEqual(len(selected), 1)
         self.assertIn("date=2026-09-07", selected[0])
-        # Older days keep the pager and simply have no selected chip.
+        # Older days get a strip around them (KTD1), the selection marked.
         old = self.client.get(f"/day?employee={rid}&date=2026-08-01").text
-        self.assertNotIn('aria-current="date"', old)
+        old_selected = [c for c in self._chips(old) if 'aria-current="date"' in c]
+        self.assertEqual(len(old_selected), 1)
+        self.assertIn("date=2026-08-01", old_selected[0])
+
+
+class HistoryPagingTest(_QuickViewBase):
+    """U6: full history in the drawer and on /day (KTD1, KTD2). Today is
+    2026-09-09; Ravi's first punch is 2026-06-01 unless a test says otherwise."""
+
+    def _chips(self, page: str) -> list[str]:
+        return re.findall(r'<a class="day-chip[^>]*>', page)
+
+    def _first_punch(self, at: datetime) -> None:
+        self.database.insert_punches([_punch_row(f"hp-{at.isoformat()}", at, "entry")])
+
+    def _selected(self, page: str) -> list[str]:
+        return [c for c in self._chips(page) if 'aria-current="date"' in c]
+
+    def test_drawer_opens_a_day_forty_days_back_without_polling(self) -> None:
+        self._first_punch(datetime(2026, 6, 1, 9))
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        response = self._quick(self.ravi["id"], "?date=2026-07-31")
+        self.assertEqual(response.status_code, 200)
+        page = response.text
+        self.assertIn('id="day-live"', page)
+        self.assertNotIn("data-poll", page)
+        self.assertIn('value="2026-07-31"', page)
+        chips = self._chips(page)
+        self.assertEqual(len(chips), 7)
+        self.assertIn("date=2026-08-03", chips[-1])
+        self.assertIn("date=2026-07-31", self._selected(page)[0])
+
+    def test_day_page_strip_ends_three_days_after_an_old_selection(self) -> None:
+        self._first_punch(datetime(2026, 6, 1, 9))
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        rid = self.ravi["id"]
+        page = self.client.get(f"/day?employee={rid}&date=2026-07-31").text
+        chips = self._chips(page)
+        self.assertIn("date=2026-07-28", chips[0])
+        self.assertIn("date=2026-08-03", chips[-1])
+        self.assertTrue(all("strip_end=2026-08-03" in c for c in chips))
+        self.assertIn("date=2026-07-31", self._selected(page)[0])
+        # Paging keeps the selected day and moves the strip a week.
+        self.assertIn('aria-label="Earlier week, 21 Jul to 27 Jul"', page)
+        self.assertIn(f'href="/day?employee={rid}&amp;date=2026-07-31&amp;strip_end=2026-07-27"', page)
+        self.assertIn('aria-label="Later week, 04 Aug to 10 Aug"', page)
+        later = self.client.get(f"/day?employee={rid}&date=2026-07-31&strip_end=2026-08-10").text
+        self.assertIn("date=2026-08-10", self._chips(later)[-1])
+        self.assertEqual(self._selected(later), [])
+        self.assertIn("Friday 31 July 2026", later)
+
+    def test_selected_today_ends_at_today_with_no_later_week(self) -> None:
+        self._first_punch(datetime(2026, 6, 1, 9))
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        for page in (self.client.get(f"/day?employee={self.ravi['id']}").text, self._quick(self.ravi["id"]).text):
+            chips = self._chips(page)
+            self.assertIn('aria-label="Wednesday 09 September, Today"', chips[-1])
+            self.assertIn('aria-current="date"', chips[-1])
+            self.assertNotIn('data-qv-page="later"', page)
+            self.assertNotIn('aria-label="Later week,', page)
+            self.assertIn('data-qv-page="earlier"', page)
+
+    def test_strip_end_beyond_today_is_clamped(self) -> None:
+        self._first_punch(datetime(2026, 6, 1, 9))
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        rid = self.ravi["id"]
+        page = self.client.get(f"/day?employee={rid}&date=2026-09-05&strip_end=2026-12-01").text
+        self.assertIn('aria-label="Wednesday 09 September, Today"', self._chips(page)[-1])
+        self.assertFalse(any("strip_end=" in c for c in self._chips(page)))
+        drawer = self._quick(rid, "?date=2026-09-05&strip_end=2026-12-01")
+        self.assertEqual(drawer.status_code, 200)
+        self.assertIn('aria-label="Wednesday 09 September, Today"', self._chips(drawer.text)[-1])
+        # A malformed strip_end on /day falls back like a malformed date.
+        self.assertEqual(self.client.get(f"/day?employee={rid}&strip_end=nope").status_code, 200)
+
+    def test_earlier_week_disabled_at_the_first_punch_week(self) -> None:
+        self._first_punch(datetime(2026, 8, 20, 9))
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        rid = self.ravi["id"]
+        at_first = self.client.get(f"/day?employee={rid}&date=2026-08-20&strip_end=2026-08-25").text
+        self.assertIn('aria-disabled="true" aria-label="Earlier week"', at_first)
+        self.assertNotIn('data-qv-page="earlier"', at_first)
+        self.assertIn('min="2026-08-20" max="2026-09-09"', at_first)
+        week_after = self.client.get(f"/day?employee={rid}&date=2026-08-20&strip_end=2026-09-01").text
+        self.assertIn('aria-label="Earlier week, 19 Aug to 25 Aug"', week_after)
+        # A strip_end before the first punch week snaps forward to it.
+        too_early = self.client.get(f"/day?employee={rid}&date=2026-08-20&strip_end=2026-07-01").text
+        self.assertIn("date=2026-08-26", self._chips(too_early)[-1])
+
+    def test_day_before_first_punch_says_so(self) -> None:
+        self._first_punch(datetime(2026, 8, 20, 9))
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        rid = self.ravi["id"]
+        expected = "Before Ravi Kumar&#39;s first punch on 20 August 2026"
+        self.assertIn(expected, self._quick(rid, "?date=2026-08-10").text)
+        self.assertIn(expected, self.client.get(f"/day?employee={rid}&date=2026-08-10").text)
+        self.assertNotIn("first punch on", self._quick(rid, "?date=2026-08-21").text)
+
+    def test_person_with_no_punches_gets_today_as_picker_min(self) -> None:
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        rid = self.ravi["id"]
+        for response in (self.client.get(f"/day?employee={rid}"), self._quick(rid, "?date=2026-07-31")):
+            self.assertEqual(response.status_code, 200)
+            self.assertIn('min="2026-09-09" max="2026-09-09"', response.text)
+            self.assertIn('aria-disabled="true" aria-label="Earlier week"', response.text)
+
+    def test_no_access_is_still_404_for_old_days(self) -> None:
+        boss = self._person("900", "Boss", "manager")
+        other = self._person("901", "Other")
+        self._sign_in(boss)
+        self.assertEqual(self._quick(other["id"], "?date=2026-07-31").status_code, 404)
+        self.assertEqual(self.client.get(f"/day?employee={other['id']}&date=2026-07-31").status_code, 404)
+
+    def test_plain_get_redirect_keeps_the_date(self) -> None:
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        rid = self.ravi["id"]
+        response = self.client.get(f"/quick/{rid}?date=2026-07-31")
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.headers["Location"].endswith(f"/day?employee={rid}&date=2026-07-31"))
+
+    def test_drawer_arrows_and_picker_carry_from_and_strip_end(self) -> None:
+        self._first_punch(datetime(2026, 6, 1, 9))
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        rid = self.ravi["id"]
+        page = self._quick(rid, "?from=people&date=2026-07-31").text
+        self.assertIn(f'data-qv-day="/quick/{rid}?date=2026-07-31&amp;strip_end=2026-07-27&amp;from=people"', page)
+        self.assertIn(f'data-qv-day="/quick/{rid}?date=2026-07-30&amp;strip_end=2026-08-03&amp;from=people"', page)
+        self.assertIn(f'data-qv-date="/quick/{rid}?from=people"', page)
+        self.assertIn('min="2026-06-01" max="2026-09-09"', page)
 
 
 class QuickViewDrawerTest(_QuickViewBase):

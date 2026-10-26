@@ -916,9 +916,18 @@ input[type="file"]::file-selector-button {
 .qv-skel-card { height: 220px; }
 @media (max-width: 767.98px) { .quick-view { width: 100vw; border-left: 0; } }
 
-/* ---------- Day strip (U8): last 7 work days ---------- */
-.day-strip { margin-bottom: var(--s4); min-width: 0; }
-.day-strip-list { display: flex; gap: var(--s2); margin: 0; padding: 0 0 var(--s1); list-style: none; overflow-x: auto; overscroll-behavior-x: contain; }
+/* ---------- Day strip (U8, U6): 7 work days, paged a week at a time ---------- */
+/* Arrows and seven chips share one row, down to 375px; the picker sits below. */
+.day-strip { display: flex; align-items: stretch; gap: var(--s2); margin-bottom: var(--s4); min-width: 0; }
+.day-strip-list { display: flex; flex: 1 1 auto; gap: var(--s2); min-width: 0; margin: 0; padding: 0 0 var(--s1); list-style: none; overflow-x: auto; overscroll-behavior-x: contain; }
+.day-strip-page { flex: 0 0 44px; width: 44px; height: auto; min-height: 44px; margin-bottom: var(--s1); padding: 0; }
+.day-strip-page:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+@media (max-width: 600px) { .day-strip { gap: var(--s1); } }
+.day-picker { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2); margin: calc(-1 * var(--s2)) 0 var(--s4); }
+.day-picker label { font-size: var(--text-13); font-weight: 500; color: var(--text-secondary); }
+.day-picker input[type="date"] { width: auto; }
+.qv-scroll .day-strip { margin-bottom: 0; }
+.qv-scroll .day-picker { margin-bottom: 0; }
 /* Chips share the row so seven fit in the drawer and at 375px. */
 .day-strip-list > li { flex: 1 1 0; min-width: 0; max-width: 72px; }
 .day-strip-list .day-chip { min-width: 0; padding: var(--s2) 2px; }
