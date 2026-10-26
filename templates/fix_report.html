@@ -1,0 +1,44 @@
+{#- Report a problem with one work day (U7). One page, two shells: the emailed
+    link (no session, _auth_base.html) and the signed-in entry (base.html).
+    The body is the `report` block, printed into whichever shell is used. -#}
+{% extends layout %}
+{% import "_ui.html" as ui %}
+{% block title %}{% if signed_in %}Report a problem - eSSL Attendance Hub{% else %}Report a problem{% endif %}{% endblock %}
+{% block card_class %} report-card{% endblock %}
+{% block card %}{{ self.report() }}{% endblock %}
+{% block content %}<div class="report-page">{{ self.report() }}</div>{% endblock %}
+
+{% block report %}
+<header class="report-head">
+  {% if signed_in %}<a class="back-link" href="{{ url_for('me.day_view', date=day.isoformat()) }}">{{ ui.icon('arrow-left') }}<span>Back to the day</span></a>{% endif %}
+  <h1>Your swipes on {{ day_label }}</h1>
+  <p>{% if not signed_in %}Hi {{ person.name }}. {% endif %}If the reader missed a swipe or read one the wrong way, tell us here and HR will correct your hours. Your device records never change.</p>
+</header>
+
+{% if state == 'pending' %}
+<section class="report-status" aria-labelledby="report-status-heading">
+  <h2 id="report-status-heading">Your report is with HR</h2>
+  <p>HR will review these changes and email you their decision. You can add more below.</p>
+  {% include "_fix_report_lines.html" %}
+</section>
+{% elif state == 'decided' %}
+<section class="report-status" aria-labelledby="report-status-heading">
+  <h2 id="report-status-heading">HR has decided {{ ui.chip({'approved': 'Approved', 'partial': 'Partly approved', 'rejected': 'Not approved'}[filed.status], {'approved': 'ok', 'partial': 'warn', 'rejected': 'bad'}[filed.status]) }}</h2>
+  {% include "_fix_report_lines.html" %}
+  {% if filed.decision_note %}
+  <div class="report-note"><p class="report-note-label">Note from {{ filed.decided_by_name or 'HR' }}</p><p class="report-note-text">{{ filed.decision_note }}</p></div>
+  {% endif %}
+  {% if not show_form %}{{ ui.button('Report another problem', 'secondary', href=page_url ~ '?report=1') }}{% endif %}
+</section>
+{% elif state == 'closed' %}
+<section class="report-status" aria-labelledby="report-status-heading">
+  <h2 id="report-status-heading">{% if filed.status == 'closed_left' %}You told us you left for the day{% else %}You told us everything on this day was correct{% endif %}</h2>
+  <p>We won't send more reminders for this day.</p>
+  {% if not show_form %}{{ ui.button("Actually, something's wrong", 'secondary', href=page_url ~ '?report=1') }}{% endif %}
+</section>
+{% endif %}
+
+{% if show_form %}{% include "_fix_report_form.html" %}{% endif %}
+
+<p class="report-foot"><a href="{{ url_for('fixes.privacy') }}">How we use attendance data</a>{% if not signed_in %} · <a href="{{ url_for('auth.signin') }}">Sign in</a>{% endif %}</p>
+{% endblock %}

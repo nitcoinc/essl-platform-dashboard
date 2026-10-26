@@ -1,0 +1,26 @@
+{#- Employee notice for missed-punch alerts (U9, linked from the report page
+    footer and every alert email). Public: readable signed out. -#}
+{% extends "_auth_base.html" %}
+{% block title %}How we use attendance data{% endblock %}
+{% block card_class %} report-card{% endblock %}
+{% block card %}
+<div class="auth-title">
+  <h1>How we use attendance data</h1>
+  <p>Attendance reminders help catch swipes the door reader missed, so your hours are right.</p>
+</div>
+<div class="privacy-notice">
+  <h2>What we use</h2>
+  <p>Only your swipe times and which door device recorded them. Nothing else about you.</p>
+  <h2>What we work out</h2>
+  <p>Your own typical day, such as when you usually leave and how long your breaks usually are. It is recomputed every week from your recent swipes, so it follows changes in your routine.</p>
+  <h2>Why</h2>
+  <p>To notice when a swipe looks missed and remind you, so your attendance is correct. Reminders assume the device missed a swipe. They are never used for discipline.</p>
+  <h2>Who sees it</h2>
+  <p>You and HR. Your manager sees your hours as before and gets a copy when you report a problem, but never sees your typical pattern.</p>
+  <h2>How long we keep it</h2>
+  <p>Reminder records are deleted after 90 days.</p>
+  <h2>How to correct something</h2>
+  <p>Use the link in a reminder email, or sign in and choose Report a problem on a day from the last 7 days. HR reviews each change; your device records are never edited.</p>
+</div>
+{{ ui.button('Sign in', 'secondary', href=url_for('auth.signin')) }}
+{% endblock %}

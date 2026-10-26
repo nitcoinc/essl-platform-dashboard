@@ -4817,3 +4817,367 @@ class BrandIconsTest(unittest.TestCase):
         self.assertIn("max-age", cache)
         self.assertNotIn("no-store", cache)
         response.close()
+
+
+class FixReportTest(unittest.TestCase):
+    """U7: the employee report flow, from the emailed link and the day view."""
+
+    DAY = datetime(2026, 10, 26).date()
+    NOW = datetime(2026, 10, 26, 18, 0)
+
+    def setUp(self) -> None:
+        self.app, self.database = _make_app()
+        self.client = self.app.test_client()
+        from essl_hub import mail as mail_module
+
+        self.captured = {}
+        original = mail_module.send_login_code
+        mail_module.send_login_code = lambda e, c: self.captured.update(code=c)
+        self.addCleanup(lambda: setattr(mail_module, "send_login_code", original))
+        for patcher in (*_fixed_now(self.NOW), patch.dict(os.environ, {"ESSL_PUBLIC_URL": "https://hub.example.com"})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.asha = self._person("118", "Asha Rao")
+        self.bob = self._person("119", "Bob Das")
+        self.boss = self._person("200", "Meera Boss", "manager")
+        self.hari = self._person("300", "Hari HR", "hr")
+        self.admin = self._person("400", "Ada Admin", "admin")
+        self.database.set_employee_manager(self.asha["id"], self.boss["id"])
+        self.database.insert_punches([
+            _punch_row("a-in", datetime(2026, 10, 26, 9, 0), "entry", uid="118"),
+            _punch_row("a-out", datetime(2026, 10, 26, 13, 0), "exit", uid="118"),
+            _punch_row("b-in", datetime(2026, 10, 26, 9, 5), "entry", uid="119"),
+        ])
+        self.token = self._link(self.asha, self.DAY)
+
+    def _person(self, uid: str, name: str, role: str = "employee") -> dict:
+        email = f"{name.split()[0].lower()}@example.com"
+        self.database.upsert_employee(device_user_id=uid, name=name, email=email)
+        person = self.database.employee_by_email(email)
+        self.database.set_employee_role(person["id"], role)
+        return person
+
+    def _link(self, person: dict, day, expires_at=None) -> str:
+        return self.database.create_report_link(
+            person["id"], day, expires_at=expires_at or _ist_now() + timedelta(days=7))
+
+    def _sign_in(self, person: dict) -> None:
+        self.client.post("/signout")
+        self.client.post("/signin", data={"email": person["email"]})
+        self.client.post("/signin/verify", data={"code": self.captured["code"]})
+
+    def _csrf(self) -> str:
+        html = self.client.get("/day").text
+        marker = 'name="csrf-token" content="'
+        start = html.index(marker) + len(marker)
+        return html[start : html.index('"', start)]
+
+    def _post_link(self, token=None, **data):
+        return self.client.post(f"/fix/{token or self.token}", data={"action": "send", **data})
+
+    def _missed_in(self, at="13:40", row=0, **extra):
+        return self._post_link(**{f"add-{row}-time": at, f"add-{row}-dir": "in"}, **extra)
+
+    def _requests(self, person=None) -> list[dict]:
+        person = person or self.asha
+        return [r for r in self.database.fix_requests.values() if r["employee_id"] == person["id"]]
+
+    # --- Viewing the link ---------------------------------------------------
+
+    def test_get_and_head_render_the_swipes_and_create_nothing(self) -> None:
+        page = self.client.get(f"/fix/{self.token}")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("09:00:00", page.text)
+        self.assertIn("13:00:00", page.text)
+        self.assertNotIn("09:05:00", page.text)  # Bob's swipe
+        self.assertIn("This was the other direction", page.text)
+        self.assertIn("Ignore this swipe", page.text)
+        self.assertIn('value="a-in"', page.text)
+        self.assertIn("Everything&#39;s correct", page.text)
+        self.assertIn('href="/privacy"', page.text)
+        self.assertIn('class="auth-panel"', page.text)
+        self.assertEqual(page.headers["Referrer-Policy"], "no-referrer")
+        self.assertEqual(self.client.head(f"/fix/{self.token}").status_code, 200)
+        self.assertEqual(self.database.fix_requests, {})
+        self.assertEqual(self.database.outbox, [])
+        self.assertIsNone(self.client.get_cookie("es_session"))
+
+    def test_expired_and_unknown_tokens_show_the_same_expired_page(self) -> None:
+        expired = self._link(self.asha, self.DAY, expires_at=_ist_now() - timedelta(minutes=1))
+        for token in ("not-a-real-token", expired):
+            for response in (self.client.get(f"/fix/{token}"), self._missed_in(token=token)):
+                self.assertEqual(response.status_code, 404)
+                self.assertIn("This link has expired or isn", response.text)
+                self.assertIn('href="/signin"', response.text)
+                self.assertEqual(response.headers["Referrer-Policy"], "no-referrer")
+        self.assertEqual(self.database.fix_requests, {})
+
+    def test_link_for_a_day_older_than_seven_days_is_expired(self) -> None:
+        old = self._link(self.asha, self.DAY - timedelta(days=7))
+        self.assertEqual(self.client.get(f"/fix/{old}").status_code, 404)
+
+    # --- Filing a fix -------------------------------------------------------
+
+    def test_missed_in_creates_a_pending_request_and_emails_hr_and_manager(self) -> None:
+        response = self._missed_in("13:40")
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], f"/fix/{self.token}?sent=1")
+        [request] = self._requests()
+        self.assertEqual((request["status"], request["source"], request["work_day"]),
+                         ("pending", "link", self.DAY))
+        self.assertTrue(request["punch_set_hash"])
+        [line] = self.database.fix_request(request["id"])["lines"]
+        self.assertEqual((line["kind"], line["event_time"], line["direction"]),
+                         ("add_in", datetime(2026, 10, 26, 13, 40), "entry"))
+        hr_mail, manager_mail = self.database.outbox
+        self.assertEqual(hr_mail["recipients"], ["hari@example.com"])
+        self.assertIn(f"https://hub.example.com/fixes/review/{request['id']}", hr_mail["text_body"])
+        self.assertIn("Missed swipe-in at 13:40", hr_mail["text_body"])
+        self.assertEqual(manager_mail["recipients"], ["meera@example.com"])
+        self.assertNotIn("/fixes/review/", manager_mail["text_body"])
+        self.assertNotIn("Review request", manager_mail["html_body"])
+        done = self.client.get(response.headers["Location"])
+        self.assertEqual(done.status_code, 200)
+        self.assertIn("Sent to HR", done.text)
+        self.assertIn("Missed swipe-in at 13:40", done.text)
+
+    def test_a_second_post_adds_a_line_and_sends_no_new_email(self) -> None:
+        self._missed_in("13:40")
+        self.assertEqual(len(self.database.outbox), 2)
+        page = self.client.get(f"/fix/{self.token}")
+        self.assertIn("Your report is with HR", page.text)
+        self.assertIn("Missed swipe-in at 13:40", page.text)
+        self.assertNotIn("Everything&#39;s correct", page.text)
+        response = self._post_link(flip="a-out", note="I went back in.")
+        self.assertEqual(response.status_code, 302)
+        [request] = self._requests()
+        lines = self.database.fix_request(request["id"])["lines"]
+        self.assertEqual([(l["kind"], l["target_fingerprint"], l["direction"]) for l in lines],
+                         [("add_in", None, "entry"), ("flip", "a-out", "entry")])
+        self.assertEqual(lines[1]["note"], "I went back in.")
+        self.assertEqual(len(self.database.outbox), 2)
+
+    def test_flip_and_ignore_targets_and_after_midnight_times(self) -> None:
+        self._post_link(ignore="a-in", **{"add-0-time": "01:30", "add-0-dir": "out"},
+                        token=self._link(self.asha, self.DAY - timedelta(days=1)))
+        # Day before: no punches of Asha's, so a-in is not hers that day.
+        self.assertEqual(self._requests(), [])
+        response = self._post_link(token=self._link(self.asha, self.DAY - timedelta(days=1)),
+                                   **{"add-0-time": "01:30", "add-0-dir": "out"})
+        self.assertEqual(response.status_code, 302)
+        [request] = self._requests()
+        [line] = self.database.fix_request(request["id"])["lines"]
+        # 01:30 on the 25th's work day is the early hours of the 26th.
+        self.assertEqual((line["kind"], line["event_time"]), ("add_out", datetime(2026, 10, 26, 1, 30)))
+
+    # --- Closing and reopening ----------------------------------------------
+
+    def test_everythings_correct_closes_the_day_and_notifies_nobody(self) -> None:
+        response = self._post_link(action="correct")
+        self.assertEqual(response.status_code, 302)
+        [request] = self._requests()
+        self.assertEqual(request["status"], "closed_correct")
+        self.assertEqual(self.database.outbox, [])
+        done = self.client.get(response.headers["Location"])
+        self.assertIn("we won't send more reminders for this day", done.text)
+        page = self.client.get(f"/fix/{self.token}")
+        self.assertIn("You told us everything on this day was correct", page.text)
+        self.assertIn("Actually, something&#39;s wrong", page.text)
+        self.assertNotIn('name="flip"', page.text)
+        reopened = self.client.get(f"/fix/{self.token}?report=1")
+        self.assertIn('name="flip"', reopened.text)
+        self._missed_in("13:40")
+        [request] = self._requests()
+        self.assertEqual(request["status"], "pending")
+        self.assertEqual(len(self.database.outbox), 2)
+
+    def test_i_left_for_the_day_closes_it(self) -> None:
+        self._post_link(action="left")
+        self.assertEqual(self._requests()[0]["status"], "closed_left")
+        self.assertIn("You told us you left for the day", self.client.get(f"/fix/{self.token}").text)
+
+    def test_closing_cannot_be_combined_with_fix_lines(self) -> None:
+        response = self._post_link(action="left", flip="a-out")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("press Send to HR", response.text)
+        self.assertIn('value="a-out" checked', response.text)
+        self.assertEqual(self._requests(), [])
+
+    # --- Decided days -------------------------------------------------------
+
+    def test_a_report_on_a_rejected_day_starts_a_new_linked_request(self) -> None:
+        self._missed_in("13:40")
+        [first] = self._requests()
+        line_id = self.database.fix_request(first["id"])["lines"][0]["id"]
+        self.database.decide_fix_lines(first["id"], [{"line_id": line_id, "status": "rejected"}],
+                                       actor_id=self.hari["id"], note="The reader shows you out until 15:00.")
+        page = self.client.get(f"/fix/{self.token}")
+        self.assertIn("Not approved", page.text)
+        self.assertIn("The reader shows you out until 15:00.", page.text)
+        self.assertIn("Report another problem", page.text)
+        self.assertNotIn('name="flip"', page.text)
+        self.assertIn('name="flip"', self.client.get(f"/fix/{self.token}?report=1").text)
+        self._missed_in("15:00")
+        first_again, second = sorted(self._requests(), key=lambda r: r["id"])
+        self.assertEqual(first_again["status"], "rejected")
+        self.assertEqual((second["status"], second["previous_request_id"]), ("pending", first["id"]))
+        self.assertEqual(len(self.database.outbox), 4)
+
+    # --- Token and ownership limits ------------------------------------------
+
+    def test_a_token_for_a_cannot_file_for_b_or_another_day(self) -> None:
+        response = self._missed_in("13:40", employee_id=str(self.bob["id"]), employee=str(self.bob["id"]),
+                                   work_day="2026-10-25", day="2026-10-25")
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(self._requests(self.bob), [])
+        [request] = self._requests()
+        self.assertEqual(request["work_day"], self.DAY)
+
+    def test_another_employees_fingerprint_is_rejected(self) -> None:
+        for field in ("flip", "ignore"):
+            response = self._post_link(**{field: "b-in"})
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("isn&#39;t on this day", response.text)
+        self.assertEqual(self.database.fix_requests, {})
+
+    def test_manager_and_hr_cannot_report_someone_elses_day(self) -> None:
+        for actor in (self.boss, self.hari):
+            self._sign_in(actor)
+            csrf = self._csrf()
+            url = f"/day/{self.DAY.isoformat()}/report"
+            self.assertEqual(self.client.get(f"{url}?employee={self.asha['id']}").status_code, 403)
+            response = self.client.post(f"{url}?employee={self.asha['id']}", data={
+                "csrf": csrf, "action": "send", "add-0-time": "13:40", "add-0-dir": "in"})
+            self.assertEqual(response.status_code, 403)
+            response = self.client.post(url, data={"csrf": csrf, "action": "send", "flip": "a-out",
+                                                   "employee": str(self.asha["id"])})
+            self.assertEqual(response.status_code, 403)
+            # Their own page: Asha's swipe is not theirs to flip.
+            response = self.client.post(url, data={"csrf": csrf, "action": "send", "flip": "a-out"})
+            self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.database.fix_requests, {})
+
+    def test_signed_in_report_lands_on_the_same_pending_request_as_the_link(self) -> None:
+        self._missed_in("13:40")
+        self._sign_in(self.asha)
+        url = f"/day/{self.DAY.isoformat()}/report"
+        page = self.client.get(url)
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("Your report is with HR", page.text)
+        self.assertIn('class="app-shell"', page.text)
+        response = self.client.post(url, data={"csrf": self._csrf(), "action": "send", "ignore": "a-in"})
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], f"{url}?sent=1")
+        [request] = self._requests()
+        self.assertEqual(len(self.database.fix_request(request["id"])["lines"]), 2)
+        self.assertEqual(len(self.database.outbox), 2)
+        self.assertIn("Sent to HR", self.client.get(response.headers["Location"]).text)
+
+    def test_signed_in_report_needs_csrf_and_a_recent_own_day(self) -> None:
+        self._sign_in(self.asha)
+        url = f"/day/{self.DAY.isoformat()}/report"
+        self.assertEqual(self.client.post(url, data={"action": "correct"}).status_code, 400)
+        for day in ("2026-10-19", "2026-10-27", "not-a-date"):
+            self.assertEqual(self.client.get(f"/day/{day}/report").status_code, 404, day)
+        self.assertEqual(self.client.get("/day/2026-10-20/report").status_code, 200)
+        self.client.post("/signout")
+        self.assertEqual(self.client.get(url).status_code, 302)
+
+    # --- Validation limits --------------------------------------------------
+
+    def test_future_and_malformed_times_are_form_errors(self) -> None:
+        for value, message in (("19:30", "hasn&#39;t happened yet"), ("03:00", "hasn&#39;t happened yet"),
+                               ("25:10", "Enter a time like 13:40"), ("noon", "Enter a time like 13:40")):
+            response = self._missed_in(value)
+            self.assertEqual(response.status_code, 400, value)
+            self.assertIn(message, response.text)
+            self.assertIn('id="f-add-0-time"', response.text)
+            self.assertRegex(response.text, r'id="f-add-0-time"[^>]*aria-invalid="true"')
+        response = self._post_link(**{"add-0-time": "13:40"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Choose In or Out", response.text)
+        self.assertEqual(self.database.fix_requests, {})
+
+    def test_note_over_500_characters_is_a_form_error(self) -> None:
+        response = self._missed_in("13:40", note="x" * 501)
+        self.assertEqual(response.status_code, 400)
+        self.assertRegex(response.text, r'id="f-note"[^>]*aria-invalid="true"')
+        self.assertEqual(self.database.fix_requests, {})
+
+    def test_an_eleventh_line_is_refused(self) -> None:
+        ten = {}
+        for i in range(10):
+            ten.update({f"add-{i}-time": f"{10 + i // 2}:{(i % 2) * 30:02d}", f"add-{i}-dir": "in" if i % 2 else "out"})
+        self.assertEqual(self._post_link(**ten).status_code, 302)
+        response = self._missed_in("17:00")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("at most 10 changes", response.text)
+        [request] = self._requests()
+        self.assertEqual(len(self.database.fix_request(request["id"])["lines"]), 10)
+
+    def test_an_eleventh_post_from_one_ip_in_a_minute_is_refused(self) -> None:
+        for _ in range(10):
+            self.assertEqual(self._post_link().status_code, 400)
+        response = self._post_link()
+        self.assertEqual(response.status_code, 429)
+        other_ip = self.client.post(f"/fix/{self.token}", data={"action": "send"},
+                                    environ_base={"REMOTE_ADDR": "10.0.0.9"})
+        self.assertEqual(other_ip.status_code, 400)
+
+    # --- Approver fallback --------------------------------------------------
+
+    def test_with_no_hr_user_the_request_email_goes_to_the_admins(self) -> None:
+        self.database.set_employee_role(self.hari["id"], "employee")
+        self._missed_in("13:40")
+        hr_mail, manager_mail = self.database.outbox
+        self.assertEqual(hr_mail["recipients"], ["ada@example.com"])
+        self.assertIn("/fixes/review/", hr_mail["text_body"])
+        self.assertEqual(manager_mail["recipients"], ["meera@example.com"])
+
+    def test_hr_requester_is_not_emailed_about_their_own_request(self) -> None:
+        token = self._link(self.hari, self.DAY)
+        self._post_link(token=token, **{"add-0-time": "10:00", "add-0-dir": "in"})
+        [hr_mail] = self.database.outbox
+        self.assertEqual(hr_mail["recipients"], ["ada@example.com"])
+
+    # --- Privacy and the day view -------------------------------------------
+
+    def test_privacy_page_renders_signed_out(self) -> None:
+        page = self.client.get("/privacy")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("How we use attendance data", page.text)
+        self.assertIn("never used for discipline", page.text)
+        self.assertIn("90 days", page.text)
+
+    def test_report_link_shows_on_own_recent_day_only(self) -> None:
+        self._sign_in(self.asha)
+        link = f'href="/day/{self.DAY.isoformat()}/report"'
+        self.assertIn(link, self.client.get(f"/day?date={self.DAY.isoformat()}").text)
+        self.assertIn('href="/day/2026-10-20/report"', self.client.get("/day?date=2026-10-20").text)
+        self.assertNotIn("Report a problem", self.client.get("/day?date=2026-10-19").text)
+        self._sign_in(self.boss)
+        other = self.client.get(f"/day?employee={self.asha['id']}&date={self.DAY.isoformat()}")
+        self.assertEqual(other.status_code, 200)
+        self.assertNotIn("Report a problem", other.text)
+        self.assertIn("Report a problem", self.client.get("/day").text)
+
+    def test_access_logs_redact_the_report_token(self) -> None:
+        import logging
+
+        records = []
+
+        class _Keep(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        logger = logging.getLogger("werkzeug")
+        handler = _Keep()
+        logger.addHandler(handler)
+        self.addCleanup(logger.removeHandler, handler)
+        previous = logger.level
+        logger.setLevel(logging.INFO)
+        self.addCleanup(logger.setLevel, previous)
+        logger.info('%s - - "%s" %s', "127.0.0.1", f"GET /fix/{self.token}?sent=1 HTTP/1.1", 200)
+        [record] = records
+        self.assertNotIn(self.token, record.getMessage())
+        self.assertIn("/fix/[redacted]?sent=1", record.getMessage())

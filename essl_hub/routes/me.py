@@ -24,6 +24,7 @@ from .common import (
     _vary_htmx,
     database,
 )
+from .fixes import REPORT_DAYS
 
 bp = Blueprint("me", __name__)
 
@@ -252,6 +253,8 @@ def day_view():
         prev_date=day - timedelta(days=1),
         next_date=day + timedelta(days=1),
         strip=strip,
+        # U7: only on your own day, and only while it can still be reported.
+        can_report=subject["id"] == g.employee["id"] and 0 <= (today - day).days < REPORT_DAYS,
     )
     template = "_day_live.html" if partial else "day.html"
     return _vary_htmx(make_response(render_template(template, **context)))

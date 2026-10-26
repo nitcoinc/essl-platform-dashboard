@@ -2,6 +2,6 @@
 
 from __future__ import annotations
 
-from . import admin, api, me, people, signin, team
+from . import admin, api, fixes, me, people, signin, team
 
-BLUEPRINTS = (signin.bp, me.bp, team.bp, people.bp, admin.bp, api.bp)
+BLUEPRINTS = (signin.bp, me.bp, team.bp, people.bp, admin.bp, api.bp, fixes.bp)
