@@ -1,5 +1,5 @@
 # Single-host stack: the database is one local SQLite file (WAL) on the data
-# folder, shared by web and collector. The backup service snapshots it to
+# folder, shared by web, collector and alerts. The backup service snapshots it to
 # Cloudflare R2 every ESSL_BACKUP_MINUTES. Users reach the web app through a
 # Cloudflare Tunnel. All settings come from .env (see .env.example);
 # deploy/install.sh sets it up.
@@ -12,6 +12,9 @@ x-app-env: &app-env
   ESSL_DB_PATH: /data/essl.db
   ESSL_COLLECTOR_INTERVAL_SECONDS: ${ESSL_COLLECTOR_INTERVAL_SECONDS:-60}
   ESSL_HEARTBEAT_WRITE_SECONDS: ${ESSL_HEARTBEAT_WRITE_SECONDS:-900}
+  # Links and Reply-To in alert and fix-request emails (web and alerts).
+  ESSL_PUBLIC_URL: ${ESSL_PUBLIC_URL:-}
+  ESSL_HR_REPLY_TO: ${ESSL_HR_REPLY_TO:-}
 
 services:
   collector:
@@ -73,6 +76,23 @@ services:
     # ESSL_WEB_BIND=0.0.0.0 also opens it on the LAN (see README "LAN access").
     ports:
       - "${ESSL_WEB_BIND:-127.0.0.1}:${ESSL_WEB_PORT:-8080}:8000"
+
+  # Missed-punch alerts (weekly baselines, live and morning checks) and the
+  # mail outbox: the web only enqueues emails, this service sends them.
+  alerts:
+    build: .
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      ESSL_MAIL_PROVIDER: ${ESSL_MAIL_PROVIDER:-}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
+      CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
+      CLOUDFLARE_FROM_ADDRESS: ${CLOUDFLARE_FROM_ADDRESS:-}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      RESEND_FROM_ADDRESS: ${RESEND_FROM_ADDRESS:-}
+    volumes:
+      - ${ESSL_DATA_DIR:-essl-data}:/data
+    command: ["python", "-m", "essl_hub.alerts_main"]
 
   backup:
     build: .

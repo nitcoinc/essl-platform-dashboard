@@ -1355,6 +1355,29 @@ class Database:
             rows = _overlaid_punches(connection, ids, start, end)
         return sorted(rows, key=lambda r: (r["device_user_id"], r["event_timestamp"]))
 
+    def raw_punches_for_device_users_range(
+        self, device_user_ids: Iterable[str], start: datetime, end: datetime
+    ) -> list[dict[str, object]]:
+        """Stored device punches for these IDs in [start, end), with their
+        ``raw_json`` and ``raw_direction_byte`` and no overlay: the morning
+        job's unconfirmed-C3-guess check (KTD9) reads these. Hours never do."""
+        ids = sorted(set(device_user_ids))
+        if not ids:
+            return []
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT device_user_id, fingerprint, event_timestamp, trusted_direction,
+                    raw_direction_byte, raw_state, raw_json, site, device_id
+                FROM punches
+                WHERE device_user_id IN (SELECT value FROM json_each(?))
+                  AND event_timestamp >= ? AND event_timestamp < ?
+                ORDER BY device_user_id, event_timestamp
+                """,
+                (json.dumps(ids), start, end),
+            ).fetchall()
+        return list(rows)
+
     def upsert_employee(self, *, device_user_id: str, name: str, email: str) -> str:
         email = email.strip().lower()
         with self.transaction() as connection:

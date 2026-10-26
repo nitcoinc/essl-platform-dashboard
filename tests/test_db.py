@@ -1862,6 +1862,21 @@ class MissedPunchSchemaTest(unittest.TestCase):
         self.assertEqual({r["device_user_id"]: r["punch_count"] for r in self.database.device_id_summary()},
                          {"101": 4, "NP0101": 1})
 
+    def test_raw_punches_carry_raw_json_and_skip_the_overlay(self) -> None:
+        self._overlay_day()
+        self._approve({"kind": "flip", "target_fingerprint": "fp-wrong", "direction": "entry"},
+                      {"kind": "add_in", "event_time": datetime(2026, 10, 26, 19, 0)})
+        rows = self.database.raw_punches_for_device_users_range(
+            ["101", "NP0101"], datetime(2026, 10, 26, 6), datetime(2026, 10, 27, 6))
+        self.assertEqual(len(rows), 5)
+        self.assertNotIn("correction", rows[0])
+        wrong = next(r for r in rows if r["fingerprint"] == "fp-wrong")
+        self.assertEqual(wrong["trusted_direction"], "exit")
+        self.assertIsInstance(wrong["raw_json"], dict)
+        self.assertIn("raw_direction_byte", wrong)
+        self.assertEqual(self.database.raw_punches_for_device_users_range(
+            [], datetime(2026, 10, 26, 6), datetime(2026, 10, 27, 6)), [])
+
 
 class SharedLocalFileTest(unittest.TestCase):
     """Local-first U1 / KTD5, KTD6: two processes share one WAL file."""
