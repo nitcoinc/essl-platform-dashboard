@@ -51,8 +51,10 @@ def _subject() -> dict:
 def _day_context(subject: dict, day, today, request_now, target_minutes: int, day_start_hour: int) -> dict:
     """The context _day_live.html needs for one subject and day; shared by
     /day and the quick-view drawer so both render the same Today."""
+    windows = database.device_windows()
     result = _day_for_employee(
-        database, subject, day, target_minutes, now=request_now, day_start_hour=day_start_hour
+        database, subject, day, target_minutes, now=request_now, day_start_hour=day_start_hour,
+        windows=windows,
     )
     is_today = day == today
     now = request_now if is_today else None
@@ -72,7 +74,7 @@ def _day_context(subject: dict, day, today, request_now, target_minutes: int, da
             # Rollover while inside: say where the open stretch went.
             previous = _day_for_employee(
                 database, subject, day - timedelta(days=1), target_minutes, now=request_now,
-                day_start_hour=day_start_hour,
+                day_start_hour=day_start_hour, windows=windows,
             )
             if previous.segments and previous.segments[-1].end is None:
                 previous_entry = previous.segments[-1].start
@@ -108,25 +110,68 @@ def _day_context(subject: dict, day, today, request_now, target_minutes: int, da
 STRIP_DAYS = 7
 
 
-def _day_strip(subject: dict, selected, today, request_now, target_minutes: int, day_start_hour: int) -> list[dict]:
-    """The last STRIP_DAYS work days ending today (KTD7), oldest first, from
-    one day_results call; each entry says whether the person punched."""
-    start = today - timedelta(days=STRIP_DAYS - 1)
+def _default_strip_end(selected, today):
+    """KTD1: today while the selection is in the last STRIP_DAYS days, else
+    the selection plus 3 (so it sits mid-strip), never past today."""
+    if today - selected < timedelta(days=STRIP_DAYS):
+        return today
+    return min(selected + timedelta(days=3), today)
+
+
+def _first_punch_day(subject: dict, day_start_hour: int):
+    """The work day of the person's first punch across all their IDs, or None."""
+    first = database.first_punch_at(device_ids_of(subject))
+    return work_day(first, day_start_hour) if first is not None else None
+
+
+def _day_strip(
+    subject: dict, selected, today, request_now, target_minutes: int, day_start_hour: int,
+    strip_end=None, first_day=None,
+) -> dict:
+    """STRIP_DAYS work days ending at strip_end (KTD1), oldest first, from one
+    day_results call, plus the week-paging targets and the picker bounds.
+    Earlier/later move strip_end by a week; the selected day stays put."""
+    end = min(strip_end or _default_strip_end(selected, today), today)
+    if first_day is not None and end < first_day:
+        end = min(first_day + timedelta(days=STRIP_DAYS - 1), today)
+    start = end - timedelta(days=STRIP_DAYS - 1)
     results = export.day_results(
-        database, [subject], start, today, target_minutes=target_minutes, today=today,
+        database, [subject], start, end, target_minutes=target_minutes, today=today,
         now=request_now, day_start_hour=day_start_hour,
     )
-    strip = []
+    days = []
     for i in range(STRIP_DAYS):
         day = start + timedelta(days=i)
         result = results.get((subject["id"], day))
-        strip.append({
+        days.append({
             "date": day,
             "is_today": day == today,
             "punched": result is not None and result.status != "empty",
             "selected": day == selected,
         })
-    return strip
+    earlier = None
+    if first_day is not None and start > first_day:
+        earlier = end - timedelta(days=STRIP_DAYS)
+    later = min(end + timedelta(days=STRIP_DAYS), today) if end < today else None
+
+    def label(last):
+        first = last - timedelta(days=STRIP_DAYS - 1)
+        return f"{first.strftime('%d %b')} to {last.strftime('%d %b')}"
+
+    return {
+        "days": days,
+        "end": end,
+        # Chip links carry strip_end unless the strip ends today, so a chip
+        # click in an older week keeps the strip where it is.
+        "end_param": None if end == today else end.isoformat(),
+        "earlier": earlier,
+        "earlier_label": label(earlier) if earlier else None,
+        "later": later,
+        "later_label": label(later) if later else None,
+        "first_day": first_day,
+        "min": first_day or today,
+        "max": today,
+    }
 
 
 @bp.get("/week")
@@ -140,12 +185,15 @@ def week_view() -> str:
     monday = today - timedelta(days=today.weekday()) + timedelta(weeks=offset)
     days = []
     week_total = 0
+    windows = database.device_windows()
     for i in range(5):
         day = monday + timedelta(days=i)
         if day > today:
             days.append({"date": day, "result": None})
             continue
-        result = _day_for_employee(database, subject, day, target_minutes, day_start_hour=day_start_hour)
+        result = _day_for_employee(
+            database, subject, day, target_minutes, day_start_hour=day_start_hour, windows=windows
+        )
         week_total += result.effective_minutes
         days.append({"date": day, "result": result})
     chart = charts.render_week_bars(
@@ -188,39 +236,63 @@ def day_view():
         response.headers["HX-Refresh"] = "true"
         return _vary_htmx(response)
     context = _day_context(subject, day, today, request_now, target_minutes, day_start_hour)
+    strip = None
+    if not partial:
+        # Like date, a malformed strip_end falls back to the default.
+        first_day = _first_punch_day(subject, day_start_hour)
+        strip = _day_strip(
+            subject, day, today, request_now, target_minutes, day_start_hour,
+            strip_end=_parse_date(request.args.get("strip_end")), first_day=first_day,
+        )
+        context.update(first_punch_day=first_day)
     context.update(
         active="day",
         employee=g.employee,
         prev_date=day - timedelta(days=1),
         next_date=day + timedelta(days=1),
-        strip=None if partial else _day_strip(subject, day, today, request_now, target_minutes, day_start_hour),
+        strip=strip,
     )
     template = "_day_live.html" if partial else "day.html"
     return _vary_htmx(make_response(render_template(template, **context)))
 
 
+def _quick_date(name: str):
+    """An optional date query arg for /quick: None when absent, 400 when
+    malformed or in the future (KTD2)."""
+    raw = request.args.get(name)
+    if not raw:
+        return None
+    value = _parse_date(raw)
+    if value is None:
+        abort(400)
+    return value
+
+
 @bp.get("/quick/<int:employee_id>")
 @_login_required
 def quick_view(employee_id: int):
-    """One person's Today for the quick-view drawer. A plain navigation (no
-    htmx, or a history restore) goes to the full Day page instead."""
+    """One person's day for the quick-view drawer, any day up to today
+    (KTD2). A plain navigation (no htmx, or a history restore) goes to the
+    full Day page for the same day instead."""
     if not access.can_view(database, g.employee, employee_id):
         abort(404)
     subject = database.employee_by_id(employee_id)
     if subject is None:
         abort(404)
     if not _htmx_partial():
-        return _vary_htmx(redirect(url_for("me.day_view", employee=employee_id)))
+        raw = _parse_date(request.args.get("date"))
+        return _vary_htmx(redirect(url_for(
+            "me.day_view", employee=employee_id, date=raw.isoformat() if raw else None,
+        )))
     target_minutes = _target_minutes(database)
     day_start_hour = _day_start_hour(database)
     request_now = _now_naive()
     today = work_day(request_now, day_start_hour)
-    day = today
-    raw_date = request.args.get("date")
-    if raw_date:
-        day = _parse_date(raw_date)
-        if day is None or not today - timedelta(days=STRIP_DAYS - 1) <= day <= today:
-            abort(400)
+    day = _quick_date("date") or today
+    strip_end = _quick_date("strip_end")
+    if day > today:
+        abort(400)
+    first_day = _first_punch_day(subject, day_start_hour)
     context = _day_context(subject, day, today, request_now, target_minutes, day_start_hour)
     from_people = request.args.get("from") == "people"
     manager = database.employee_by_id(subject["manager_id"]) if subject.get("manager_id") else None
@@ -230,7 +302,11 @@ def quick_view(employee_id: int):
         role_label=ROLE_LABELS.get(subject["role"], subject["role"]),
         # Mirrors person_edit's guard, and only offered from People.
         can_edit=from_people and g.employee["role"] in access.EDITOR_ROLES,
-        strip=_day_strip(subject, day, today, request_now, target_minutes, day_start_hour),
+        strip=_day_strip(
+            subject, day, today, request_now, target_minutes, day_start_hour,
+            strip_end=strip_end, first_day=first_day,
+        ),
         strip_from="people" if from_people else None,
+        first_punch_day=first_day,
     )
     return _vary_htmx(make_response(render_template("_quick_view.html", **context)))

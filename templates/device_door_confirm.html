@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% import "_ui.html" as ui %}
+{% block title %}Confirm door settings - eSSL Attendance Hub{% endblock %}
+{% block content %}
+<header class="topbar">
+  <div>
+    <h1>{{ 'Restore door settings' if restore else 'Confirm door settings' }}</h1>
+    <p>{{ device.site }} {{ device.model }}. Nothing is sent to the panel until you confirm.</p>
+  </div>
+</header>
+
+<section class="device door-confirm" aria-labelledby="door-changes-title">
+  <h2 id="door-changes-title">{{ changes|length }} {{ 'change' if changes|length == 1 else 'changes' }}</h2>
+  {% if restore %}
+  <p class="field-hint">Puts back the values read just before the change requested {% if snapshot_for %}<time datetime="{{ snapshot_for.isoformat() }}">{{ snapshot_for.strftime('%d %b, %H:%M') }}</time>{% else %}earlier{% endif %}. Only settings that differ from the last read are listed.</p>
+  {% endif %}
+  <ul class="door-changes">
+    {% for change in changes %}<li>{{ change.label }}: {{ change.old }} → {{ change.new }}</li>{% endfor %}
+  </ul>
+  <p class="device-warning">{{ ui.icon('triangle-alert') }}<span>These settings change how the door behaves for everyone. A wrong value can lock people out or leave the door open.</span></p>
+  <p class="field-hint">The collector applies each change on the device's next poll (about {{ poll_minutes }} min) and reads it back. A request not applied within 15 minutes expires.</p>
+  <form method="post" action="{{ action }}" class="door-confirm-actions">
+    <input type="hidden" name="csrf" value="{{ csrf_token }}">
+    {% for key, value in fields.items() %}<input type="hidden" name="{{ key }}" value="{{ value }}">{% endfor %}
+    <input type="hidden" name="confirm" value="1">
+    {{ ui.button('Confirm and send' if not restore else 'Confirm restore', 'primary', type='submit') }}
+    {{ ui.button('Cancel', 'tertiary', href=url_for('admin.devices_view') ~ '#device-' ~ device.id ~ '-name') }}
+  </form>
+</section>
+{% endblock %}

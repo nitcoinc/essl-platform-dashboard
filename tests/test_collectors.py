@@ -260,8 +260,19 @@ class C3IntervalTooShortTest(unittest.TestCase):
         [hist] = self._history([self._row("20")])
         self.assertEqual(rt["fingerprint"], hist["fingerprint"])
         self.assertIn("interval too short", rt["raw_state"])
-        # 15 -> exit is evidence from granted events only; 20 alternates.
-        self.assertIsNone(rt["trusted_direction"])
+        # KTD4: the panel only emits bytes 0/1, so realtime 15 on event 20 is an exit.
+        self.assertEqual(rt["trusted_direction"], "exit")
+
+    def test_realtime_directions_for_granted_and_interval_too_short(self) -> None:
+        from c3.utils import C3DateTime
+
+        entry, short_exit = self._realtime([
+            _RtRecord(0, "173", 0, C3DateTime.from_value(800000000)),
+            _RtRecord(20, "173", 15, C3DateTime.from_value(800000005)),
+        ])
+        self.assertEqual(entry["trusted_direction"], "entry")
+        self.assertEqual(entry["raw_state"], "0 · 0")
+        self.assertEqual(short_exit["trusted_direction"], "exit")
 
     def test_event_20_without_pin_or_card_is_dropped(self) -> None:
         self.assertEqual(self._history([self._row("20", pin="", card="0")]), [])
@@ -273,6 +284,76 @@ class C3IntervalTooShortTest(unittest.TestCase):
     def test_two_people_back_to_back_both_stored(self) -> None:
         events = self._history([self._row("0", pin="173"), self._row("20", pin="39", second=800000001)])
         self.assertEqual({e["device_user_id"] for e in events}, {c3_user_id("173"), c3_user_id("39")})
+
+
+class C3DoorDeniedTest(unittest.TestCase):
+    """KTD5: interlock (25) and anti-passback (24) denials are captured only
+    at/after the device's door_denied_since."""
+
+    SINCE_SECOND = 800000000
+
+    def setUp(self) -> None:
+        from dataclasses import replace
+
+        from c3.utils import C3DateTime
+
+        base = next(d for d in DEVICES if d.protocol == "c3-pullsdk")
+        self.since = C3DateTime.from_value(self.SINCE_SECOND)
+        self.policy_off = base
+        self.policy_on = replace(base, door_denied_since=self.since)
+
+    def _history(self, rows, device):
+        from essl_hub import collectors
+
+        with patch("c3.C3", _FakeC3), patch.object(collectors, "read_c3_table", return_value=rows), \
+                patch.dict(os.environ, {"ESSL_C3_MODE": "history"}):
+            return collectors.collect_c3(device).events
+
+    def _realtime(self, records, device):
+        from essl_hub import collectors
+
+        _FakeC3.rt_batches = [records]
+        with patch("c3.C3", _FakeC3), patch.dict(os.environ, {"ESSL_C3_MODE": "realtime"}):
+            return collectors.collect_c3(device).events
+
+    _row = staticmethod(C3IntervalTooShortTest._row)
+
+    def test_history_event_25_after_since_is_a_flagged_exit(self) -> None:
+        [event] = self._history([self._row("25", second=self.SINCE_SECOND + 60)], self.policy_on)
+        self.assertEqual(event["trusted_direction"], "exit")
+        self.assertIn("door denied: interlock", event["raw_state"])
+        [event] = self._history([self._row("24", in_out="0", second=self.SINCE_SECOND)], self.policy_on)
+        self.assertEqual(event["trusted_direction"], "entry")  # at `since` counts
+        self.assertIn("door denied: anti-passback", event["raw_state"])
+
+    def test_door_denied_before_since_or_with_policy_off_is_dropped(self) -> None:
+        self.assertEqual(self._history([self._row("25", second=self.SINCE_SECOND - 1)], self.policy_on), [])
+        self.assertEqual(self._history([self._row("25", second=self.SINCE_SECOND + 60)], self.policy_off), [])
+
+    def test_door_denied_without_pin_or_card_is_dropped(self) -> None:
+        rows = [self._row(e, pin=pin, card=card, second=self.SINCE_SECOND + 60)
+                for e in ("24", "25") for pin, card in (("", "0"), ("0", ""))]
+        self.assertEqual(self._history(rows, self.policy_on), [])
+
+    def test_event_27_is_always_dropped(self) -> None:
+        self.assertEqual(self._history([self._row("27", second=self.SINCE_SECOND + 60)], self.policy_on), [])
+
+    def test_realtime_event_25_with_15_has_no_direction_and_dedupes_with_history(self) -> None:
+        from c3.utils import C3DateTime
+
+        when = C3DateTime.from_value(self.SINCE_SECOND + 60)
+        [rt] = self._realtime([_RtRecord(25, "173", 15, when)], self.policy_on)
+        self.assertIsNone(rt["trusted_direction"])
+        self.assertIn("door denied: interlock", rt["raw_state"])
+        [hist] = self._history([self._row("25", second=self.SINCE_SECOND + 60)], self.policy_on)
+        self.assertEqual(rt["fingerprint"], hist["fingerprint"])
+        self.assertEqual(hist["trusted_direction"], "exit")  # what fill_punch_directions applies
+
+    def test_realtime_event_25_with_policy_off_is_dropped(self) -> None:
+        from c3.utils import C3DateTime
+
+        when = C3DateTime.from_value(self.SINCE_SECOND + 60)
+        self.assertEqual(self._realtime([_RtRecord(25, "173", 15, when)], self.policy_off), [])
 
 
 class C3TrustedDirectionTest(unittest.TestCase):
@@ -288,9 +369,24 @@ class C3TrustedDirectionTest(unittest.TestCase):
         for event_type in (0, 1, 2, 3):
             self.assertEqual(_c3_trusted_direction(15, event_type), "exit")
 
+    def test_byte_fifteen_on_interval_too_short_is_an_exit(self) -> None:
+        # KTD4: history carries only bytes 0/1, so 15 is byte 1 for event 20 too.
+        self.assertEqual(_c3_trusted_direction(15, 20), "exit")
+
+    def test_byte_fifteen_on_event_20_is_unknown_when_the_rule_is_off(self) -> None:
+        from essl_hub import collectors
+
+        # Gate-miss branch: the pre-implementation check could have failed.
+        with patch.object(collectors, "C3_REALTIME_15_EXIT_EVENT_TYPES", frozenset(collectors.C3_GRANTED_EVENT_TYPES)):
+            self.assertIsNone(_c3_trusted_direction(15, 20))
+            self.assertEqual(_c3_trusted_direction(15, 0), "exit")
+
     def test_byte_fifteen_without_a_card_event_is_not_trusted(self) -> None:
         self.assertIsNone(_c3_trusted_direction(15))
         self.assertIsNone(_c3_trusted_direction(15, 8))
+        # Door-denied rows wait for a history read (KTD4).
+        self.assertIsNone(_c3_trusted_direction(15, 24))
+        self.assertIsNone(_c3_trusted_direction(15, 25))
 
     def test_entry_and_exit_bytes_ignore_the_event_type(self) -> None:
         self.assertEqual(_c3_trusted_direction(0, 0), "entry")
@@ -307,3 +403,198 @@ class C3TrustedDirectionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+_PANEL_VALUES = {
+    "LockCount": "4", "ReaderCount": "4", "AntiPassback": "0", "InterLock": "0",
+    **{f"Door{n}{k}": v for n in range(1, 5) for k, v in (
+        ("Intertime", "1"), ("Drivertime", "5"), ("Detectortime", "15"),
+        ("CloseAndLock", "1"), ("SensorType", "0"), ("VerifyType", "7"))},
+}
+
+
+class _DoorPanel:
+    """Fake C3 for the door step. ``behaviour`` maps a key to what its
+    SETPARAM does: "keep" (0xC8 but the panel keeps its value), an int error
+    code (0xC9), "drop" (socket send fails) or "drop_after" (the reply never
+    comes). Anything else stores the value."""
+
+    instances: list["_DoorPanel"] = []
+    behaviour: dict = {}
+    connects = True
+
+    def __init__(self, *a, **k):
+        self.values = dict(_PANEL_VALUES)
+        self.sent: list[tuple[int, bytes]] = []
+        self.param_calls: list[list[str]] = []
+        self.dead = False
+        type(self).instances.append(self)
+
+    def connect(self, password=None):
+        if not type(self).connects:
+            raise ConnectionError("timed out")
+        return True
+
+    def disconnect(self):
+        pass
+
+    @classmethod
+    def _kv_to_message(cls, data):
+        from c3.core import C3
+
+        return C3._kv_to_message(data)
+
+    def get_device_param(self, names):
+        if self.dead:
+            raise ConnectionError("Invalid response header received; expected 5 bytes, received b''")
+        self.param_calls.append(list(names))
+        return {name: self.values[name] for name in names if name in self.values}
+
+    def _send_receive(self, command, data=None):
+        if self.dead:
+            raise ConnectionError("Unexpected connection end: [Errno 32] Broken pipe") from BrokenPipeError()
+        key, value = bytes(data).decode("ascii").split("=")
+        action = type(self).behaviour.get(key)
+        if action == "drop":
+            self.dead = True
+            raise ConnectionError("Unexpected connection end: [Errno 32] Broken pipe") from BrokenPipeError()
+        self.sent.append((command, bytes(data)))
+        if isinstance(action, int):
+            raise ConnectionError(f"Error {action} received in reply: Unknown")
+        if action == "drop_after":
+            self.dead = True
+            raise ConnectionError("Invalid response header received; expected 5 bytes, received b''")
+        if action != "keep":
+            self.values[key] = value
+        return bytearray(), 0
+
+
+class C3DoorStepTest(unittest.TestCase):
+    """U4: KTD6/KTD7/KTD9 door-parameter reads and writes, on a fake panel."""
+
+    def setUp(self) -> None:
+        from datetime import datetime
+
+        self.device = next(d for d in DEVICES if d.protocol == "c3-pullsdk")
+        self.now = datetime(2026, 10, 26, 10, 5, 0)
+        self.requested_at = datetime(2026, 10, 26, 10, 0, 0)
+        _DoorPanel.instances = []
+        _DoorPanel.behaviour = {}
+        _DoorPanel.connects = True
+
+    def _step(self, request, requested_at="default"):
+        from essl_hub import collectors
+
+        if requested_at == "default":
+            requested_at = self.requested_at
+        with patch("c3.C3", _DoorPanel):
+            return collectors.c3_door_step(self.device, request, requested_at, now=self.now)
+
+    def _sent(self):
+        return [frame for panel in _DoorPanel.instances for frame in panel.sent]
+
+    def test_plain_read_parses_every_door_in_batches_of_at_most_30(self) -> None:
+        outcome = self._step(None, requested_at=None)
+        self.assertIsNone(outcome.result)
+        self.assertIsNone(outcome.previous)
+        self.assertEqual(outcome.params["LockCount"], 4)
+        self.assertEqual(outcome.params["Door4Detectortime"], 15)
+        self.assertEqual(outcome.params["Door2VerifyType"], 7)
+        self.assertEqual(outcome.read_at, self.now)
+        calls = _DoorPanel.instances[0].param_calls
+        self.assertEqual(calls[0], ["LockCount"])
+        self.assertTrue(all(len(call) <= 30 for call in calls))
+        self.assertEqual(self._sent(), [])
+
+    def test_applied_when_the_read_back_matches(self) -> None:
+        outcome = self._step({"Door1Intertime": 0})
+        self.assertEqual(self._sent(), [(0x03, b"Door1Intertime=0")])
+        self.assertEqual(outcome.result["state"], "applied")
+        self.assertEqual(outcome.result["requested_at"], "2026-10-26 10:00:00")
+        self.assertEqual(
+            outcome.result["keys"]["Door1Intertime"],
+            {"outcome": "applied", "old": 1, "new": 0, "now": 0, "message": ""},
+        )
+        self.assertEqual(outcome.previous["Door1Intertime"], 1)
+        self.assertEqual(outcome.params["Door1Intertime"], 0)
+
+    def test_unchanged_keys_are_not_sent(self) -> None:
+        outcome = self._step({"Door1Intertime": 1, "InterLock": 0})
+        self.assertEqual(self._sent(), [])
+        self.assertEqual(outcome.result["state"], "applied")
+        self.assertEqual({e["outcome"] for e in outcome.result["keys"].values()}, {"unchanged"})
+        self.assertIsNone(outcome.previous)
+
+    def test_a_value_the_panel_kept_fails_that_key_only(self) -> None:
+        _DoorPanel.behaviour = {"Door1Intertime": "keep"}
+        outcome = self._step({"Door1Intertime": 0, "Door2Intertime": 0})
+        keys = outcome.result["keys"]
+        self.assertEqual(outcome.result["state"], "failed")
+        self.assertEqual(keys["Door1Intertime"]["outcome"], "failed")
+        self.assertEqual(keys["Door1Intertime"]["message"], "panel kept 1")
+        self.assertEqual(keys["Door2Intertime"]["outcome"], "applied")
+        self.assertEqual(outcome.params["Door1Intertime"], 1)
+
+    def test_0xc9_is_decoded_and_the_next_key_still_runs(self) -> None:
+        _DoorPanel.behaviour = {"Door1Intertime": -14, "InterLock": -13}
+        outcome = self._step({"Door1Intertime": 0, "InterLock": 1, "Door2Intertime": 0})
+        keys = outcome.result["keys"]
+        self.assertEqual(outcome.result["state"], "failed")
+        self.assertEqual(keys["Door1Intertime"]["message"], "communication password rejected")
+        self.assertEqual(keys["InterLock"]["message"], "command not available")
+        self.assertEqual(keys["Door2Intertime"]["outcome"], "applied")
+
+    def test_a_drop_after_key_one_fails_the_request_and_sends_nothing_more(self) -> None:
+        _DoorPanel.behaviour = {"Door2Intertime": "drop"}
+        outcome = self._step({"Door1Intertime": 0, "Door2Intertime": 0, "InterLock": 1})
+        keys = outcome.result["keys"]
+        self.assertEqual(outcome.result["state"], "failed")
+        self.assertEqual(keys["Door1Intertime"]["outcome"], "applied")
+        self.assertEqual(keys["Door2Intertime"]["outcome"], "not_attempted")
+        self.assertEqual(keys["InterLock"]["outcome"], "not_attempted")
+        self.assertIn("connection lost", outcome.result["message"])
+        self.assertEqual(self._sent(), [(0x03, b"Door1Intertime=0")])
+        self.assertEqual(outcome.previous["Door1Intertime"], 1)
+        self.assertEqual(outcome.previous["Door2Intertime"], 1)
+
+    def test_a_lost_reply_leaves_that_key_unconfirmed(self) -> None:
+        _DoorPanel.behaviour = {"Door1Intertime": "drop_after"}
+        outcome = self._step({"Door1Intertime": 0, "Door2Intertime": 0})
+        keys = outcome.result["keys"]
+        self.assertEqual(keys["Door1Intertime"]["outcome"], "failed")
+        self.assertIn("not confirmed", keys["Door1Intertime"]["message"])
+        self.assertEqual(keys["Door2Intertime"]["outcome"], "not_attempted")
+
+    def test_read_from_device_returns_a_read_result_and_no_snapshot(self) -> None:
+        outcome = self._step({})
+        self.assertEqual(outcome.result["state"], "read")
+        self.assertEqual(outcome.result["keys"], {})
+        self.assertIsNone(outcome.previous)
+        self.assertEqual(outcome.params["Door1Intertime"], 1)
+
+    def test_a_request_older_than_15_minutes_expires_without_connecting(self) -> None:
+        from datetime import timedelta
+
+        outcome = self._step({"Door1Intertime": 0}, requested_at=self.now - timedelta(minutes=16))
+        self.assertEqual(_DoorPanel.instances, [])
+        self.assertEqual(outcome.result["state"], "expired")
+        self.assertEqual(outcome.result["keys"]["Door1Intertime"]["outcome"], "not_attempted")
+        self.assertIsNone(outcome.params)
+        self.assertIsNone(outcome.previous)
+
+    def test_the_collector_revalidates_against_the_fresh_lock_count(self) -> None:
+        for request in ({"ComPwd": 1}, {"Door5Intertime": 0}, {"Door1Intertime": "0,ComPwd=1"}):
+            _DoorPanel.instances = []
+            outcome = self._step(request)
+            self.assertEqual(outcome.result["state"], "failed")
+            self.assertTrue(outcome.result["message"])
+            self.assertEqual(self._sent(), [])
+
+    def test_connect_failure_raises_without_the_password(self) -> None:
+        from dataclasses import replace
+
+        _DoorPanel.connects = False
+        self.device = replace(self.device, password="timed")
+        with self.assertRaises(ConnectionError) as caught:
+            self._step({"Door1Intertime": 0})
+        self.assertNotIn("timed", str(caught.exception))

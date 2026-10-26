@@ -1,14 +1,32 @@
-{#- Last 7 work days (U8, KTD7). In the drawer (drawer=true) each chip also
-    carries data-qv-day so quick-view.js swaps the drawer in place; on /day
-    the chips are plain links. Status is a dot plus text, never colour alone. -#}
-<nav class="day-strip" aria-label="Last 7 days">
+{#- Seven work days ending at strip.end (U6, KTD1), paged a week at a time,
+    with a date picker below. In the drawer (drawer=true) chips and arrows
+    also carry data-qv-day so quick-view.js swaps the drawer in place, and
+    the picker is an input[data-qv-date]; on /day all are plain links and a
+    GET form. Status is a dot plus text, never colour alone. -#}
+{% import "_ui.html" as ui %}
+{% set emp = subject.id if subject.id != employee.id else None %}
+{% set sel = None if day == today else day.isoformat() %}
+{% set qv_from = {'from': strip_from} if strip_from else {} %}
+{% macro page_arrow(kind, target, label, icon_name) -%}
+{% if target %}
+  {% set end = None if target == today else target.isoformat() %}
+  <a class="button button-secondary day-strip-page" data-qv-page="{{ kind }}"
+    href="{{ url_for('me.day_view', employee=emp, date=sel, strip_end=end) }}"
+    {%- if drawer %} data-qv-day="{{ url_for('me.quick_view', employee_id=subject.id, date=day.isoformat(), strip_end=end, **qv_from) }}"{% endif %}
+    aria-label="{{ kind|capitalize }} week, {{ label }}" title="{{ kind|capitalize }} week">{{ ui.icon(icon_name) }}</a>
+{% else %}
+  <span class="button button-secondary day-strip-page" role="link" aria-disabled="true" aria-label="{{ kind|capitalize }} week">{{ ui.icon(icon_name) }}</span>
+{% endif %}
+{%- endmacro %}
+<nav class="day-strip" aria-label="Days, {{ strip.days[0].date.strftime('%d %b') }} to {{ strip.end.strftime('%d %b') }}">
+  {{ page_arrow('earlier', strip.earlier, strip.earlier_label, 'chevron-left') }}
   <ol class="day-strip-list">
-  {% for d in strip %}
+  {% for d in strip.days %}
     {% set status = 'Today' if d.is_today else ('Punched' if d.punched else 'No punches') %}
     <li>
       <a class="day-chip{% if d.punched %} is-punched{% endif %}{% if d.is_today %} is-today{% endif %}"
-        href="{{ url_for('me.day_view', employee=subject.id, date=None if d.is_today else d.date.isoformat()) }}"
-        {%- if drawer %} data-qv-day="{{ url_for('me.quick_view', employee_id=subject.id, date=d.date.isoformat(), **({'from': strip_from} if strip_from else {})) }}"{% endif %}
+        href="{{ url_for('me.day_view', employee=subject.id, date=None if d.is_today else d.date.isoformat(), strip_end=strip.end_param) }}"
+        {%- if drawer %} data-qv-day="{{ url_for('me.quick_view', employee_id=subject.id, date=d.date.isoformat(), strip_end=strip.end_param, **qv_from) }}"{% endif %}
         {%- if d.selected %} aria-current="date"{% endif %}
         aria-label="{{ d.date.strftime('%A %d %B') }}, {{ status }}">
         <span class="day-chip-dow">{{ d.date.strftime('%a') }}</span>
@@ -18,4 +36,20 @@
     </li>
   {% endfor %}
   </ol>
+  {{ page_arrow('later', strip.later, strip.later_label, 'chevron-right') }}
 </nav>
+{% set picker_id = 'qv-date' if drawer else 'day-date' %}
+{% if drawer %}
+<form class="day-picker" data-qv-date-form>
+  <label for="{{ picker_id }}">Go to date</label>
+  <input id="{{ picker_id }}" type="date" value="{{ day.isoformat() }}" min="{{ strip.min.isoformat() }}" max="{{ strip.max.isoformat() }}"
+    data-qv-date="{{ url_for('me.quick_view', employee_id=subject.id, **qv_from) }}">
+</form>
+{% else %}
+<form class="day-picker" method="get" action="{{ url_for('me.day_view') }}">
+  {% if emp %}<input type="hidden" name="employee" value="{{ emp }}">{% endif %}
+  <label for="{{ picker_id }}">Go to date</label>
+  <input id="{{ picker_id }}" type="date" name="date" value="{{ day.isoformat() }}" min="{{ strip.min.isoformat() }}" max="{{ strip.max.isoformat() }}" required>
+  <button type="submit" class="button button-secondary">Go</button>
+</form>
+{% endif %}

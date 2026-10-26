@@ -162,6 +162,24 @@ class FrappeSyncTest(unittest.TestCase):
         self.assertEqual(self.transport.calls[-1][0], "PUT")
         self.assertEqual(sum(1 for c in self.transport.calls if c[0] == "PUT"), 1)
 
+    def test_shift_sync_stops_before_a_held_direction_guess(self):
+        from unittest.mock import patch
+
+        now = datetime(2026, 3, 2, 12, 0, 0)
+        guess = {**punch("rt", "101", "2026-03-02 10:00:00", "exit"),
+                 "device_id": "gachibowli-c3-400", "site": "Gachibowli", "raw_direction_byte": 15,
+                 "raw": {"in_out_state": 15, "source": "realtime_fallback"}}
+        self.database.add_device(device_id="gachibowli-c3-400", site="Gachibowli", model="C3-400",
+                                 ip="10.0.0.2", port=4370, protocol="c3-pullsdk", comm_password=None)
+        with patch.object(db_module, "_now", return_value=now):
+            self.database.record_poll("gachibowli-c3-400", punches=[guess], status="connected",
+                                      transport="TCP realtime", serial_number="S", firmware="F",
+                                      records_seen=1)
+            self.add(punch("a", "102", "2026-03-02 09:00:00", "entry"))
+            report = self.sync(shift_types=("General",)).run_once()
+        self.assertEqual(report.synced, 1)  # the guess is held back
+        self.assertEqual(self.transport.calls[-1][3], {"last_sync_of_checkin": "2026-03-02 09:59:59"})
+
     def test_shift_type_not_updated_while_retrying(self):
         self.add(punch("a", "101", "2026-03-02 09:00:00", "entry"))
         self.transport.responses = [OSError("down")]

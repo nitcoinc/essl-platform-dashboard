@@ -256,6 +256,23 @@ class ExportTest(unittest.TestCase):
             with self.assertRaises(export.RangeError):
                 export.parse_range(*bad, today)
 
+    def test_each_punch_uses_its_devices_quick_swipe_window(self) -> None:
+        # KTD3: 09:00:20 is collapsed at 60 s and counts as Out at 0.
+        people = self._people(1)
+        self.database.insert_punches([
+            self._punch("100", self._at(hours=9, seconds=s), None, n)
+            for n, s in enumerate((0, 20, 3 * 3600, 8 * 3600))
+        ])
+
+        def effective() -> int:
+            results = export.day_results(self.database, people, self.day, self.day, target_minutes=480,
+                                         today=date(2026, 10, 10), now=None)
+            return results[(people[0]["id"], self.day)].effective_seconds
+
+        self.assertEqual(effective(), 3 * 3600)
+        self.database.set_device_policy(DEVICES[0].id, window_seconds=0, wait_for_door_close=True)
+        self.assertEqual(effective(), 20 + 5 * 3600)
+
     def test_query_count_is_constant_for_10_vs_100_people(self) -> None:
         statements: list[str] = []
         original = db_module.Database._open

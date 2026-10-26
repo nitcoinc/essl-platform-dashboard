@@ -82,7 +82,11 @@
 {% include "_day_breaks.html" %}
 {% elif not lone_today %}
 <div class="day-empty">
-{% if day.weekday() >= 5 and not is_today %}
+{% set first_day = first_punch_day|default(none) %}
+{% if first_day and day < first_day %}
+{#- KTD2: an empty day before any punch is not lost data. -#}
+{{ ui.empty_state('Before ' ~ ((subject.name ~ "'s") if other else 'your') ~ ' first punch on ' ~ first_day.strftime('%d %B %Y'), 'History starts at the first scan at the door.', 'calendar-days') }}
+{% elif day.weekday() >= 5 and not is_today %}
 {{ ui.empty_state('Weekend', 'No scans at the door on this ' ~ day.strftime('%A') ~ '.', 'calendar-days') }}
 {% elif is_today %}
 {{ ui.empty_state('No punches yet today', 'Hours start counting from the first scan at the door.', 'clock') }}

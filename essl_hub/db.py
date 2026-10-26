@@ -6,19 +6,19 @@ import os
 import re
 import threading
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Iterable, Iterator
 from zoneinfo import ZoneInfo
 
 import libsql
 
-from .config import DeviceConfig, TIMEZONE_NAME, db_path
+from .config import C3_PROTOCOL, DeviceConfig, TIMEZONE_NAME, db_path
 
 _TZ = ZoneInfo(TIMEZONE_NAME)
 _logger = logging.getLogger(__name__)
 
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # libsql exposes no declared column types (U8), so read-side conversion is by
 # column name. Every TIMESTAMP column in the schema is listed here.
@@ -38,9 +38,24 @@ TIMESTAMP_COLUMNS = frozenset(
         "synced_at",
         "archived_at",
         "last_punch",
+        "door_denied_since",
+        "door_params_read_at",
+        "door_params_previous_for",
+        "door_params_requested_at",
+        "policy_updated_at",
     }
 )
-JSON_COLUMNS = frozenset({"raw_json"})
+JSON_COLUMNS = frozenset(
+    {
+        "raw_json",
+        "door_params",
+        "door_params_previous",
+        "door_params_request",
+        "door_params_result",
+        "old_value",
+        "new_value",
+    }
+)
 
 
 class RuleViolation(ValueError):
@@ -455,7 +470,54 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         END
         """,
     ),
+    # v7: per-device swipe policy (KTD3, KTD5), C3 door-parameter state kept
+    # for the collector (KTD6, KTD9), and an append-only audit log (KTD11).
+    7: (
+        "ALTER TABLE devices ADD COLUMN duplicate_window_seconds INTEGER NOT NULL DEFAULT 60",
+        "ALTER TABLE devices ADD COLUMN door_denied_since TIMESTAMP",
+        "ALTER TABLE devices ADD COLUMN door_params TEXT",
+        "ALTER TABLE devices ADD COLUMN door_params_read_at TIMESTAMP",
+        "ALTER TABLE devices ADD COLUMN door_params_previous TEXT",
+        "ALTER TABLE devices ADD COLUMN door_params_previous_for TIMESTAMP",
+        "ALTER TABLE devices ADD COLUMN door_params_request TEXT",
+        "ALTER TABLE devices ADD COLUMN door_params_requested_at TIMESTAMP",
+        "ALTER TABLE devices ADD COLUMN door_params_result TEXT",
+        "ALTER TABLE devices ADD COLUMN policy_updated_at TIMESTAMP",
+        """
+        CREATE TABLE IF NOT EXISTS device_changes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT NOT NULL REFERENCES devices(id),
+            actor_employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            kind TEXT NOT NULL CHECK (kind IN
+                ('policy', 'door_write', 'door_read', 'door_restore', 'door_dismiss')),
+            old_value TEXT,
+            new_value TEXT,
+            created_at TIMESTAMP NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_device_changes_device ON device_changes(device_id, created_at)",
+    ),
 }
+
+# The C3 library's "unknown" in/out value: a realtime exit (byte 1) arrives as
+# 15 and its direction is a guess until a history read gives the real byte.
+C3_UNDECODED_BYTE = 15
+# How long such a guess waits for that confirmation before Frappe gets it
+# anyway (history is re-read every ESSL_C3_HISTORY_HOURS, default 6).
+FRAPPE_GUESS_HOLD = timedelta(hours=24)
+# Params: C3_UNDECODED_BYTE, now - FRAPPE_GUESS_HOLD. COALESCE keeps NOT (...)
+# true for rows with no byte or no source (SQL NULL would hide them).
+_FRAPPE_HELD_SQL = (
+    "(COALESCE(p.raw_direction_byte, -1) = ? "
+    "AND COALESCE(json_extract(p.raw_json, '$.source'), '') = 'realtime_fallback' "
+    "AND p.event_timestamp > ?)"
+)
+
+# Quick-swipe window bounds in seconds (KTD3); 0 counts every swipe.
+DUPLICATE_WINDOW_MAX = 300
+DEVICE_CHANGE_KINDS = frozenset(
+    {"policy", "door_write", "door_read", "door_restore", "door_dismiss"}
+)
 
 _ADD_COLUMN = re.compile(r"^\s*ALTER TABLE (\w+) ADD COLUMN (\w+)", re.IGNORECASE)
 
@@ -700,8 +762,208 @@ class Database:
     def device_connection_info(self) -> list[dict[str, object]]:
         with self.connect() as connection:
             rows = connection.execute(
-                "SELECT id, site, model, protocol, ip, port, comm_password, connection_updated_at "
+                "SELECT id, site, model, protocol, ip, port, comm_password, connection_updated_at, "
+                "duplicate_window_seconds, door_denied_since, door_params_request, "
+                "door_params_requested_at "
                 "FROM devices WHERE retired_at IS NULL ORDER BY site, created_at, id"
+            ).fetchall()
+        return list(rows)
+
+    # --- Swipe policy and C3 door parameters (v7) -------------------------
+
+    def set_device_policy(
+        self,
+        device_id: str,
+        *,
+        window_seconds: int,
+        wait_for_door_close: bool,
+        actor_id: int | None = None,
+    ) -> bool:
+        """Set the quick-swipe window (KTD3) and "Wait for door close" (KTD5),
+        with the audit row in the same transaction (KTD11). Unchecking starts
+        ``door_denied_since`` once; re-checking clears it. False if no device."""
+        if (
+            isinstance(window_seconds, bool)
+            or not isinstance(window_seconds, int)
+            or not 0 <= window_seconds <= DUPLICATE_WINDOW_MAX
+        ):
+            raise ValueError(f"window must be 0-{DUPLICATE_WINDOW_MAX} seconds")
+        now = _now()
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT duplicate_window_seconds, door_denied_since FROM devices WHERE id = ?",
+                (device_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            connection.execute(
+                "UPDATE devices SET duplicate_window_seconds = ?, "
+                "door_denied_since = CASE WHEN ? THEN NULL "
+                "ELSE COALESCE(door_denied_since, ?) END, policy_updated_at = ? WHERE id = ?",
+                (window_seconds, 1 if wait_for_door_close else 0, now, now, device_id),
+            )
+            _insert_device_change(
+                connection, device_id, actor_id, "policy",
+                {
+                    "duplicate_window_seconds": row["duplicate_window_seconds"],
+                    "wait_for_door_close": row["door_denied_since"] is None,
+                },
+                {
+                    "duplicate_window_seconds": window_seconds,
+                    "wait_for_door_close": bool(wait_for_door_close),
+                },
+            )
+        return True
+
+    def file_door_request(
+        self,
+        device_id: str,
+        request: dict[str, int],
+        *,
+        kind: str = "door_write",
+        requested_at: datetime | None = None,
+        actor_id: int | None = None,
+    ) -> bool:
+        """File a door-parameter request for the collector (KTD6), replacing
+        any pending one; an empty map is "Read from device". The audit row
+        holds the last-read value of each requested key as old (KTD11).
+        Whitelist checks live in essl_hub.door_params (KTD8)."""
+        if kind not in ("door_write", "door_read", "door_restore"):
+            raise ValueError(f"not a door request kind: {kind}")
+        if not isinstance(request, dict) or any(
+            not isinstance(key, str) or isinstance(value, bool) or not isinstance(value, int)
+            for key, value in request.items()
+        ):
+            raise ValueError("door request must map keys to integers")
+        requested_at = requested_at or _now()
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT door_params FROM devices WHERE id = ?", (device_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            current = row["door_params"] if isinstance(row["door_params"], dict) else {}
+            connection.execute(
+                "UPDATE devices SET door_params_request = ?, door_params_requested_at = ? "
+                "WHERE id = ?",
+                (dict(request), requested_at, device_id),
+            )
+            _insert_device_change(
+                connection, device_id, actor_id, kind,
+                {key: current.get(key) for key in request},
+                dict(request),
+            )
+        return True
+
+    def dismiss_door_request(self, device_id: str, *, actor_id: int | None = None) -> bool:
+        """Clear the pending request and the last result; files nothing."""
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT door_params_request, door_params_requested_at, door_params_result "
+                "FROM devices WHERE id = ?",
+                (device_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            connection.execute(
+                "UPDATE devices SET door_params_request = NULL, door_params_requested_at = NULL, "
+                "door_params_result = NULL WHERE id = ?",
+                (device_id,),
+            )
+            _insert_device_change(
+                connection, device_id, actor_id, "door_dismiss",
+                {
+                    "request": row["door_params_request"],
+                    "requested_at": row["door_params_requested_at"],
+                    "result": row["door_params_result"],
+                },
+                None,
+            )
+        return True
+
+    def record_door_params(
+        self,
+        device_id: str,
+        *,
+        params: dict[str, int] | None,
+        read_at: datetime | None,
+        result: dict | None = None,
+        previous: dict[str, int] | None = None,
+        previous_for: datetime | None = None,
+    ) -> None:
+        """Collector side: store a door read and, for a request, its per-key
+        result. ``previous`` is kept once per request (KTD9): a second call for
+        the same ``previous_for`` leaves the first snapshot. ``params`` None
+        (an expired request, nothing read) keeps the last read. Never touches
+        the policy columns (the web owns them)."""
+        with self.transaction() as connection:
+            if params is not None:
+                connection.execute(
+                    "UPDATE devices SET door_params = ?, door_params_read_at = ? WHERE id = ?",
+                    (dict(params), read_at, device_id),
+                )
+            if result is not None:
+                connection.execute(
+                    "UPDATE devices SET door_params_result = ? WHERE id = ?",
+                    (dict(result), device_id),
+                )
+            if previous is not None and previous_for is not None:
+                connection.execute(
+                    "UPDATE devices SET door_params_previous = ?, door_params_previous_for = ? "
+                    "WHERE id = ? AND door_params_previous_for IS NOT ?",
+                    (dict(previous), previous_for, device_id, previous_for),
+                )
+
+    def door_request_at(self, device_id: str) -> datetime | None:
+        """The pending door request's ``requested_at``, read fresh so the
+        collector never sends a request dismissed or replaced since its device
+        list was read."""
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT door_params_requested_at FROM devices WHERE id = ?", (device_id,)
+            ).fetchone()
+        return row["door_params_requested_at"] if row else None
+
+    def clear_door_request(self, device_id: str, requested_at: datetime) -> bool:
+        """Clear the request only if it is still the one filed at
+        ``requested_at`` (KTD6), so a newer web request survives."""
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE devices SET door_params_request = NULL, door_params_requested_at = NULL "
+                "WHERE id = ? AND door_params_requested_at = ?",
+                (device_id, requested_at),
+            )
+            return cursor.rowcount > 0
+
+    def device_windows(self) -> dict[str, int]:
+        """Quick-swipe window per device, retired ones included (KTD3)."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT id, duplicate_window_seconds FROM devices"
+            ).fetchall()
+        return {row["id"]: int(row["duplicate_window_seconds"]) for row in rows}
+
+    def record_device_change(
+        self,
+        device_id: str,
+        *,
+        kind: str,
+        old_value: dict | None,
+        new_value: dict | None,
+        actor_id: int | None = None,
+    ) -> None:
+        """Append one audit row on its own (KTD11)."""
+        with self.transaction() as connection:
+            _insert_device_change(connection, device_id, actor_id, kind, old_value, new_value)
+
+    def device_changes(self, device_id: str, limit: int = 20) -> list[dict[str, object]]:
+        """Newest audit rows first, with the actor's name when known."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT c.*, e.name AS actor_name FROM device_changes c "
+                "LEFT JOIN employees e ON e.id = c.actor_employee_id "
+                "WHERE c.device_id = ? ORDER BY c.created_at DESC, c.id DESC LIMIT ?",
+                (device_id, limit),
             ).fetchall()
         return list(rows)
 
@@ -768,38 +1030,53 @@ class Database:
             return inserted + _insert_punches(connection, rest)
 
     def fill_punch_directions(self, punches: Iterable[dict[str, object]]) -> int:
-        """Fill trusted_direction on stored C3 punches that have none, from a
-        history download carrying the same fingerprints. Collector metadata,
-        not a punch edit: rows with a direction and non-C3 rows are never
-        touched, and nothing is inserted. Returns the rows updated."""
-        updates = [
-            (str(p["trusted_direction"]), str(p["fingerprint"]))
+        """Set trusted_direction on stored C3 punches from a history download
+        carrying the same fingerprints: rows with none, and realtime-sourced
+        rows whose guess the history byte contradicts (KTD4; history is
+        authoritative). A realtime row read as in/out 15 also takes the
+        history's real byte, which confirms its direction for Frappe
+        (``frappe_pending_punches``). Collector metadata, not a punch edit:
+        history-sourced and non-C3 rows are never touched, and nothing is
+        inserted. Returns the rows updated."""
+        wanted = {
+            str(p["fingerprint"]): (str(p["trusted_direction"]), p.get("raw_direction_byte"))
             for p in punches
             if p.get("trusted_direction") in ("entry", "exit") and p.get("fingerprint")
-        ]
-        if not updates:
+        }
+        if not wanted:
             return 0
         # Read first: a history download is the device's whole log, so only
-        # rows still missing a direction are updated.
+        # rows still open to repair are compared.
         with self.connect() as connection:
-            missing = {
-                row["fingerprint"]
+            stored = {
+                row["fingerprint"]: (row["trusted_direction"], row["raw_direction_byte"])
                 for row in connection.execute(
-                    "SELECT fingerprint FROM punches WHERE trusted_direction IS NULL "
-                    "AND device_id IN (SELECT id FROM devices WHERE protocol = 'c3-pullsdk')"
+                    "SELECT fingerprint, trusted_direction, raw_direction_byte FROM punches "
+                    "WHERE (trusted_direction IS NULL "
+                    "OR json_extract(raw_json, '$.source') = 'realtime_fallback') "
+                    "AND device_id IN (SELECT id FROM devices WHERE protocol = ?)",
+                    (C3_PROTOCOL,),
                 ).fetchall()
             }
-        updates = [u for u in updates if u[1] in missing]
+        updates = []
+        for fingerprint, (direction, byte) in wanted.items():
+            if fingerprint not in stored:
+                continue
+            old_direction, old_byte = stored[fingerprint]
+            new_byte = byte if old_byte == C3_UNDECODED_BYTE and byte is not None else old_byte
+            if (old_direction, old_byte) != (direction, new_byte):
+                updates.append((direction, new_byte, fingerprint))
         if not updates:
             return 0
         updated = 0
         with self.transaction() as connection:
-            for direction, fingerprint in updates:
+            for direction, byte, fingerprint in updates:
                 cursor = connection.execute(
-                    "UPDATE punches SET trusted_direction = ? "
-                    "WHERE fingerprint = ? AND trusted_direction IS NULL "
-                    "AND device_id IN (SELECT id FROM devices WHERE protocol = 'c3-pullsdk')",
-                    (direction, fingerprint),
+                    "UPDATE punches SET trusted_direction = ?, raw_direction_byte = ? "
+                    "WHERE fingerprint = ? AND (trusted_direction IS NULL "
+                    "OR json_extract(raw_json, '$.source') = 'realtime_fallback') "
+                    "AND device_id IN (SELECT id FROM devices WHERE protocol = ?)",
+                    (direction, byte, fingerprint, C3_PROTOCOL),
                 )
                 updated += cursor.rowcount
         return updated
@@ -860,7 +1137,7 @@ class Database:
         with self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT event_timestamp, trusted_direction, raw_direction_byte, raw_state
+                SELECT event_timestamp, trusted_direction, raw_direction_byte, raw_state, device_id
                 FROM punches
                 WHERE device_user_id IN (SELECT value FROM json_each(?))
                   AND event_timestamp >= ? AND event_timestamp < ?
@@ -869,6 +1146,24 @@ class Database:
                 (json.dumps(ids), start, end),
             ).fetchall()
         return list(rows)
+
+    def first_punch_at(self, device_user_ids: Iterable[str]) -> datetime | None:
+        """Earliest punch across one person's IDs (``device_ids_of``); None
+        when they never punched. Bounds the history pager and picker."""
+        ids = sorted(set(device_user_ids))
+        if not ids:
+            return None
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT MIN(event_timestamp) AS first FROM punches "
+                "WHERE device_user_id IN (SELECT value FROM json_each(?))",
+                (json.dumps(ids),),
+            ).fetchone()
+        value = row["first"] if row else None
+        if value is None:
+            return None
+        # MIN() drops the column's declared type, so timestamps come back as text.
+        return value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
 
     def punches_for_device_users_range(
         self, device_user_ids: Iterable[str], start: datetime, end: datetime
@@ -881,7 +1176,7 @@ class Database:
         with self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT device_user_id, event_timestamp, trusted_direction, site
+                SELECT device_user_id, event_timestamp, trusted_direction, site, device_id
                 FROM punches
                 WHERE device_user_id IN (SELECT value FROM json_each(?))
                   AND event_timestamp >= ? AND event_timestamp < ?
@@ -1413,14 +1708,20 @@ class Database:
     # --- Frappe HR push (essl_hub.frappe_sync) ---------------------------
 
     def frappe_pending_punches(self, *, since: datetime | None, limit: int) -> list[dict]:
-        """Punches with no frappe_sync_log row, oldest first."""
+        """Punches with no frappe_sync_log row, oldest first. Door-denied C3
+        rows (KTD5) stay local: payroll cannot see their flag. A C3 realtime
+        row read as in/out 15 carries a guessed direction, so it waits until a
+        history read confirms the real byte (Frappe keeps the log type it is
+        first sent), or FRAPPE_GUESS_HOLD has passed."""
         sql = (
             f"SELECT p.id, p.device_id, {_MAIN_ID_SQL} AS device_user_id, "
             "p.event_timestamp, p.trusted_direction "
             "FROM punches p LEFT JOIN frappe_sync_log f ON f.punch_id = p.id "
-            "WHERE f.punch_id IS NULL"
+            "WHERE f.punch_id IS NULL "
+            "AND COALESCE(p.raw_state, '') NOT LIKE '%door denied:%' "
+            f"AND NOT {_FRAPPE_HELD_SQL}"
         )
-        params: list[object] = []
+        params: list[object] = [C3_UNDECODED_BYTE, _now() - FRAPPE_GUESS_HOLD]
         if since is not None:
             sql += " AND p.event_timestamp >= ?"
             params.append(since)
@@ -1440,6 +1741,19 @@ class Database:
                 "error = excluded.error, synced_at = excluded.synced_at",
                 (punch_id, status, checkin_name, error, _now()),
             )
+
+    def frappe_oldest_held_punch(self) -> datetime | None:
+        """The earliest unsent punch held back as a direction guess, so the
+        shift sync never moves past it (frappe_sync.update_shift_types)."""
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT MIN(p.event_timestamp) AS event_timestamp FROM punches p "
+                "LEFT JOIN frappe_sync_log f ON f.punch_id = p.id "
+                f"WHERE f.punch_id IS NULL AND {_FRAPPE_HELD_SQL}",
+                (C3_UNDECODED_BYTE, _now() - FRAPPE_GUESS_HOLD),
+            ).fetchone()
+        # Aliased to the column name so it is read back as a datetime.
+        return row["event_timestamp"] if row else None
 
     def frappe_sync_counts(self) -> dict[str, int]:
         with self.connect() as connection:
@@ -1509,6 +1823,24 @@ def reports_message(count: int) -> str:
 
 def _now() -> datetime:
     return datetime.now(_TZ).replace(tzinfo=None)
+
+
+def _insert_device_change(
+    connection: _Connection,
+    device_id: str,
+    actor_id: int | None,
+    kind: str,
+    old_value: dict | None,
+    new_value: dict | None,
+) -> None:
+    """Append an audit row inside the caller's transaction (KTD11)."""
+    if kind not in DEVICE_CHANGE_KINDS:
+        raise ValueError(f"unknown device change kind: {kind}")
+    connection.execute(
+        "INSERT INTO device_changes (device_id, actor_employee_id, kind, old_value, "
+        "new_value, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (device_id, actor_id, kind, old_value, new_value, _now()),
+    )
 
 
 _PUNCH_COLUMNS = (

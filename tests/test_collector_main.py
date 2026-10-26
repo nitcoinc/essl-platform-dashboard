@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import essl_hub.collector_main as collector_main
@@ -13,6 +14,7 @@ from essl_hub.collector_main import (
 )
 from essl_hub.collectors import CollectionResult
 from essl_hub.config import DEVICES
+from essl_hub.db import OfflineError
 from essl_hub.spool import Spool
 
 
@@ -20,7 +22,9 @@ def _seeded_rows() -> list[dict]:
     """What device_connection_info returns right after seeding config.DEVICES."""
     return [
         {"id": d.id, "site": d.site, "model": d.model, "protocol": d.protocol,
-         "ip": d.ip, "port": d.port, "comm_password": None, "connection_updated_at": None}
+         "ip": d.ip, "port": d.port, "comm_password": None, "connection_updated_at": None,
+         "duplicate_window_seconds": 60, "door_denied_since": None,
+         "door_params_request": None, "door_params_requested_at": None}
         for d in DEVICES
     ]
 
@@ -36,6 +40,8 @@ class FakeDatabase:
         self.offline = False
         self.initialized = 0
         self.direction_fills: list[list[dict]] = []
+        self.door_records: list[dict] = []
+        self.door_clears: list[tuple] = []
 
     def initialize(self, devices) -> None:
         self.initialized += 1
@@ -55,6 +61,20 @@ class FakeDatabase:
 
     def warn_device_drift(self, devices) -> None:
         self.drift_checked = list(devices)
+
+    def record_door_params(self, device_id, *, params, read_at, result=None,
+                           previous=None, previous_for=None) -> None:
+        self.door_records.append({"device_id": device_id, "params": params, "read_at": read_at,
+                                  "result": result, "previous": previous,
+                                  "previous_for": previous_for})
+
+    def door_request_at(self, device_id):
+        row = next((r for r in self.connection_info if r["id"] == device_id), {})
+        return collector_main._as_datetime(row.get("door_params_requested_at"))
+
+    def clear_door_request(self, device_id, requested_at) -> bool:
+        self.door_clears.append((device_id, requested_at))
+        return True
 
     def record_poll(self, device_id, *, punches=(), status, **kwargs) -> int:
         punches = list(punches)
@@ -443,6 +463,18 @@ class MergeDeviceConfigsTest(unittest.TestCase):
         with patch.dict(os.environ, {"ESSL_X990_PASSWORD": "envpw"}):
             self.assertEqual(config.password_for(device), "dbpw")
 
+    def test_door_denied_since_comes_from_the_row(self) -> None:
+        # KTD5: the collector gates 24/25 capture on the device's policy.
+        from datetime import datetime
+
+        rows = _seeded_rows()
+        rows[1]["door_denied_since"] = datetime(2026, 10, 26, 9, 0)
+        merged = merge_device_configs(DEVICES, rows)
+        self.assertIsNone(merged[0].door_denied_since)
+        self.assertEqual(merged[1].door_denied_since, datetime(2026, 10, 26, 9, 0))
+        rows[1]["door_denied_since"] = "2026-10-26 09:00:00"
+        self.assertEqual(merge_device_configs(DEVICES, rows)[1].door_denied_since, datetime(2026, 10, 26, 9, 0))
+
     def test_no_rows_means_nothing_to_poll(self) -> None:
         # every device retired: nothing is polled, the static list is not a fallback
         self.assertEqual(merge_device_configs(DEVICES, []), [])
@@ -568,6 +600,255 @@ class DynamicDevicesCycleTest(unittest.TestCase):
         collectors._C3_HISTORY_AT[DEVICES[1].id] = collectors.time.monotonic()
         self.assertFalse(collectors._c3_history_due(DEVICES[1].id))
         self.assertTrue(collectors._c3_history_due("kondapur-c3-400"))
+
+
+class DoorStepCycleTest(unittest.TestCase):
+    """U4: the C3 door step runs after the poll, on its own, and never
+    breaks the cycle."""
+
+    REQUESTED = datetime(2026, 10, 26, 10, 0, 0)
+    NOW = datetime(2026, 10, 26, 10, 1, 0)
+
+    def setUp(self) -> None:
+        from tests.test_collectors import _DoorPanel
+
+        self.panel = _DoorPanel
+        _DoorPanel.instances = []
+        _DoorPanel.behaviour = {}
+        _DoorPanel.connects = True
+        self.c3 = DEVICES[1]
+        self.state = collector_main.PollState(heartbeat_seconds=300, clock=_Clock())
+        self.steps: list[tuple] = []
+
+    def _rows(self, request=None, requested_at=None) -> list[dict]:
+        rows = _seeded_rows()
+        rows[1]["door_params_request"] = request
+        rows[1]["door_params_requested_at"] = requested_at
+        return rows
+
+    def _cycle(self, database, *, transport="TCP realtime", events=(), door_step=None):
+        def step(device, request, requested_at, *, now):
+            self.steps.append((device.id, request, requested_at))
+            return door_step(device, request, requested_at, now=now)
+
+        with patch.object(collector_main, "_ist_now", return_value=self.NOW):
+            collector_main.run_cycle(
+                database, Spool(":memory:"), collector_main.static_devices(),
+                collector=lambda d: CollectionResult(list(events), transport, "SN", "FW"),
+                state=self.state, door_step=step,
+            )
+
+    def _real_step(self, device, request, requested_at, *, now):
+        from essl_hub import collectors
+
+        with patch("c3.C3", self.panel):
+            return collectors.c3_door_step(device, request, requested_at, now=now)
+
+    def test_merge_carries_the_pending_request(self) -> None:
+        [_, c3] = merge_device_configs(DEVICES, self._rows({"Door1Intertime": 0}, self.REQUESTED))
+        self.assertEqual(c3.door_request, {"Door1Intertime": 0})
+        self.assertEqual(c3.door_requested_at, self.REQUESTED)
+        [_, c3] = merge_device_configs(DEVICES, self._rows("junk", "2026-10-26 10:00:00"))
+        self.assertIsNone(c3.door_request)
+
+    def test_collect_once_reports_a_history_read(self) -> None:
+        database = FakeDatabase()
+        history = lambda d: CollectionResult([], "TCP history", "SN", "FW")
+        realtime = lambda d: CollectionResult([], "TCP realtime", "SN", "FW")
+        self.assertTrue(collect_once(database, self.c3, collector=history))
+        self.assertFalse(collect_once(database, self.c3, collector=realtime))
+
+    def test_no_request_and_no_history_read_skips_the_door_step(self) -> None:
+        self._cycle(FakeDatabase(), door_step=self._real_step)
+        self.assertEqual(self.steps, [])
+
+    def test_a_history_read_refreshes_the_door_read_without_a_result(self) -> None:
+        database = FakeDatabase()
+        self._cycle(database, transport="TCP history", door_step=self._real_step)
+        # The X990 never gets a door step.
+        self.assertEqual(self.steps, [(self.c3.id, None, None)])
+        [record] = database.door_records
+        self.assertEqual(record["params"]["Door1Intertime"], 1)
+        self.assertIsNone(record["result"])
+        self.assertIsNone(record["previous"])
+        self.assertEqual(database.door_clears, [])
+
+    def test_a_pending_request_is_applied_recorded_and_cleared(self) -> None:
+        database = FakeDatabase(self._rows({"Door1Intertime": 0}, self.REQUESTED))
+        self._cycle(database, door_step=self._real_step)
+        [record] = database.door_records
+        self.assertEqual(record["result"]["state"], "applied")
+        self.assertEqual(record["previous"]["Door1Intertime"], 1)
+        self.assertEqual(record["previous_for"], self.REQUESTED)
+        self.assertEqual(database.door_clears, [(self.c3.id, self.REQUESTED)])
+
+    def test_a_password_rejection_fails_the_request_but_punches_are_stored(self) -> None:
+        self.panel.behaviour = {"Door1Intertime": -14}
+        database = FakeDatabase(self._rows({"Door1Intertime": 0}, self.REQUESTED))
+        punch = {"fingerprint": "fp-door", "device_id": self.c3.id}
+        self._cycle(database, events=[punch], door_step=self._real_step)
+        self.assertIn(punch, database.inserted_punches)
+        [record] = database.door_records
+        self.assertEqual(record["result"]["state"], "failed")
+        self.assertEqual(record["result"]["keys"]["Door1Intertime"]["message"],
+                         "communication password rejected")
+        self.assertEqual(database.door_clears, [(self.c3.id, self.REQUESTED)])
+
+    def test_an_unreachable_panel_leaves_the_request_pending(self) -> None:
+        self.panel.connects = False
+        database = FakeDatabase(self._rows({"Door1Intertime": 0}, self.REQUESTED))
+        with self.assertLogs(collector_main._logger, level="WARNING"):
+            self._cycle(database, door_step=self._real_step)
+        self.assertEqual(database.door_records, [])
+        self.assertEqual(database.door_clears, [])
+
+    def test_an_expired_request_is_recorded_and_cleared_without_a_write(self) -> None:
+        old = self.NOW - timedelta(minutes=20)
+        database = FakeDatabase(self._rows({"Door1Intertime": 0}, old))
+        self._cycle(database, door_step=self._real_step)
+        self.assertEqual(self.panel.instances, [])
+        [record] = database.door_records
+        self.assertEqual(record["result"]["state"], "expired")
+        self.assertIsNone(record["params"])
+        self.assertEqual(database.door_clears, [(self.c3.id, old)])
+
+    def test_a_door_step_crash_never_breaks_the_poll_cycle(self) -> None:
+        def broken(device, request, requested_at, *, now):
+            raise RuntimeError("boom")
+
+        database = FakeDatabase(self._rows({"Door1Intertime": 0}, self.REQUESTED))
+        punch = {"fingerprint": "fp-c3", "device_id": self.c3.id}
+        with self.assertLogs(collector_main._logger, level="WARNING"):
+            self._cycle(database, events=[punch], door_step=broken)
+        self.assertIn(punch, database.inserted_punches)
+        self.assertEqual({w["device_id"] for w in database.writes}, {d.id for d in DEVICES})
+        self.assertIsNotNone(self.state.last_poll)
+
+    def test_a_stale_device_list_never_resends_an_answered_request(self) -> None:
+        self.panel.behaviour = {"Door1Intertime": -14}
+        database = FakeDatabase(self._rows({"Door1Intertime": 0}, self.REQUESTED))
+        self._cycle(database, door_step=self._real_step)
+        # The web's clear has not been re-read yet (e.g. a refresh failed).
+        self._cycle(database, door_step=self._real_step)
+        sent = [frame for panel in self.panel.instances for frame in panel.sent]
+        self.assertEqual(sent, [(0x03, b"Door1Intertime=0")])
+        self.assertEqual(len(database.door_records), 1)
+
+
+class DoorStepDatabaseTest(unittest.TestCase):
+    """U4 against a real database: guarded clear and the KTD9 snapshot."""
+
+    T1 = datetime(2026, 10, 26, 10, 0, 0)
+    T2 = datetime(2026, 10, 26, 10, 0, 30)
+    NOW = datetime(2026, 10, 26, 10, 1, 0)
+
+    def setUp(self) -> None:
+        import tempfile
+
+        from essl_hub.db import Database
+        from tests.test_collectors import _DoorPanel
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.database = Database(os.path.join(tmp.name, "essl.db"))
+        self.addCleanup(self.database.close)
+        self.database.initialize(DEVICES)
+        self.c3_id = DEVICES[1].id
+        self.panel = _DoorPanel
+        _DoorPanel.instances = []
+        _DoorPanel.behaviour = {}
+        _DoorPanel.connects = True
+
+    def _device(self):
+        rows = self.database.device_connection_info()
+        return next(d for d in merge_device_configs(DEVICES, rows) if d.id == self.c3_id)
+
+    def _door_once(self, device) -> None:
+        from essl_hub import collectors
+
+        with patch("c3.C3", self.panel):
+            collector_main.door_once(
+                self.database, device, door_step=collectors.c3_door_step, now=self.NOW
+            )
+
+    def test_a_request_replaced_meanwhile_survives_the_collectors_clear(self) -> None:
+        self.database.file_door_request(self.c3_id, {"Door1Intertime": 0}, requested_at=self.T1)
+        device = self._device()
+        self.database.file_door_request(self.c3_id, {"Door1Intertime": 2}, requested_at=self.T2)
+        self._door_once(device)
+        row = self.database.device_by_id(self.c3_id)
+        # The superseded T1 request never reaches the door; T2 stays pending.
+        self.assertEqual(row["door_params_request"], {"Door1Intertime": 2})
+        self.assertEqual(row["door_params_requested_at"], self.T2)
+        self.assertIsNone(row["door_params_result"])
+        self.assertEqual([f for p in self.panel.instances for f in p.sent], [])
+
+    def test_a_request_dismissed_after_the_device_list_was_read_is_never_sent(self) -> None:
+        self.database.file_door_request(self.c3_id, {"Door1Intertime": 0}, requested_at=self.T1)
+        device = self._device()
+        self.database.dismiss_door_request(self.c3_id)
+        self._door_once(device)
+        self.assertEqual([f for p in self.panel.instances for f in p.sent], [])
+        self.assertIsNone(self.database.device_by_id(self.c3_id)["door_params_result"])
+
+    def test_a_failed_result_write_is_retried_not_resent_or_expired(self) -> None:
+        from essl_hub import collectors
+
+        self.database.file_door_request(self.c3_id, {"Door1Intertime": 0}, requested_at=self.T1)
+        device = self._device()
+        state = collector_main.PollState()
+        with patch.object(self.database, "record_door_params", side_effect=OfflineError("busy")):
+            with patch("c3.C3", self.panel), self.assertRaises(OfflineError):
+                collector_main.door_once(self.database, device, door_step=collectors.c3_door_step,
+                                         state=state, now=self.NOW)
+        later = self.T1 + timedelta(minutes=30)
+        with patch("c3.C3", self.panel):
+            collector_main.door_once(self.database, device, door_step=collectors.c3_door_step,
+                                     state=state, now=later)
+        sent = [f for p in self.panel.instances for f in p.sent]
+        self.assertEqual(sent, [(0x03, b"Door1Intertime=0")])
+        row = self.database.device_by_id(self.c3_id)
+        self.assertEqual(row["door_params_result"]["state"], "applied")
+        self.assertIsNone(row["door_params_request"])
+
+    def test_a_drop_clears_the_request_and_keeps_both_originals(self) -> None:
+        self.panel.behaviour = {"Door2Intertime": "drop"}
+        self.database.file_door_request(
+            self.c3_id, {"Door1Intertime": 0, "Door2Intertime": 0}, requested_at=self.T1)
+        self._door_once(self._device())
+        row = self.database.device_by_id(self.c3_id)
+        self.assertIsNone(row["door_params_request"])
+        self.assertEqual(row["door_params_result"]["state"], "failed")
+        self.assertEqual(row["door_params_result"]["keys"]["Door2Intertime"]["outcome"], "not_attempted")
+        self.assertEqual(row["door_params_previous"]["Door1Intertime"], 1)
+        self.assertEqual(row["door_params_previous"]["Door2Intertime"], 1)
+        self.assertEqual(row["door_params_previous_for"], self.T1)
+        self.assertEqual(row["door_params"]["Door1Intertime"], 0)
+        self.assertEqual(row["door_params_read_at"], self.NOW)
+
+    def test_a_read_only_request_leaves_previous_unchanged(self) -> None:
+        self.database.file_door_request(self.c3_id, {"Door1Intertime": 0}, requested_at=self.T1)
+        self._door_once(self._device())
+        self.database.file_door_request(self.c3_id, {}, kind="door_read", requested_at=self.T2)
+        self._door_once(self._device())
+        row = self.database.device_by_id(self.c3_id)
+        self.assertEqual(row["door_params_result"]["state"], "read")
+        self.assertIsNone(row["door_params_request"])
+        self.assertEqual(row["door_params_previous"]["Door1Intertime"], 1)
+        self.assertEqual(row["door_params_previous_for"], self.T1)
+
+    def test_an_expired_request_keeps_the_last_read(self) -> None:
+        self.database.record_door_params(
+            self.c3_id, params={"LockCount": 4, "Door1Intertime": 1}, read_at=self.T1)
+        self.database.file_door_request(
+            self.c3_id, {"Door1Intertime": 0}, requested_at=self.NOW - timedelta(minutes=16))
+        self._door_once(self._device())
+        row = self.database.device_by_id(self.c3_id)
+        self.assertEqual(row["door_params_result"]["state"], "expired")
+        self.assertIsNone(row["door_params_request"])
+        self.assertEqual(row["door_params"], {"LockCount": 4, "Door1Intertime": 1})
+        self.assertEqual(row["door_params_read_at"], self.T1)
+        self.assertEqual(self.panel.instances, [])
 
 
 if __name__ == "__main__":

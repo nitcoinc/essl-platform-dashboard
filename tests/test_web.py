@@ -39,6 +39,21 @@ from essl_hub.db import OfflineError
 from essl_hub.web import create_app
 
 
+# Device columns added in schema v7, with their database defaults.
+_V7_DEVICE_DEFAULTS = {
+    "duplicate_window_seconds": 60,
+    "door_denied_since": None,
+    "door_params": None,
+    "door_params_read_at": None,
+    "door_params_previous": None,
+    "door_params_previous_for": None,
+    "door_params_request": None,
+    "door_params_requested_at": None,
+    "door_params_result": None,
+    "policy_updated_at": None,
+}
+
+
 class FakeDatabase:
     """In-memory stand-in for essl_hub.db.Database, implementing the same
     interface, so the whole web layer can be exercised without Postgres."""
@@ -54,6 +69,7 @@ class FakeDatabase:
         self._next_login_code_id = 1
         self.sessions: dict[str, dict] = {}
         self.api_keys_list: list[dict] = []
+        self.device_change_rows: list[dict] = []
         # `offline` makes every write raise OfflineError, the way an
         # unavailable database does.
         self.offline = False
@@ -86,6 +102,7 @@ class FakeDatabase:
                 "connection_updated_at": None,
                 "created_at": None,
                 "retired_at": None,
+                **_V7_DEVICE_DEFAULTS,
             }
         self.settings.setdefault("daily_target_minutes", "480")
 
@@ -140,7 +157,7 @@ class FakeDatabase:
             "serial_number": None, "firmware": None, "last_attempt": None,
             "last_success": None, "last_error": None, "records_seen": 0,
             "comm_password": comm_password, "connection_updated_at": now,
-            "created_at": now, "retired_at": None,
+            "created_at": now, "retired_at": None, **_V7_DEVICE_DEFAULTS,
         }
 
     def set_device_retired(self, device_id: str, retired: bool) -> None:
@@ -149,6 +166,92 @@ class FakeDatabase:
 
     def devices_at_address(self, ip: str, port: int) -> list[dict]:
         return [d for d in self.devices_by_id.values() if d["ip"] == ip and d["port"] == port]
+
+    # swipe policy and door parameters (v7) -------------------------------
+
+    def _change(self, device_id, actor_id, kind, old_value, new_value) -> None:
+        self.device_change_rows.append({
+            "id": len(self.device_change_rows) + 1, "device_id": device_id,
+            "actor_employee_id": actor_id, "kind": kind, "old_value": old_value,
+            "new_value": new_value, "created_at": _ist_now(),
+        })
+
+    def set_device_policy(self, device_id, *, window_seconds, wait_for_door_close, actor_id=None) -> bool:
+        self._check_online()
+        if isinstance(window_seconds, bool) or not isinstance(window_seconds, int) \
+                or not 0 <= window_seconds <= 300:
+            raise ValueError("window must be 0-300 seconds")
+        device = self.devices_by_id.get(device_id)
+        if device is None:
+            return False
+        old = {"duplicate_window_seconds": device["duplicate_window_seconds"],
+               "wait_for_door_close": device["door_denied_since"] is None}
+        now = _ist_now()
+        device["duplicate_window_seconds"] = window_seconds
+        device["door_denied_since"] = None if wait_for_door_close else (device["door_denied_since"] or now)
+        device["policy_updated_at"] = now
+        self._change(device_id, actor_id, "policy", old,
+                     {"duplicate_window_seconds": window_seconds,
+                      "wait_for_door_close": bool(wait_for_door_close)})
+        return True
+
+    def file_door_request(self, device_id, request, *, kind="door_write", requested_at=None, actor_id=None) -> bool:
+        self._check_online()
+        device = self.devices_by_id.get(device_id)
+        if device is None:
+            return False
+        current = device["door_params"] or {}
+        device["door_params_request"] = dict(request)
+        device["door_params_requested_at"] = requested_at or _ist_now()
+        self._change(device_id, actor_id, kind, {k: current.get(k) for k in request}, dict(request))
+        return True
+
+    def dismiss_door_request(self, device_id, *, actor_id=None) -> bool:
+        self._check_online()
+        device = self.devices_by_id.get(device_id)
+        if device is None:
+            return False
+        old = {"request": device["door_params_request"],
+               "requested_at": device["door_params_requested_at"],
+               "result": device["door_params_result"]}
+        device["door_params_request"] = None
+        device["door_params_requested_at"] = None
+        device["door_params_result"] = None
+        self._change(device_id, actor_id, "door_dismiss", old, None)
+        return True
+
+    def record_door_params(self, device_id, *, params, read_at, result=None, previous=None, previous_for=None) -> None:
+        device = self.devices_by_id[device_id]
+        device["door_params"] = dict(params)
+        device["door_params_read_at"] = read_at
+        if result is not None:
+            device["door_params_result"] = dict(result)
+        if previous is not None and previous_for is not None \
+                and device["door_params_previous_for"] != previous_for:
+            device["door_params_previous"] = dict(previous)
+            device["door_params_previous_for"] = previous_for
+
+    def clear_door_request(self, device_id, requested_at) -> bool:
+        device = self.devices_by_id[device_id]
+        if device["door_params_requested_at"] != requested_at:
+            return False
+        device["door_params_request"] = None
+        device["door_params_requested_at"] = None
+        return True
+
+    def device_windows(self) -> dict[str, int]:
+        return {d["id"]: d["duplicate_window_seconds"] for d in self.devices_by_id.values()}
+
+    def record_device_change(self, device_id, *, kind, old_value, new_value, actor_id=None) -> None:
+        self._check_online()
+        self._change(device_id, actor_id, kind, old_value, new_value)
+
+    def device_changes(self, device_id, limit=20) -> list[dict]:
+        rows = [r for r in self.device_change_rows if r["device_id"] == device_id]
+        return [
+            {**r, "actor_name": (self.employees_by_id.get(r["actor_employee_id"]) or {}).get("name")}
+            for r in reversed(rows)
+        ][:limit]
 
     # punches --------------------------------------------------------------
 
@@ -175,9 +278,15 @@ class FakeDatabase:
                 "trusted_direction": p.get("trusted_direction"),
                 "raw_direction_byte": p.get("raw_direction_byte"),
                 "raw_state": p.get("raw_state", ""),
+                "device_id": p.get("device_id"),
             }
             for p in rows
         ]
+
+    def first_punch_at(self, device_user_ids):
+        wanted = set(device_user_ids)
+        stamps = [p["event_timestamp"] for p in self.punches if p.get("device_user_id") in wanted]
+        return min(stamps) if stamps else None
 
     def punches_for_device_users_range(self, device_user_ids, start: datetime, end: datetime):
         wanted = set(device_user_ids)
@@ -192,6 +301,7 @@ class FakeDatabase:
                 "event_timestamp": p["event_timestamp"],
                 "trusted_direction": p.get("trusted_direction"),
                 "site": p.get("site"),
+                "device_id": p.get("device_id"),
             }
             for p in rows
         ]
@@ -1319,11 +1429,14 @@ class DayStripTest(_QuickViewBase):
         self.assertEqual(len(selected), 1)
         self.assertIn("date=2026-09-06", selected[0])
 
-    def test_out_of_window_and_malformed_dates_are_400(self) -> None:
+    def test_future_and_malformed_dates_are_400(self) -> None:
+        # KTD2: no 7-day guard any more; only future and malformed dates fail.
         self._sign_in(self._person("1", "Hema HR", "hr"))
-        for value in ("2026-09-02", "2026-09-10", "nope"):
+        for value in ("2026-09-10", "nope", "2026-13-01"):
             self.assertEqual(self._quick(self.ravi["id"], f"?date={value}").status_code, 400, value)
-        self.assertEqual(self._quick(self.ravi["id"], "?date=2026-09-03").status_code, 200)
+        self.assertEqual(self._quick(self.ravi["id"], "?strip_end=nope").status_code, 400)
+        for value in ("2026-09-02", "2026-09-03"):
+            self.assertEqual(self._quick(self.ravi["id"], f"?date={value}").status_code, 200, value)
 
     def test_from_people_carried_in_strip_targets(self) -> None:
         self._sign_in(self._person("1", "Hema HR", "hr"))
@@ -1351,9 +1464,137 @@ class DayStripTest(_QuickViewBase):
         selected = [c for c in chips if 'aria-current="date"' in c]
         self.assertEqual(len(selected), 1)
         self.assertIn("date=2026-09-07", selected[0])
-        # Older days keep the pager and simply have no selected chip.
+        # Older days get a strip around them (KTD1), the selection marked.
         old = self.client.get(f"/day?employee={rid}&date=2026-08-01").text
-        self.assertNotIn('aria-current="date"', old)
+        old_selected = [c for c in self._chips(old) if 'aria-current="date"' in c]
+        self.assertEqual(len(old_selected), 1)
+        self.assertIn("date=2026-08-01", old_selected[0])
+
+
+class HistoryPagingTest(_QuickViewBase):
+    """U6: full history in the drawer and on /day (KTD1, KTD2). Today is
+    2026-09-09; Ravi's first punch is 2026-06-01 unless a test says otherwise."""
+
+    def _chips(self, page: str) -> list[str]:
+        return re.findall(r'<a class="day-chip[^>]*>', page)
+
+    def _first_punch(self, at: datetime) -> None:
+        self.database.insert_punches([_punch_row(f"hp-{at.isoformat()}", at, "entry")])
+
+    def _selected(self, page: str) -> list[str]:
+        return [c for c in self._chips(page) if 'aria-current="date"' in c]
+
+    def test_drawer_opens_a_day_forty_days_back_without_polling(self) -> None:
+        self._first_punch(datetime(2026, 6, 1, 9))
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        response = self._quick(self.ravi["id"], "?date=2026-07-31")
+        self.assertEqual(response.status_code, 200)
+        page = response.text
+        self.assertIn('id="day-live"', page)
+        self.assertNotIn("data-poll", page)
+        self.assertIn('value="2026-07-31"', page)
+        chips = self._chips(page)
+        self.assertEqual(len(chips), 7)
+        self.assertIn("date=2026-08-03", chips[-1])
+        self.assertIn("date=2026-07-31", self._selected(page)[0])
+
+    def test_day_page_strip_ends_three_days_after_an_old_selection(self) -> None:
+        self._first_punch(datetime(2026, 6, 1, 9))
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        rid = self.ravi["id"]
+        page = self.client.get(f"/day?employee={rid}&date=2026-07-31").text
+        chips = self._chips(page)
+        self.assertIn("date=2026-07-28", chips[0])
+        self.assertIn("date=2026-08-03", chips[-1])
+        self.assertTrue(all("strip_end=2026-08-03" in c for c in chips))
+        self.assertIn("date=2026-07-31", self._selected(page)[0])
+        # Paging keeps the selected day and moves the strip a week.
+        self.assertIn('aria-label="Earlier week, 21 Jul to 27 Jul"', page)
+        self.assertIn(f'href="/day?employee={rid}&amp;date=2026-07-31&amp;strip_end=2026-07-27"', page)
+        self.assertIn('aria-label="Later week, 04 Aug to 10 Aug"', page)
+        later = self.client.get(f"/day?employee={rid}&date=2026-07-31&strip_end=2026-08-10").text
+        self.assertIn("date=2026-08-10", self._chips(later)[-1])
+        self.assertEqual(self._selected(later), [])
+        self.assertIn("Friday 31 July 2026", later)
+
+    def test_selected_today_ends_at_today_with_no_later_week(self) -> None:
+        self._first_punch(datetime(2026, 6, 1, 9))
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        for page in (self.client.get(f"/day?employee={self.ravi['id']}").text, self._quick(self.ravi["id"]).text):
+            chips = self._chips(page)
+            self.assertIn('aria-label="Wednesday 09 September, Today"', chips[-1])
+            self.assertIn('aria-current="date"', chips[-1])
+            self.assertNotIn('data-qv-page="later"', page)
+            self.assertNotIn('aria-label="Later week,', page)
+            self.assertIn('data-qv-page="earlier"', page)
+
+    def test_strip_end_beyond_today_is_clamped(self) -> None:
+        self._first_punch(datetime(2026, 6, 1, 9))
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        rid = self.ravi["id"]
+        page = self.client.get(f"/day?employee={rid}&date=2026-09-05&strip_end=2026-12-01").text
+        self.assertIn('aria-label="Wednesday 09 September, Today"', self._chips(page)[-1])
+        self.assertFalse(any("strip_end=" in c for c in self._chips(page)))
+        drawer = self._quick(rid, "?date=2026-09-05&strip_end=2026-12-01")
+        self.assertEqual(drawer.status_code, 200)
+        self.assertIn('aria-label="Wednesday 09 September, Today"', self._chips(drawer.text)[-1])
+        # A malformed strip_end on /day falls back like a malformed date.
+        self.assertEqual(self.client.get(f"/day?employee={rid}&strip_end=nope").status_code, 200)
+
+    def test_earlier_week_disabled_at_the_first_punch_week(self) -> None:
+        self._first_punch(datetime(2026, 8, 20, 9))
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        rid = self.ravi["id"]
+        at_first = self.client.get(f"/day?employee={rid}&date=2026-08-20&strip_end=2026-08-25").text
+        self.assertIn('aria-disabled="true" aria-label="Earlier week"', at_first)
+        self.assertNotIn('data-qv-page="earlier"', at_first)
+        self.assertIn('min="2026-08-20" max="2026-09-09"', at_first)
+        week_after = self.client.get(f"/day?employee={rid}&date=2026-08-20&strip_end=2026-09-01").text
+        self.assertIn('aria-label="Earlier week, 19 Aug to 25 Aug"', week_after)
+        # A strip_end before the first punch week snaps forward to it.
+        too_early = self.client.get(f"/day?employee={rid}&date=2026-08-20&strip_end=2026-07-01").text
+        self.assertIn("date=2026-08-26", self._chips(too_early)[-1])
+
+    def test_day_before_first_punch_says_so(self) -> None:
+        self._first_punch(datetime(2026, 8, 20, 9))
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        rid = self.ravi["id"]
+        expected = "Before Ravi Kumar&#39;s first punch on 20 August 2026"
+        self.assertIn(expected, self._quick(rid, "?date=2026-08-10").text)
+        self.assertIn(expected, self.client.get(f"/day?employee={rid}&date=2026-08-10").text)
+        self.assertNotIn("first punch on", self._quick(rid, "?date=2026-08-21").text)
+
+    def test_person_with_no_punches_gets_today_as_picker_min(self) -> None:
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        rid = self.ravi["id"]
+        for response in (self.client.get(f"/day?employee={rid}"), self._quick(rid, "?date=2026-07-31")):
+            self.assertEqual(response.status_code, 200)
+            self.assertIn('min="2026-09-09" max="2026-09-09"', response.text)
+            self.assertIn('aria-disabled="true" aria-label="Earlier week"', response.text)
+
+    def test_no_access_is_still_404_for_old_days(self) -> None:
+        boss = self._person("900", "Boss", "manager")
+        other = self._person("901", "Other")
+        self._sign_in(boss)
+        self.assertEqual(self._quick(other["id"], "?date=2026-07-31").status_code, 404)
+        self.assertEqual(self.client.get(f"/day?employee={other['id']}&date=2026-07-31").status_code, 404)
+
+    def test_plain_get_redirect_keeps_the_date(self) -> None:
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        rid = self.ravi["id"]
+        response = self.client.get(f"/quick/{rid}?date=2026-07-31")
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.headers["Location"].endswith(f"/day?employee={rid}&date=2026-07-31"))
+
+    def test_drawer_arrows_and_picker_carry_from_and_strip_end(self) -> None:
+        self._first_punch(datetime(2026, 6, 1, 9))
+        self._sign_in(self._person("1", "Hema HR", "hr"))
+        rid = self.ravi["id"]
+        page = self._quick(rid, "?from=people&date=2026-07-31").text
+        self.assertIn(f'data-qv-day="/quick/{rid}?date=2026-07-31&amp;strip_end=2026-07-27&amp;from=people"', page)
+        self.assertIn(f'data-qv-day="/quick/{rid}?date=2026-07-30&amp;strip_end=2026-08-03&amp;from=people"', page)
+        self.assertIn(f'data-qv-date="/quick/{rid}?from=people"', page)
+        self.assertIn('min="2026-06-01" max="2026-09-09"', page)
 
 
 class QuickViewDrawerTest(_QuickViewBase):
@@ -1962,6 +2203,383 @@ class AdminDeviceLifecycleTest(AdminDeviceEditTest):
         response = self.client.post("/devices/uppal-x990/retire", data={"csrf": "x"})
         self.assertEqual(response.status_code, 403)
         self.assertIsNone(self.database.device_by_id("uppal-x990")["retired_at"])
+
+
+# A four-door C3 as the Pre-implementation Check read it.
+_C3_PARAMS = {
+    "LockCount": 4, "ReaderCount": 4, "AntiPassback": 0, "InterLock": 0,
+    **{
+        f"Door{door}{name}": value
+        for door in range(1, 5)
+        for name, value in (
+            ("Intertime", 1), ("Drivertime", 5), ("Detectortime", 15),
+            ("CloseAndLock", 1), ("SensorType", 0), ("VerifyType", 7),
+        )
+    },
+}
+_C3 = "gachibowli-c3-400"
+_X990 = "uppal-x990"
+
+
+class _DeviceSettingsBase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.app, self.database = _make_app()
+        self.admin = self._person("1", "Admin", "admin@example.com", "admin")
+        self.client = self.app.test_client()
+        self._sign_in("admin@example.com")
+
+    def _person(self, uid: str, name: str, email: str, role: str) -> dict:
+        self.database.upsert_employee(device_user_id=uid, name=name, email=email)
+        person = self.database.employee_by_email(email)
+        self.database.set_employee_role(person["id"], role)
+        return person
+
+    def _sign_in(self, email: str) -> None:
+        from essl_hub import mail as mail_module
+
+        captured = {}
+        original = mail_module.send_login_code
+        mail_module.send_login_code = lambda e, c: captured.update(code=c)
+        self.addCleanup(lambda: setattr(mail_module, "send_login_code", original))
+        self.client.post("/signin", data={"email": email})
+        self.client.post("/signin/verify", data={"code": captured["code"]})
+
+    def _sign_in_as(self, role: str) -> None:
+        self.client.post("/signout")
+        self._person("900", f"Priya {role}", f"{role}@example.com", role)
+        self._sign_in(f"{role}@example.com")
+
+    def _csrf(self) -> str:
+        html = self.client.get("/settings").text
+        marker = 'name="csrf" value="'
+        start = html.index(marker) + len(marker)
+        return html[start : html.index('"', start)]
+
+    def _card(self, device_id: str, html: str | None = None) -> str:
+        html = html if html is not None else self.client.get("/devices").text
+        start = html.index(f'aria-labelledby="device-{device_id}-name"')
+        end = html.find('<section class="device"', start)
+        return html[start : end if end != -1 else len(html)]
+
+    def _read_c3(self, **overrides) -> dict:
+        device = self.database.device_by_id(_C3)
+        device["door_params"] = {**_C3_PARAMS, **overrides}
+        device["door_params_read_at"] = _ist_now() - timedelta(minutes=30)
+        return device
+
+
+class DevicePolicyTest(_DeviceSettingsBase):
+    """U5: per-device quick-swipe window and, on a C3, Wait for door close."""
+
+    def _policy(self, device_id: str, **data):
+        data.setdefault("csrf", self._csrf())
+        return self.client.post(f"/devices/{device_id}/policy", data=data)
+
+    def test_admin_saves_window_with_one_audit_row(self) -> None:
+        response = self._policy(_X990, window_seconds="10")
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(f"policy={_X990}", response.headers["Location"])
+        device = self.database.device_by_id(_X990)
+        self.assertEqual(device["duplicate_window_seconds"], 10)
+        self.assertIsNotNone(device["policy_updated_at"])
+        rows = self.database.device_change_rows
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["kind"], rows[0]["actor_employee_id"]), ("policy", self.admin["id"]))
+        self.assertEqual(rows[0]["new_value"]["duplicate_window_seconds"], 10)
+        page = self.client.get(f"/devices?policy={_X990}").text
+        self.assertIn("Swipe policy saved", self._card(_X990, page))
+
+    def test_window_zero_and_max_are_accepted(self) -> None:
+        for raw, expected in (("0", 0), (" 300 ", 300)):
+            with self.subTest(raw=raw):
+                self.assertEqual(self._policy(_X990, window_seconds=raw).status_code, 302)
+                self.assertEqual(self.database.device_by_id(_X990)["duplicate_window_seconds"], expected)
+
+    def test_invalid_window_rerenders_with_error_and_stores_nothing(self) -> None:
+        for raw in ("abc", "1.5", "400", "-1", "", "10s"):
+            with self.subTest(raw=raw):
+                response = self._policy(_X990, window_seconds=raw)
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("Enter whole seconds from 0 to 300.", self._card(_X990, response.text))
+                self.assertEqual(self.database.device_by_id(_X990)["duplicate_window_seconds"], 60)
+        self.assertEqual(self.database.device_change_rows, [])
+
+    def test_hr_and_manager_are_forbidden(self) -> None:
+        for role in ("hr", "manager"):
+            with self.subTest(role=role):
+                self._sign_in_as(role)
+                response = self.client.post(
+                    f"/devices/{_X990}/policy", data={"csrf": "x", "window_seconds": "10"})
+                self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.database.device_by_id(_X990)["duplicate_window_seconds"], 60)
+
+    def test_missing_csrf_is_rejected(self) -> None:
+        response = self.client.post(f"/devices/{_X990}/policy", data={"window_seconds": "10"})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.database.device_change_rows, [])
+
+    def test_unknown_device_is_404(self) -> None:
+        self.assertEqual(self._policy("ghost", window_seconds="10").status_code, 404)
+
+    def test_only_the_c3_card_has_the_door_close_checkbox(self) -> None:
+        page = self.client.get("/devices").text
+        self.assertIn("Swipe policy", self._card(_X990, page))
+        self.assertIn("0 = count every swipe", self._card(_X990, page))
+        self.assertNotIn('name="wait_for_door_close"', self._card(_X990, page))
+        self.assertIn('name="wait_for_door_close"', self._card(_C3, page))
+        self.assertIn("Recommended for this C3: 10 s.", self._card(_C3, page))
+        self.assertIn("Recommended for the X990: 5-10 s.", self._card(_X990, page))
+
+    def test_x990_post_never_starts_door_denials(self) -> None:
+        self._policy(_X990, window_seconds="10")  # no checkbox posted
+        self.assertIsNone(self.database.device_by_id(_X990)["door_denied_since"])
+
+    def test_unchecking_door_close_starts_denials_and_rechecking_clears(self) -> None:
+        self.assertIn(" checked", self._card(_C3).split('name="wait_for_door_close"')[1][:120])
+        self._policy(_C3, window_seconds="10")
+        since = self.database.device_by_id(_C3)["door_denied_since"]
+        self.assertIsNotNone(since)
+        card = self._card(_C3)
+        self.assertIn("Counting door denials since", card)
+        self.assertNotIn(" checked", card.split('name="wait_for_door_close"')[1][:120])
+        self._policy(_C3, window_seconds="10", wait_for_door_close="1")
+        self.assertIsNone(self.database.device_by_id(_C3)["door_denied_since"])
+        self.assertEqual(len(self.database.device_change_rows), 2)
+
+    def test_door_close_note_follows_the_last_read(self) -> None:
+        self.assertNotIn("Last read:", self._card(_C3))
+        self._read_c3()
+        self.assertIn("Last read: no door sensor, InterLock 0, AntiPassback 0.", self._card(_C3))
+        self._read_c3(Door2SensorType=2, InterLock=1)
+        self.assertIn("door sensor on door 2, InterLock Doors 1 and 2", self._card(_C3))
+
+
+class DeviceDoorSettingsTest(_DeviceSettingsBase):
+    """U8: reading, changing, restoring and dismissing C3 door parameters."""
+
+    def _door(self, path: str = "", device_id: str = _C3, **data):
+        data.setdefault("csrf", self._csrf())
+        return self.client.post(f"/devices/{device_id}/door{path}", data=data)
+
+    def _form(self, **changes) -> dict:
+        # What the browser posts: every writable key at its current value.
+        from essl_hub.door_params import writable_keys
+
+        form = {key: str(_C3_PARAMS[key]) for key in writable_keys(4)}
+        form.update(changes)
+        return form
+
+    def test_x990_card_has_no_door_section_and_door_routes_404(self) -> None:
+        self.assertNotIn("Door settings", self._card(_X990))
+        self.assertIn("Door settings", self._card(_C3))
+        for path in ("", "/read", "/restore", "/dismiss"):
+            with self.subTest(path=path):
+                self.assertEqual(self._door(path, device_id=_X990).status_code, 404)
+                self.assertEqual(self._door(path, device_id="ghost").status_code, 404)
+        self.assertEqual(self.database.device_change_rows, [])
+
+    def test_before_any_read_form_is_hidden_and_read_is_offered(self) -> None:
+        card = self._card(_C3)
+        self.assertIn("Not read yet. Use Read from device.", card)
+        self.assertNotIn("Change door settings", card)
+        self.assertIn(f"/devices/{_C3}/door/read", card)
+        response = self._door("", **self._form(Door1Intertime="0"))
+        self.assertEqual(response.status_code, 400)
+        self.assertIsNone(self.database.device_by_id(_C3)["door_params_request"])
+
+    def test_read_from_device_files_an_empty_request(self) -> None:
+        response = self._door("/read")
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(f"door={_C3}", response.headers["Location"])
+        device = self.database.device_by_id(_C3)
+        self.assertEqual(device["door_params_request"], {})
+        self.assertEqual(self.database.device_change_rows[-1]["kind"], "door_read")
+        card = self._card(_C3)
+        self.assertIn("Pending", card)
+        self.assertIn("applied on the device's next poll (about 1 min)", card)
+
+    def test_values_show_labels_per_door(self) -> None:
+        self._read_c3()
+        card = self._card(_C3)
+        for text in ("Door 1", "Door 4", "Punch interval", "Lock when door closes",
+                     "Verify mode (read only)", "Panel-wide", "Anti-passback", "Busy door: 0"):
+            self.assertIn(text, card)
+        self.assertIn("Change door settings", card)
+        self.assertNotIn('name="Door1VerifyType"', card)
+        self.assertNotIn('name="LockCount"', card)
+
+    def test_change_confirms_then_files_with_audit(self) -> None:
+        self._read_c3()
+        response = self._door("", **self._form(Door1Intertime="0"))
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Punch interval, door 1: 1 → 0", response.text)
+        self.assertEqual(response.text.count("→"), 1)
+        self.assertIsNone(self.database.device_by_id(_C3)["door_params_request"])
+        self.assertEqual(self.database.device_change_rows, [])
+
+        response = self._door("", Door1Intertime="0", confirm="1")
+        self.assertEqual(response.status_code, 302)
+        device = self.database.device_by_id(_C3)
+        self.assertEqual(device["door_params_request"], {"Door1Intertime": 0})
+        (row,) = self.database.device_change_rows
+        self.assertEqual((row["kind"], row["actor_employee_id"]), ("door_write", self.admin["id"]))
+        self.assertEqual((row["old_value"], row["new_value"]), ({"Door1Intertime": 1}, {"Door1Intertime": 0}))
+        card = self._card(_C3)
+        self.assertIn("Pending", card)
+        self.assertIn(f"Requested {device['door_params_requested_at'].strftime('%H:%M')}", card)
+        self.assertNotIn("Change door settings", card)
+
+    def test_select_change_shows_option_labels(self) -> None:
+        self._read_c3()
+        response = self._door("", **self._form(Door2CloseAndLock="0"))
+        self.assertIn("Lock when door closes, door 2: On → Off", response.text)
+
+    def test_nothing_changed_files_nothing(self) -> None:
+        self._read_c3()
+        response = self._door("", **self._form())
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Nothing changed.", self._card(_C3, response.text))
+        self.assertIsNone(self.database.device_by_id(_C3)["door_params_request"])
+
+    def test_forbidden_keys_and_smuggled_values_are_400(self) -> None:
+        self._read_c3()
+        cases = [
+            {"ComPwd": "1"},
+            {"Door1Intertime": "0,ComPwd=1"},
+            {"Door1VerifyType": "4"},
+            {"IPAddress": "1"},
+            {"Door5Intertime": "0"},
+            {"Door1Intertime": "11"},
+            {"Door1Intertime": "1.5"},
+        ]
+        for extra in cases:
+            for confirm in ({}, {"confirm": "1"}):
+                with self.subTest(extra=extra, confirm=confirm):
+                    response = self._door("", **self._form(**extra), **confirm)
+                    self.assertEqual(response.status_code, 400)
+        self.assertIsNone(self.database.device_by_id(_C3)["door_params_request"])
+        self.assertEqual(self.database.device_change_rows, [])
+
+    def test_restore_without_snapshot_is_disabled_and_400(self) -> None:
+        self._read_c3()
+        card = self._card(_C3)
+        button = card.split("/door/restore")[1].split("</form>")[0]
+        self.assertIn("disabled", button)
+        self.assertEqual(self._door("/restore").status_code, 400)
+        self.assertEqual(self._door("/restore", confirm="1").status_code, 400)
+        self.assertIsNone(self.database.device_by_id(_C3)["door_params_request"])
+
+    def test_restore_lists_only_differing_whitelisted_keys(self) -> None:
+        device = self._read_c3(Door1Intertime=0, Door2Drivertime=5)
+        device["door_params_previous"] = {
+            **_C3_PARAMS, "Door2Drivertime": 8, "Door1VerifyType": 4, "LockCount": 2,
+            "ComPwd": 5,
+        }
+        device["door_params_previous_for"] = _ist_now() - timedelta(hours=1)
+        card = self._card(_C3)
+        self.assertNotIn("disabled", card.split("/door/restore")[1].split("</form>")[0])
+        response = self._door("/restore")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Punch interval, door 1: 0 → 1", response.text)
+        self.assertIn("Unlock time, door 2: 5 → 8", response.text)
+        self.assertEqual(response.text.count("→"), 2)
+        self.assertIsNone(device["door_params_request"])
+
+        response = self._door("/restore", confirm="1")
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(device["door_params_request"], {"Door1Intertime": 1, "Door2Drivertime": 8})
+        self.assertEqual(self.database.device_change_rows[-1]["kind"], "door_restore")
+
+    def test_failed_shows_per_key_messages_and_dismiss_clears(self) -> None:
+        device = self._read_c3()
+        device["door_params_result"] = {
+            "state": "failed", "requested_at": "2026-10-26 10:00:00",
+            "finished_at": "2026-10-26 10:00:41", "message": "",
+            "keys": {
+                "Door1Intertime": {"outcome": "failed", "old": 1, "new": 0, "now": 1,
+                                   "message": "panel kept 1"},
+                "Door2Intertime": {"outcome": "not_attempted", "old": 1, "new": 0,
+                                   "now": None, "message": ""},
+            },
+        }
+        card = self._card(_C3)
+        self.assertIn("Failed", card)
+        self.assertIn("Punch interval, door 1: 1 → 0", card)
+        self.assertIn("panel kept 1", card)
+        self.assertIn("Not attempted", card)
+        self.assertIn(f"/devices/{_C3}/door/dismiss", card)
+
+        response = self._door("/dismiss")
+        self.assertEqual(response.status_code, 302)
+        self.assertIsNone(device["door_params_result"])
+        self.assertIsNone(device["door_params_request"])
+        (row,) = self.database.device_change_rows
+        self.assertEqual(row["kind"], "door_dismiss")
+        self.assertNotIn("panel kept 1", self._card(_C3))
+
+    def test_pending_past_two_polls_says_collector_has_not_picked_it_up(self) -> None:
+        device = self._read_c3()
+        device["door_params_request"] = {"Door1Intertime": 0}
+        device["door_params_requested_at"] = _ist_now()
+        self.assertNotIn("Collector has not picked this up.", self._card(_C3))
+        device["door_params_requested_at"] = _ist_now() - timedelta(minutes=3)
+        card = self._card(_C3)
+        self.assertIn("Collector has not picked this up.", card)
+        self.assertIn("Cancel request", card)
+
+    def test_a_pending_request_blocks_another(self) -> None:
+        device = self._read_c3()
+        device["door_params_request"] = {}
+        device["door_params_requested_at"] = _ist_now()
+        self.assertEqual(self._door("/read").status_code, 409)
+        self.assertEqual(self._door("", **self._form(Door1Intertime="0"), confirm="1").status_code, 409)
+        self.assertEqual(device["door_params_request"], {})
+
+    def test_hr_is_forbidden_on_every_door_route(self) -> None:
+        self._read_c3()
+        self._sign_in_as("hr")
+        for path in ("", "/read", "/restore", "/dismiss"):
+            with self.subTest(path=path):
+                response = self.client.post(f"/devices/{_C3}/door{path}", data={"csrf": "x"})
+                self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.database.device_change_rows, [])
+
+    def test_missing_csrf_is_400_on_every_door_route(self) -> None:
+        self._read_c3()
+        for path in ("", "/read", "/restore", "/dismiss"):
+            with self.subTest(path=path):
+                response = self.client.post(
+                    f"/devices/{_C3}/door{path}", data={"Door1Intertime": "0", "confirm": "1"})
+                self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.database.device_change_rows, [])
+
+
+class DoorViewStateTest(unittest.TestCase):
+    """The card-state helper behind U8, one case per diagram state."""
+
+    def _view(self, **device):
+        from essl_hub.routes.admin import _door_view
+
+        base = {"protocol": "c3-pullsdk", **_V7_DEVICE_DEFAULTS}
+        return _door_view({**base, **device}, datetime(2026, 10, 26, 10, 10), 60)
+
+    def test_states(self) -> None:
+        requested = datetime(2026, 10, 26, 10, 0)
+        self.assertIsNone(self._view(protocol="zk-attendance"))
+        self.assertEqual(self._view()["state"], "not_read")
+        self.assertFalse(self._view()["can_change"])
+        pending = self._view(door_params_request={}, door_params_requested_at=requested)
+        self.assertEqual((pending["state"], pending["stale"]), ("pending", True))
+        self.assertEqual(pending["expires_at"], datetime(2026, 10, 26, 10, 15))
+        read = self._view(door_params=_C3_PARAMS, door_params_result={"state": "read", "keys": {}})
+        self.assertEqual((read["state"], read["can_change"], len(read["doors"])), ("applied", True, 4))
+        for state in ("failed", "expired"):
+            view = self._view(door_params=_C3_PARAMS, door_params_result={"state": state, "keys": {}})
+            self.assertEqual(view["state"], state)
+        pending_after_read = self._view(
+            door_params=_C3_PARAMS, door_params_requested_at=requested,
+            door_params_request={"Door1Intertime": 0})
+        self.assertFalse(pending_after_read["can_change"])
 
 
 class AdminRosterUploadTest(unittest.TestCase):
@@ -3391,6 +4009,35 @@ class PeopleManagementTest(unittest.TestCase):
         csv_text = self.client.get(f"/export.csv?from={day.isoformat()}&to={day.isoformat()}").text
         row = next(line for line in csv_text.splitlines() if "Kiran Kumar" in line)
         self.assertIn("09:00,17:00,2,8:00", row)
+
+    def _quick_swipe_day(self, window: int):
+        import csv as csv_module
+
+        from essl_hub import export
+        kiran = self._person("NP0128", "Kiran Kumar")
+        day = (_ist_now() - timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0)
+        self._punches(*[("NP0128", "Kiran", day.replace(hour=h, minute=0, second=s), None)
+                        for h, s in ((9, 0), (9, 20), (12, 0), (17, 0))])
+        self.database.set_device_policy(DEVICES[0].id, window_seconds=window, wait_for_door_close=True)
+        self._sign_in(self.hr)
+        page = self.client.get(f"/day?date={day.date().isoformat()}&employee={kiran['id']}").text
+        csv_text = self.client.get(f"/export.csv?from={day.date().isoformat()}&to={day.date().isoformat()}").text
+        row = next(r for r in csv_module.reader(io.StringIO(csv_text.lstrip("\ufeff"))) if "Kiran Kumar" in r)
+        return page, row[export.DAILY_HEADER.index("Effective")]
+
+    def test_day_page_and_export_agree_under_device_window(self) -> None:
+        # KTD3: window 0 counts 09:00:20 as Out; 12:00 In, 17:00 Out -> 5h.
+        page, effective = self._quick_swipe_day(0)
+        self.assertIn("5h 00m", page)
+        self.assertEqual(effective, "5:00")
+        self.assertNotIn("not counted", page)
+
+    def test_default_window_collapses_with_reason_on_day_page(self) -> None:
+        # 60 s: 09:00:20 is not counted; 09:00 In, 12:00 Out, 17:00 unpaired -> 3h.
+        page, effective = self._quick_swipe_day(60)
+        self.assertIn("3h 00m", page)
+        self.assertEqual(effective, "3:00")
+        self.assertIn("same as In 09:00:00, 20s earlier", page)
 
     def test_twin_of_never_punched_id_replaces_the_main_id(self) -> None:
         kiran = self._person("128", "Kiran Kumar")

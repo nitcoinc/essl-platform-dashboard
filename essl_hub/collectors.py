@@ -2,15 +2,25 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import struct
 import time
 import zlib
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable
 
-from .config import DeviceConfig, numeric_comm_password, password_for
+from .config import C3_PROTOCOL, X990_PROTOCOL, DeviceConfig, numeric_comm_password, password_for
+from .door_params import (
+    DOOR_REQUEST_TTL,
+    READ_BATCH,
+    DoorParamError,
+    lock_count_of,
+    parse_params,
+    read_keys,
+    validate_request,
+)
 from .hashing import sha256_hex
 
 
@@ -78,6 +88,13 @@ C3_GRANTED_EVENT_TYPES = {"0", "1", "2", "3"}
 C3_INTERVAL_TOO_SHORT_EVENT = "20"
 C3_INTERVAL_TOO_SHORT_NOTE = "interval too short"
 C3_ATTENDANCE_EVENT_TYPES = C3_GRANTED_EVENT_TYPES | {C3_INTERVAL_TOO_SHORT_EVENT}
+# KTD5: interlock (25) and anti-passback (24) denials depend on door state or
+# swipe history, not on the person. Captured, flagged, only from the device's
+# door_denied_since on ("Wait for door close" unchecked).
+C3_DOOR_DENIED_NOTES = {"24": "door denied: anti-passback", "25": "door denied: interlock"}
+# KTD4: events whose realtime in/out 15 is a real exit (byte 1). Event 20 was
+# gated by the 2026-10-26 pre-implementation check; drop it here to undo.
+C3_REALTIME_15_EXIT_EVENT_TYPES = frozenset(C3_GRANTED_EVENT_TYPES | {C3_INTERVAL_TOO_SHORT_EVENT})
 
 _C3_HISTORY_AT: dict[str, float] = {}
 
@@ -95,17 +112,37 @@ def _c3_is_punch(event_type: str) -> bool:
     return str(event_type).strip() in C3_ATTENDANCE_EVENT_TYPES
 
 
-def _c3_is_granted(event_type: str) -> bool:
-    return str(event_type).strip() in C3_GRANTED_EVENT_TYPES
-
-
-def _c3_keep(event_type: str, pin: str, card: str) -> bool:
-    """An interval-too-short row with neither PIN nor card has no identity."""
+def _c3_keep(
+    event_type: str,
+    pin: str,
+    card: str,
+    timestamp: str = "",
+    door_denied_since: datetime | None = None,
+) -> bool:
+    """Interval-too-short and door-denied rows with neither PIN nor card have
+    no identity. Door-denied rows count only at/after ``door_denied_since``."""
+    event_type = str(event_type).strip()
+    has_identity = str(pin or "").strip() not in ("", "0") or str(card or "").strip() not in ("", "0")
+    if event_type in C3_DOOR_DENIED_NOTES:
+        if door_denied_since is None or not has_identity:
+            return False
+        try:
+            return datetime.fromisoformat(str(timestamp)) >= door_denied_since
+        except ValueError:
+            return False
     if not _c3_is_punch(event_type):
         return False
-    if str(event_type).strip() == C3_INTERVAL_TOO_SHORT_EVENT:
-        return str(pin or "").strip() not in ("", "0") or str(card or "").strip() not in ("", "0")
+    if event_type == C3_INTERVAL_TOO_SHORT_EVENT:
+        return has_identity
     return True
+
+
+def _c3_note(event_type: str) -> str:
+    """The raw_state note day_story.punch_flags turns into a chip."""
+    event_type = str(event_type).strip()
+    if event_type == C3_INTERVAL_TOO_SHORT_EVENT:
+        return C3_INTERVAL_TOO_SHORT_NOTE
+    return C3_DOOR_DENIED_NOTES.get(event_type, "")
 
 
 def _read_c3_frame(sock: socket.socket) -> tuple[int, bytes]:
@@ -173,9 +210,9 @@ def read_c3_table(panel: Any, table_name: str) -> list[dict[str, Any]]:
 
 
 def collect(device: DeviceConfig) -> CollectionResult:
-    if device.protocol == "zk-attendance":
+    if device.protocol == X990_PROTOCOL:
         return collect_x990(device)
-    if device.protocol == "c3-pullsdk":
+    if device.protocol == C3_PROTOCOL:
         return collect_c3(device)
     raise ValueError(f"Unsupported device protocol: {device.protocol}")
 
@@ -286,8 +323,6 @@ def collect_c3(device: DeviceConfig) -> CollectionResult:
             value = _record_values(row)
             pin = value("Pin")
             card = value("Cardno", "CardNo", "Card")
-            if not _c3_keep(value("EventType", "event_type"), pin, card):
-                continue
             raw_time = value("Time_second", "TimeSecond")
             timestamp = ""
             if raw_time:
@@ -298,13 +333,15 @@ def collect_c3(device: DeviceConfig) -> CollectionResult:
                 except (TypeError, ValueError):
                     timestamp = str(raw_time)
             event_type = value("EventType", "event_type")
+            if not _c3_keep(event_type, pin, card, timestamp, device.door_denied_since):
+                continue
             in_out = value("InOutState", "InOutStatus")
             raw_state = " · ".join(
                 part
                 for part in (
                     f"event {event_type}" if event_type else "",
                     f"in/out {in_out}" if in_out else "",
-                    C3_INTERVAL_TOO_SHORT_NOTE if event_type.strip() == C3_INTERVAL_TOO_SHORT_EVENT else "",
+                    _c3_note(event_type),
                 )
                 if part
             )
@@ -345,7 +382,13 @@ def collect_c3(device: DeviceConfig) -> CollectionResult:
             realtime_events = [
                 record for record in records
                 if record.is_event()
-                and _c3_keep(str(int(record.event_type)), str(record.pin or ""), str(record.card_no or ""))
+                and _c3_keep(
+                    str(int(record.event_type)),
+                    str(record.pin or ""),
+                    str(record.card_no or ""),
+                    _format_datetime(record.time_second),
+                    device.door_denied_since,
+                )
             ]
             if not realtime_events:
                 break
@@ -372,9 +415,14 @@ def collect_c3(device: DeviceConfig) -> CollectionResult:
                         or names_by_card.get(card)
                         or "",
                         timestamp=raw["timestamp"],
-                        raw_state=f"{record.event_type} · {record.in_out_state}" + (
-                            f" · {C3_INTERVAL_TOO_SHORT_NOTE}"
-                            if str(int(record.event_type)) == C3_INTERVAL_TOO_SHORT_EVENT else ""
+                        raw_state=" · ".join(
+                            part
+                            for part in (
+                                str(record.event_type),
+                                str(record.in_out_state),
+                                _c3_note(str(int(record.event_type))),
+                            )
+                            if part
                         ),
                         door=str(record.port_nr),
                         raw_direction_byte=int(record.in_out_state),
@@ -394,6 +442,205 @@ def collect_c3(device: DeviceConfig) -> CollectionResult:
             panel.disconnect()
         except Exception:
             pass
+
+
+# --- C3 door parameters (U4) -------------------------------------------------
+# KTD7: SetDeviceParam is the 0x03 command set_device_datetime already sends
+# (consts.Command.DATETIME), one Key=Value per call, trusted only on GETPARAM
+# read-back. A 0xC9 reply surfaces from the library as
+# ConnectionError("Error <n> received in reply: ..."); anything else is a
+# lost connection. The result JSON is documented in essl_hub.door_params.
+C3_CMD_SETPARAM = 0x03
+_C3_REPLY_ERROR = re.compile(r"^Error (-?\d+) received in reply")
+C3_ERROR_TEXT = {-14: "communication password rejected", -13: "command not available"}
+
+
+@dataclass
+class DoorParamsOutcome:
+    """What one door step did. ``params``/``read_at`` are the latest read
+    (None when the panel was not contacted); ``result`` answers the request
+    (None for a plain history-time read); ``previous`` is the pre-write read,
+    set only when a SETPARAM was attempted (KTD9)."""
+
+    params: dict[str, int] | None = None
+    read_at: datetime | None = None
+    result: dict[str, Any] | None = None
+    previous: dict[str, int] | None = None
+
+
+DoorStep = Callable[..., DoorParamsOutcome]
+
+
+def door_request_expired(requested_at: datetime | None, now: datetime) -> bool:
+    """KTD6: the admin confirmed against values that may since have changed."""
+    return requested_at is not None and now - requested_at > DOOR_REQUEST_TTL
+
+
+def read_c3_door_params(panel: Any) -> dict[str, int]:
+    """LockCount first (it sets how many doors to ask about), then the
+    door keys in GETPARAM batches of at most READ_BATCH."""
+    lock_count = lock_count_of(parse_params(panel.get_device_param(["LockCount"])))
+    if lock_count is None:
+        raise ConnectionError("controller did not report a usable LockCount")
+    keys = read_keys(lock_count)
+    params: dict[str, int] = {}
+    for start in range(0, len(keys), READ_BATCH):
+        params.update(parse_params(panel.get_device_param(keys[start : start + READ_BATCH])))
+    params["LockCount"] = lock_count
+    return params
+
+
+def c3_door_step(
+    device: DeviceConfig,
+    request: dict[str, Any] | None,
+    requested_at: datetime | None,
+    *,
+    now: datetime,
+) -> DoorParamsOutcome:
+    """Read the door parameters and apply ``request`` (KTD6, KTD7, KTD9).
+
+    ``request`` None is a plain read alongside a history read; ``{}`` is
+    "Read from device". Raises ConnectionError when the panel cannot be
+    reached or read before any write, which leaves the request pending (and
+    subject to expiry). Once a SETPARAM was attempted it always returns a
+    result and never re-sends."""
+    if request is None or requested_at is None:
+        request, requested_at = None, None
+    elif door_request_expired(requested_at, now):
+        return DoorParamsOutcome(result=_door_result(
+            "expired", requested_at, now,
+            {
+                str(key): _door_key("not_attempted", None, value, message="expired, not applied")
+                for key, value in request.items()
+            },
+            message="Expired, not applied: requested more than 15 minutes before the collector reached it",
+        ))
+
+    from c3 import C3
+
+    password = password_for(device)
+    panel = C3(device.ip, port=device.port)
+    try:
+        try:
+            if not panel.connect(password):
+                raise ConnectionError("controller rejected the PullSDK connection")
+            current = read_c3_door_params(panel)
+        except Exception as exc:
+            raise ConnectionError(_scrub(_friendly_error(exc), password)) from None
+        if request is None:
+            return DoorParamsOutcome(params=current, read_at=now)
+        try:
+            wanted = validate_request(request, lock_count_of(current))
+        except DoorParamError as exc:
+            return DoorParamsOutcome(
+                params=current, read_at=now,
+                result=_door_result("failed", requested_at, now, {}, message=str(exc)),
+            )
+        if not wanted:
+            return DoorParamsOutcome(
+                params=current, read_at=now, result=_door_result("read", requested_at, now, {}),
+            )
+
+        params = dict(current)
+        keys: dict[str, dict[str, Any]] = {}
+        attempted = lost = False
+        for key, value in wanted.items():
+            old = current.get(key)
+            if lost:
+                keys[key] = _door_key("not_attempted", old, value, message="not sent; connection lost")
+                continue
+            if old == value:
+                keys[key] = _door_key("unchanged", old, value, now=old)
+                continue
+            attempted = True
+            keys[key], lost = _write_door_key(panel, key, value, old)
+            if keys[key]["now"] is not None:
+                params[key] = keys[key]["now"]
+        ok = all(entry["outcome"] in ("applied", "unchanged") for entry in keys.values())
+        return DoorParamsOutcome(
+            params=params,
+            read_at=now,
+            result=_door_result(
+                "applied" if ok else "failed", requested_at, now, keys,
+                message="connection lost; the remaining keys were not sent" if lost else "",
+            ),
+            previous=dict(current) if attempted else None,
+        )
+    finally:
+        try:
+            panel.disconnect()
+        except Exception:
+            pass
+
+
+def _write_door_key(panel: Any, key: str, value: int, old: int | None) -> tuple[dict[str, Any], bool]:
+    """One SETPARAM then its read-back. Returns the key's entry and whether
+    the connection was lost. ``key`` and ``value`` come from validate_request,
+    so the frame text is a whitelisted name and a formatted int (KTD8)."""
+    try:
+        panel._send_receive(C3_CMD_SETPARAM, panel._kv_to_message({key: int(value)}))
+    except Exception as exc:
+        code = _c3_error_code(exc)
+        if code is not None:
+            return _door_key("failed", old, value, message=_c3_error_text(code)), False
+        if _never_sent(exc):
+            return _door_key("not_attempted", old, value, message="not sent; connection lost"), True
+        return _door_key("failed", old, value, message="connection lost; value not confirmed"), True
+    try:
+        back = parse_params(panel.get_device_param([key])).get(key)
+    except Exception as exc:
+        code = _c3_error_code(exc)
+        if code is not None:
+            return _door_key("failed", old, value, message=f"read-back refused: {_c3_error_text(code)}"), False
+        return _door_key("failed", old, value, message="connection lost before read-back; value not confirmed"), True
+    if back is None:
+        return _door_key("failed", old, value, message="panel did not report the value after the write"), False
+    if back != value:
+        return _door_key("failed", old, value, now=back, message=f"panel kept {back}"), False
+    return _door_key("applied", old, value, now=back), False
+
+
+def _door_key(
+    outcome: str, old: int | None, new: Any, *, now: int | None = None, message: str = ""
+) -> dict[str, Any]:
+    return {"outcome": outcome, "old": old, "new": new, "now": now, "message": message}
+
+
+def _door_result(
+    state: str, requested_at: datetime, finished_at: datetime, keys: dict, *, message: str = ""
+) -> dict[str, Any]:
+    return {
+        "state": state,
+        "requested_at": _format_datetime(requested_at),
+        "finished_at": _format_datetime(finished_at),
+        "message": message,
+        "keys": keys,
+    }
+
+
+def _c3_error_code(exc: BaseException) -> int | None:
+    """The panel's error code from a 0xC9 reply, None for anything else."""
+    if not isinstance(exc, ConnectionError):
+        return None
+    match = _C3_REPLY_ERROR.match(str(exc))
+    return int(match.group(1)) if match else None
+
+
+def _c3_error_text(code: int) -> str:
+    return C3_ERROR_TEXT.get(code, f"panel error {code}")
+
+
+def _never_sent(exc: BaseException) -> bool:
+    """The library wraps a failed socket send (BrokenPipeError) as
+    "Unexpected connection end"; then the frame never left this host."""
+    return isinstance(exc, BrokenPipeError) or isinstance(exc.__cause__, BrokenPipeError)
+
+
+def _scrub(message: str, password: str | None) -> str:
+    """Error text is stored and shown; it never carries the comm password."""
+    if password:
+        message = message.replace(password, "***")
+    return message
 
 
 def _normalized_event(
@@ -441,15 +688,19 @@ def _c3_trusted_direction(in_out_state: int, event_type: int | None = None) -> s
     """KTD4: this library's InOutDirection enum only decodes bytes 0 and 3 to
     ENTRY/EXIT. A real exit (protocol byte 1) fails its decode and the record
     keeps only the fallback UNKNOWN_UNSUPPORTED (15); the raw byte is not
-    exposed. On a card (punch) event 15 is therefore an exit: on the
-    Gachibowli panel 21 of 22 such rows sit between two entries. That
-    evidence covers granted events only, so an interval-too-short (20) row
-    with 15 is left for hours.py to alternate, like anything else."""
+    exposed. The Gachibowli history table carries only bytes 0 and 1 (14,195
+    and 13,958 rows, 2026-10-12 replica), so 15 is an exit for the swipe
+    events in C3_REALTIME_15_EXIT_EVENT_TYPES. Door-denied rows (24/25) with
+    15 stay unknown until a history read fills them."""
     if in_out_state == 0:
         return "entry"
     if in_out_state == 3:
         return "exit"
-    if in_out_state == 15 and event_type is not None and _c3_is_granted(str(event_type)):
+    if (
+        in_out_state == 15
+        and event_type is not None
+        and str(event_type).strip() in C3_REALTIME_15_EXIT_EVENT_TYPES
+    ):
         return "exit"
     return None
 

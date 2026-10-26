@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 
 
 @dataclass(frozen=True)
@@ -14,6 +15,18 @@ class DeviceConfig:
     protocol: str
     password_env: str
     password: str | None = None
+    # KTD5: set while "Wait for door close" is unchecked; C3 door-denied
+    # swipes (24/25) at or after it are captured. None = drop them.
+    door_denied_since: datetime | None = None
+    # KTD6: the pending door-parameter request and its guard timestamp, as
+    # read at the start of the cycle. A dict, so kept out of the hash.
+    door_request: dict | None = field(default=None, hash=False)
+    door_requested_at: datetime | None = None
+
+# The two device protocols the collector speaks.
+X990_PROTOCOL = "zk-attendance"
+C3_PROTOCOL = "c3-pullsdk"
+
 
 # Seed-only: inserted into the devices table when missing, never overwritten.
 # The database is authoritative; admins add and retire devices there.
@@ -24,7 +37,7 @@ DEVICES = (
         model="X990",
         ip=os.getenv("ESSL_X990_IP", "192.168.1.201"),
         port=int(os.getenv("ESSL_X990_PORT", "4370")),
-        protocol="zk-attendance",
+        protocol=X990_PROTOCOL,
         password_env="ESSL_X990_PASSWORD",
     ),
     DeviceConfig(
@@ -33,7 +46,7 @@ DEVICES = (
         model="C3-400",
         ip=os.getenv("ESSL_C3_IP", "192.168.1.202"),
         port=int(os.getenv("ESSL_C3_PORT", "4370")),
-        protocol="c3-pullsdk",
+        protocol=C3_PROTOCOL,
         password_env="ESSL_C3_PASSWORD",
     ),
 )

@@ -32,6 +32,11 @@ class RemapTest(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(remap_c3_ids.planned_changes([_row(3, "2", pin="2")])[0][1], "C3-2")
 
+    def test_stored_door_denied_swipes_are_kept(self) -> None:
+        # KTD5: a stored 24/25 row passed the collector's door_denied_since gate.
+        rows = [_row(1, "9", event_type=24), _row(2, "9", event_type=25), _row(3, "9", event_type=27)]
+        self.assertEqual(remap_c3_ids.not_punches(rows), [3])
+
 
 if __name__ == "__main__":
     unittest.main()
