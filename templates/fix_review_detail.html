@@ -1,7 +1,6 @@
 {% extends "base.html" %}
 {% import "_ui.html" as ui %}
 {% block title %}Fix request: {{ person.name }}, {{ day_label }} - eSSL Attendance Hub{% endblock %}
-{% set chip_tone = {'added by HR': 'info', 'direction fixed': 'info', 'ignored': 'neutral'} %}
 {% set line_chip = {'pending': ('Pending', 'info'), 'approved': ('Approved', 'ok'), 'rejected': ('Not approved', 'bad')} %}
 {% set event_labels = {'filed': 'Filed', 'lines_added': 'Added changes', 'closed': 'Closed the day', 'reopened': 'Reopened', 'line_approved': 'Approved a change', 'line_rejected': 'Rejected a change', 'decided': 'Decided the request'} %}
 {% block content %}
@@ -33,7 +32,7 @@
       <div class="report-swipe-head">
         <span class="punch-time num">{{ s.time.strftime('%H:%M:%S') }}{% if s.next_day %}<sup title="Next calendar day">+1</sup>{% endif %}</span>
         <span class="punch-dir">{{ s.direction }}</span>
-        {% for c in s.chips %}{{ ui.chip(c, chip_tone.get(c, 'warn')) }}{% endfor %}
+        {% for label, tone in s.chips %}{{ ui.chip(label, tone) }}{% endfor %}
       </div>
     </li>
     {% endfor %}

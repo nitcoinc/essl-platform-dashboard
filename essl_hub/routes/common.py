@@ -15,7 +15,15 @@ from werkzeug.local import LocalProxy
 from .. import config, roster
 from ..config import TIMEZONE_NAME
 from ..db import Database, device_ids_of
-from ..hours import DEFAULT_DAY_START_HOUR, DayResult, compute_day, counted_punches, work_day, work_day_window
+from ..hours import (
+    DayResult,
+    compute_day,
+    counted_punches,
+    read_day_start_hour,
+    read_target_minutes,
+    work_day,
+    work_day_window,
+)
 
 
 _TZ = ZoneInfo(TIMEZONE_NAME)
@@ -153,16 +161,13 @@ def _home_for(employee: dict) -> str:
 
 
 def _target_minutes(database: Database) -> int:
-    return int(database.setting("daily_target_minutes", "480"))
+    # Like the day-start hour, a missing or corrupt value is the default.
+    return read_target_minutes(database)
 
 
 def _day_start_hour(database: Database) -> int:
     """The work-day start hour (R1); a missing or corrupt value falls back."""
-    try:
-        hour = int(database.setting("day_start_hour", str(DEFAULT_DAY_START_HOUR)))
-    except (TypeError, ValueError):
-        return DEFAULT_DAY_START_HOUR
-    return hour if 0 <= hour <= 23 else DEFAULT_DAY_START_HOUR
+    return read_day_start_hour(database)
 
 
 def _day_start_label(day_start_hour: int) -> str:
@@ -275,17 +280,20 @@ def _day_for_employee(
     *,
     day_start_hour: int | None = None,
     windows: dict[str, int] | None = None,
+    rows: list[dict] | None = None,
 ) -> DayResult:
     """Score one work day. Pass ``now`` to share one instant across a request,
     so every figure on a page is measured from the same second (R17/U11).
     Loop callers pass ``day_start_hour`` and ``windows`` (device -> quick-swipe
-    window, KTD3) so each is read once."""
+    window, KTD3) so each is read once; a caller that already holds the day's
+    punch ``rows`` passes them so they are not read twice."""
     if day_start_hour is None:
         day_start_hour = _day_start_hour(database)
     if windows is None:
         windows = database.device_windows()
-    start, end = work_day_window(day, day_start_hour)
-    rows = database.punches_for_employee_range(device_ids_of(employee), start, end)
+    if rows is None:
+        start, end = work_day_window(day, day_start_hour)
+        rows = database.punches_for_employee_range(device_ids_of(employee), start, end)
     punches = counted_punches(rows, windows)
     now = now or _now_naive()
     is_today = day == work_day(now, day_start_hour)

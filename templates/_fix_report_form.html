@@ -2,7 +2,6 @@
     page. Needs: action_url, swipes, form, errors, allow_close, csrf_token
     (signed-in only), day_start, max_lines, note_max. Works without JS. -#}
 {% import "_ui.html" as ui %}
-{% set chip_tone = {'added by HR': 'info', 'direction fixed': 'info', 'ignored': 'neutral'} %}
 <form method="post" action="{{ action_url }}" class="report-form" novalidate>
   {% if csrf_token %}<input type="hidden" name="csrf" value="{{ csrf_token }}">{% endif %}
   {% if errors.form %}<div class="auth-error" role="alert">{{ ui.icon('circle-alert') }}<span>{{ errors.form }}</span></div>{% endif %}
@@ -16,7 +15,7 @@
         <div class="report-swipe-head">
           <span class="punch-time num">{{ s.time.strftime('%H:%M:%S') }}{% if s.next_day %}<sup title="Next calendar day">+1</sup>{% endif %}</span>
           <span class="punch-dir">{{ s.direction }}</span>
-          {% for c in s.chips %}{{ ui.chip(c, chip_tone.get(c, 'warn')) }}{% endfor %}
+          {% for label, tone in s.chips %}{{ ui.chip(label, tone) }}{% endfor %}
         </div>
         {% if s.actionable %}
         <div class="report-swipe-actions">

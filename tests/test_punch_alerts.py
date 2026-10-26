@@ -81,9 +81,9 @@ class LiveDecisionTest(unittest.TestCase):
         )
 
     def test_alert_hours_may_wrap_midnight(self) -> None:
-        self.assertTrue(punch_alerts._in_hours(_t(23, 0), 22, 2))
-        self.assertTrue(punch_alerts._in_hours(datetime(2026, 10, 28, 1, 0), 22, 2))
-        self.assertFalse(punch_alerts._in_hours(_t(12, 0), 22, 2))
+        self.assertTrue(punch_alerts.in_alert_hours(_t(23, 0), 22, 2))
+        self.assertTrue(punch_alerts.in_alert_hours(datetime(2026, 10, 28, 1, 0), 22, 2))
+        self.assertFalse(punch_alerts.in_alert_hours(_t(12, 0), 22, 2))
 
     def test_no_punch_today(self) -> None:
         now = _t(15, 0)

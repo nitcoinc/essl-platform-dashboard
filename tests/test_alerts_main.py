@@ -384,6 +384,22 @@ class AlertsServiceTest(unittest.TestCase):
         self.tick(at(TODAY + timedelta(days=1), "09:00"))
         self.assertEqual(len(self.alerts(kind="morning")), 1)
 
+    def test_finished_morning_run_is_not_reloaded_every_tick(self) -> None:
+        self.employee("301")
+        self.history("301")
+        self.punches("301", TODAY, CLEAN_DAY[:3])
+        morning = at(TODAY + timedelta(days=1), "09:00")
+        self.tick(morning)
+        self.assertEqual(len(self.alerts(kind="morning")), 1)
+        with mock.patch.object(self.service, "_load_day", wraps=self.service._load_day) as load:
+            for minutes in (1, 15, 29):
+                self.tick(morning + timedelta(minutes=minutes))
+            # Live checks load today; the morning job would load TODAY.
+            self.assertEqual([c for c in load.call_args_list if c.args[1] == TODAY], [])
+            self.tick(morning + timedelta(minutes=30))
+            self.assertEqual(len([c for c in load.call_args_list if c.args[1] == TODAY]), 1)
+        self.assertEqual(len(self.alerts(kind="morning")), 1)
+
     def test_punched_but_few_clean_days_gets_morning_but_no_live(self) -> None:
         employee_id = self.employee("401")
         # 12 punched days: the 8 oldest end on a swipe-in, the 4 newest are clean.
@@ -502,7 +518,7 @@ class AlertsServiceTest(unittest.TestCase):
         self.assertEqual(self.alerts(old_day), [])
         self.assertEqual(self.outbox(), [])
         self.assertEqual(links, 0)
-        self.assertEqual(self.database.setting(alerts_main.BASELINES_AT_KEY), "2026-11-01 02:00:00")
+        self.assertEqual(self.database.setting(alert_settings.BASELINES_AT_KEY), "2026-11-01 02:00:00")
 
     def test_weekly_job_with_nobody_does_not_rerun_every_tick(self) -> None:
         with mock.patch.object(self.service, "run_weekly", wraps=self.service.run_weekly) as run:

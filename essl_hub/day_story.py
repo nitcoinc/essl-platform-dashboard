@@ -118,7 +118,7 @@ def punch_flags(raw_state: str | None) -> tuple[str, ...]:
 
 # KTD4: chips for a swipe an approved fix touched, keyed by the row's
 # ``correction`` (hours.apply_corrections).
-_CORRECTION_FLAGS = {
+CORRECTION_FLAGS = {
     CORRECTION_ADDED: "added by HR",
     CORRECTION_DIRECTION: "direction fixed",
     CORRECTION_IGNORED: "ignored",
@@ -303,7 +303,7 @@ def break_view(result: DayResult, now: datetime | None, raw_rows=(), fix_statuse
     for kind in (CORRECTION_ADDED, CORRECTION_IGNORED):
         count = sum(1 for row in raw_rows if row.get("correction") == kind)
         if count:
-            label += f", {count} punch{'es' if count != 1 else ''} {_CORRECTION_FLAGS[kind]}"
+            label += f", {count} punch{'es' if count != 1 else ''} {CORRECTION_FLAGS[kind]}"
 
     starts = {s.start for s in result.segments}
     ends = {s.end for s in result.segments if s.end is not None}
@@ -320,7 +320,7 @@ def break_view(result: DayResult, now: datetime | None, raw_rows=(), fix_statuse
         correction = row.get("correction")
         if correction == CORRECTION_IGNORED:
             # Never scored, so it pairs with nothing and repeats nothing.
-            flags.append(_CORRECTION_FLAGS[correction])
+            flags.append(CORRECTION_FLAGS[correction])
             flags.extend(punch_flags(row.get("raw_state")))
             punches.append(RawPunch(t, row.get("trusted_direction") or "", tuple(flags)))
             continue
@@ -341,8 +341,8 @@ def break_view(result: DayResult, now: datetime | None, raw_rows=(), fix_statuse
             direction = row.get("trusted_direction") or ""
         if t in inferred and "not counted" not in flags:
             flags.append("inferred")
-        if correction in _CORRECTION_FLAGS:
-            flags.append(_CORRECTION_FLAGS[correction])
+        if correction in CORRECTION_FLAGS:
+            flags.append(CORRECTION_FLAGS[correction])
         flags.extend(punch_flags(row.get("raw_state")))
         punches.append(RawPunch(t, direction, tuple(flags), note))
     return BreakView(

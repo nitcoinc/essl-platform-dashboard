@@ -11,8 +11,9 @@ ticks every minute. Each tick:
   Sunday 02:00 IST once the newest snapshot is over 6 days old, or at once
   when there is none);
 - runs the live "out too long" check every 5 minutes and the morning check
-  for the previous work day, both only in shadow or live mode, inside their
-  hours, and never while the collector's data is stale (KTD9);
+  for the previous work day (every 30 minutes once a run held nobody back),
+  both only in shadow or live mode, inside their hours, and never while the
+  collector's data is stale (KTD9);
 - drains the outbox, always, whatever the mode, hours or staleness: the web
   only enqueues, so fix-request and decision emails go out from here.
 
@@ -33,11 +34,16 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from . import alert_mail, alert_settings, config, export, mail
-from .alert_settings import MODE_LIVE, AlertSettings
+from .alert_settings import BASELINES_AT_KEY, MODE_LIVE, MODE_SHADOW, AlertSettings
 from .baselines import Baseline, compute_baseline, excluded_request_days, lookback_days
 from .db import (
+    ALERT_LIVE,
+    ALERT_MORNING,
     SCHEMA_VERSION,
     SETUP_COMMANDS,
+    STATUS_BREAKER,
+    STATUS_QUEUED,
+    STATUS_RECORDED,
     TIMESTAMP_FORMAT,
     Database,
     DatabaseMissing,
@@ -46,10 +52,11 @@ from .db import (
     device_ids_of,
 )
 from .hours import (
-    DEFAULT_DAY_START_HOUR,
     DayResult,
     compute_day,
     counted_punches,
+    read_day_start_hour,
+    read_target_minutes,
     work_day,
     work_day_window,
 )
@@ -57,6 +64,7 @@ from .punch_alerts import (
     HOLD,
     LiveAlert,
     has_unconfirmed_c3_guess,
+    in_alert_hours,
     is_door_denied,
     live_decision,
     morning_issues,
@@ -81,16 +89,14 @@ BREAKER_MIN_FOR_SHARE = 2
 WEEKLY_WEEKDAY = 6
 WEEKLY_HOUR = 2
 BASELINE_MAX_AGE = timedelta(days=6)
-# Retention, enforced by the weekly job.
-ALERT_RETENTION_DAYS = 90
-MAIL_RETENTION_DAYS = 30
-BASELINE_SNAPSHOTS = 4
+# The morning job re-checks a finished day at most this often, so late data
+# is still picked up without a full reload every tick.
+MORNING_RECHECK = timedelta(minutes=30)
 # Report links live until the end of the work day + 7 days (KTD7).
 REPORT_LINK_DAYS = 7
 OUTBOX_BATCH = 50
 
-# Settings this service writes for itself.
-BASELINES_AT_KEY = "alerts_baselines_at"
+# Settings this service writes for itself (and alert_settings.BASELINES_AT_KEY).
 BREAKER_WARNED_KEY = "alerts_breaker_warned_{kind}"
 
 Clock = Callable[[], datetime]
@@ -138,6 +144,8 @@ class AlertsService:
         self._schema_ready = False
         self._waiting: str | None = None
         self._url_warned: date | None = None
+        # (work day, when) of the last morning run that held nobody back.
+        self._morning_done: tuple[date, datetime] | None = None
 
     # --- The loop body -----------------------------------------------------
 
@@ -212,7 +220,7 @@ class AlertsService:
     def run_weekly(self, now: datetime) -> int | None:
         """One snapshot for every active employee, then the prunes. Returns
         the snapshot id, None when there was nobody to snapshot."""
-        day_start_hour = _day_start_hour(self.database)
+        day_start_hour = read_day_start_hour(self.database)
         today = work_day(now, day_start_hour)
         first, last = lookback_days(today)
         people = self.database.employees()
@@ -220,7 +228,7 @@ class AlertsService:
         if people:
             results = export.day_results(
                 self.database, people, first, last,
-                target_minutes=_target_minutes(self.database), today=today, now=now,
+                target_minutes=read_target_minutes(self.database), today=today, now=now,
                 day_start_hour=day_start_hour,
             )
             requests = self.database.fix_request_days([p["id"] for p in people], first, last)
@@ -250,11 +258,12 @@ class AlertsService:
                 "baseline snapshot %s: %d people, %d with a live limit", snapshot, len(rows), live
             )
         # Recorded before pruning, so a failed prune never re-runs the snapshot.
+        # Retention periods are the db defaults (db.BASELINE_SNAPSHOTS_KEPT etc.).
         self.database.set_setting(BASELINES_AT_KEY, now.strftime(TIMESTAMP_FORMAT))
         for name, prune in (
-            ("baseline snapshots", lambda: self.database.prune_baselines(keep=BASELINE_SNAPSHOTS)),
-            ("alerts", lambda: self.database.prune_alerts(ALERT_RETENTION_DAYS)),
-            ("outbox rows", lambda: self.database.prune_mail(MAIL_RETENTION_DAYS)),
+            ("baseline snapshots", self.database.prune_baselines),
+            ("alerts", self.database.prune_alerts),
+            ("outbox rows", self.database.prune_mail),
             ("report links", self.database.prune_report_links),
         ):
             removed = self._step(f"pruning {name}", prune)
@@ -291,13 +300,13 @@ class AlertsService:
     # --- Live check (R4, R6) -----------------------------------------------
 
     def run_live(self, now: datetime, settings: AlertSettings) -> RunReport:
-        if not _in_hours(now, settings.start_hour, settings.end_hour):
+        if not in_alert_hours(now, settings.start_hour, settings.end_hour):
             return RunReport("outside_alert_hours")
         stale = self.stale_reason(now)
         if stale:
             _logger.info("live check skipped: %s", stale)
             return RunReport("stale")
-        day_start_hour = _day_start_hour(self.database)
+        day_start_hour = read_day_start_hour(self.database)
         today = work_day(now, day_start_hour)
         day_start, _ = work_day_window(today, day_start_hour)
         people = {p["id"]: p for p in self.database.employees()}
@@ -310,7 +319,7 @@ class AlertsService:
         baselines = self.database.latest_baselines()
         requests = self.database.fix_request_days(present, today, today)
         already = {
-            a["employee_id"] for a in self.database.alerts_for_day(today) if a["kind"] == "live"
+            a["employee_id"] for a in self.database.alerts_for_day(today) if a["kind"] == ALERT_LIVE
         }
         candidates = []
         for pid in present:
@@ -334,7 +343,7 @@ class AlertsService:
                 candidates.append(
                     _live_candidate(people[pid], rows, decision, baseline, today)
                 )
-        return self._record("live", today, candidates, len(present), settings, day_start_hour)
+        return self._record(ALERT_LIVE, today, candidates, len(present), settings, day_start_hour)
 
     # --- Morning check (R5, R8) --------------------------------------------
 
@@ -345,9 +354,22 @@ class AlertsService:
         if stale:
             _logger.info("morning check skipped: %s", stale)
             return RunReport("stale")
-        day_start_hour = _day_start_hour(self.database)
+        day_start_hour = read_day_start_hour(self.database)
         today = work_day(now, day_start_hour)
         day = today - timedelta(days=1)
+        if self._morning_done is not None:
+            done_day, done_at = self._morning_done
+            # A clock that stepped back re-checks at once.
+            if done_day == day and timedelta(0) <= now - done_at < MORNING_RECHECK:
+                return RunReport("morning_done")
+        report = self._morning(now, settings, day, today, day_start_hour)
+        if not report.held:
+            self._morning_done = (day, now)
+        return report
+
+    def _morning(
+        self, now: datetime, settings: AlertSettings, day: date, today: date, day_start_hour: int
+    ) -> RunReport:
         people = {p["id"]: p for p in self.database.employees()}
         grouped, results = self._load_day(
             people, day, day_start_hour=day_start_hour, now=None, is_today=False
@@ -358,7 +380,7 @@ class AlertsService:
         baselines = self.database.latest_baselines()
         requests = self.database.fix_request_days(present, day, day)
         already = {
-            a["employee_id"] for a in self.database.alerts_for_day(day) if a["kind"] == "morning"
+            a["employee_id"] for a in self.database.alerts_for_day(day) if a["kind"] == ALERT_MORNING
         }
         eligible = []
         for pid in present:
@@ -390,7 +412,7 @@ class AlertsService:
                 continue
             if issues:
                 candidates.append(_morning_candidate(people[pid], grouped[pid], issues, day, today))
-        recorded = self._record("morning", day, candidates, len(present), settings, day_start_hour)
+        recorded = self._record(ALERT_MORNING, day, candidates, len(present), settings, day_start_hour)
         recorded.held = report.held
         return recorded
 
@@ -409,19 +431,19 @@ class AlertsService:
         if not candidates:
             return report
         url = self._live_url(settings, day)
-        mode = MODE_LIVE if url else "shadow"
+        mode = MODE_LIVE if url else MODE_SHADOW
         if breaker_tripped(len(candidates), present):
             for candidate in candidates:
                 if self.database.record_alert(
                     employee_id=candidate.employee["id"], work_day=day, kind=kind, mode=mode,
-                    status="breaker", site=candidate.site, detail=candidate.detail,
+                    status=STATUS_BREAKER, site=candidate.site, detail=candidate.detail,
                 ):
                     report.breaker.append(candidate.employee["id"])
             self._warn_breaker(kind, day, len(candidates), present)
             return report
         for candidate in candidates:
             try:
-                if self._record_one(kind, day, candidate, url, day_start_hour):
+                if self._record_one(kind, day, candidate, url, mode, day_start_hour):
                     report.recorded.append(candidate.employee["id"])
             except Exception:  # noqa: BLE001 - one person's alert never stops the rest
                 _logger.exception("recording %s alert for employee %s failed",
@@ -429,8 +451,10 @@ class AlertsService:
         return report
 
     def _record_one(
-        self, kind: str, day: date, candidate: Candidate, url: str | None, day_start_hour: int
+        self, kind: str, day: date, candidate: Candidate, url: str | None, mode: str,
+        day_start_hour: int,
     ) -> bool:
+        """``mode`` is live exactly when ``url`` is set (``_record``)."""
         employee = candidate.employee
         email = (employee.get("email") or "").strip()
         if url is None or not email:
@@ -439,7 +463,7 @@ class AlertsService:
                                 kind, employee["id"])
             recorded = self.database.record_alert(
                 employee_id=employee["id"], work_day=day, kind=kind,
-                mode=MODE_LIVE if url else "shadow", status="recorded",
+                mode=mode, status=STATUS_RECORDED,
                 site=candidate.site, detail=candidate.detail,
             )
             if recorded and url is None:
@@ -450,7 +474,7 @@ class AlertsService:
         token = self.database.create_report_link(employee["id"], day, expires_at=expires_at)
         rendered = candidate.render(f"{url}/fix/{token}", f"{url}/privacy")
         recorded = self.database.record_alert(
-            employee_id=employee["id"], work_day=day, kind=kind, mode=MODE_LIVE, status="queued",
+            employee_id=employee["id"], work_day=day, kind=kind, mode=mode, status=STATUS_QUEUED,
             site=candidate.site, detail=candidate.detail,
             mail={
                 "recipients": [email],
@@ -501,7 +525,7 @@ class AlertsService:
         for row in self.database.due_mail(limit=OUTBOX_BATCH):
             try:
                 send(
-                    row["subject"], _recipients(row["recipients"]), row["text_body"] or "",
+                    row["subject"], list(row["recipients"]), row["text_body"] or "",
                     row["html_body"], reply_to=reply_to,
                 )
             except Exception as exc:  # noqa: BLE001 - provider errors of every kind
@@ -544,7 +568,7 @@ class AlertsService:
             if pid is not None:
                 grouped[pid].append(row)
         windows = self.database.device_windows()
-        target = _target_minutes(self.database)
+        target = read_target_minutes(self.database)
         results = {}
         for pid, rows in grouped.items():
             rows.sort(key=lambda r: r["event_timestamp"])
@@ -646,19 +670,6 @@ def _baseline(stored: dict | None) -> Baseline | None:
     return Baseline.from_stored(stored["punched_days"], stored["clean_days"], stored.get("metrics"))
 
 
-def _in_hours(now: datetime, start_hour: int, end_hour: int) -> bool:
-    return start_hour <= now.hour < end_hour
-
-
-def _recipients(value: object) -> list[str]:
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except ValueError:
-            return [value]
-    return [str(v) for v in value or []]
-
-
 def _fmt(value: object) -> str | None:
     if isinstance(value, datetime):
         return value.strftime(TIMESTAMP_FORMAT)
@@ -682,22 +693,6 @@ def _parse_dt(value: object) -> datetime | None:
 def _latest(*values: datetime | None) -> datetime | None:
     present = [v for v in values if v is not None]
     return max(present) if present else None
-
-
-def _day_start_hour(database: Database) -> int:
-    """Same fallback as the web: a missing or corrupt value is the default."""
-    try:
-        hour = int(database.setting("day_start_hour", str(DEFAULT_DAY_START_HOUR)))
-    except (TypeError, ValueError):
-        return DEFAULT_DAY_START_HOUR
-    return hour if 0 <= hour <= 23 else DEFAULT_DAY_START_HOUR
-
-
-def _target_minutes(database: Database) -> int:
-    try:
-        return int(database.setting("daily_target_minutes", "480"))
-    except (TypeError, ValueError):
-        return 480
 
 
 # --- Entry point -------------------------------------------------------------

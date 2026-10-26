@@ -11,6 +11,7 @@ DirectionSource = Literal["raw_byte", "alternation", "mixed", "none"]
 # A work day runs from this hour to the same hour next day (R1). Night shifts
 # cross calendar midnight, so a midnight cut splits one shift over two days.
 DEFAULT_DAY_START_HOUR = 6
+DEFAULT_TARGET_MINUTES = 480
 
 # KTD9: a direction-less swipe within the quick-swipe window of the previous
 # kept swipe, or a same-direction re-swipe, is a duplicate: stored, shown
@@ -218,6 +219,23 @@ def work_day_window(day: date, day_start_hour: int) -> tuple[datetime, datetime]
     """The half-open [start, end) window of work day ``day``."""
     start = datetime.combine(day, time(hour=day_start_hour))
     return start, start + timedelta(days=1)
+
+
+def read_day_start_hour(database) -> int:
+    """The stored work-day start hour (R1); a missing or corrupt value falls back."""
+    try:
+        hour = int(database.setting("day_start_hour", str(DEFAULT_DAY_START_HOUR)))
+    except (TypeError, ValueError):
+        return DEFAULT_DAY_START_HOUR
+    return hour if 0 <= hour <= 23 else DEFAULT_DAY_START_HOUR
+
+
+def read_target_minutes(database) -> int:
+    """The stored daily target; a missing or corrupt value is the default."""
+    try:
+        return int(database.setting("daily_target_minutes", str(DEFAULT_TARGET_MINUTES)))
+    except (TypeError, ValueError):
+        return DEFAULT_TARGET_MINUTES
 
 
 # KTD4: what an approved fix did to a punch row (its ``correction`` key).

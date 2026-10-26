@@ -10,8 +10,14 @@ from datetime import datetime, timedelta
 from flask import Blueprint, Response, abort, g, redirect, render_template, request, url_for
 
 from .. import access, alert_settings, config, hashing
-from ..alerts_main import BASELINES_AT_KEY
-from ..db import DUPLICATE_WINDOW_MAX
+from ..db import (
+    ALERT_LIVE,
+    ALERT_MORNING,
+    DUPLICATE_WINDOW_MAX,
+    STATUS_BREAKER,
+    STATUS_FAILED,
+    STATUS_QUEUED,
+)
 from ..door_params import (
     DOOR_REQUEST_TTL,
     PANEL_WIDE,
@@ -28,6 +34,7 @@ from .common import (
     _day_start_hour,
     _login_required,
     _now_naive,
+    _parse_ts,
     _require_csrf,
     _role_required,
     _target_minutes,
@@ -353,17 +360,17 @@ ALERT_MODE_LABELS = {
 # Would-have-sent counts cover this many work days, today included (KTD11).
 ALERT_COUNT_DAYS = 7
 # How an alert row reads in the counts table, in display order.
-ALERT_BUCKETS = ("would send", "sent", "queued", "failed", "held")
+ALERT_BUCKETS = ("would send", "sent", STATUS_QUEUED, STATUS_FAILED, "held")
 
 
 def _alert_bucket(mode: str, status: str) -> str:
     """"held" is a candidate the circuit breaker stopped (KTD9); shadow rows
     are what live mode would have sent; live rows follow their outbox row."""
-    if status == "breaker":
+    if status == STATUS_BREAKER:
         return "held"
     if mode == alert_settings.MODE_SHADOW:
         return "would send"
-    return status if status in ("queued", "failed") else "sent"
+    return status if status in (STATUS_QUEUED, STATUS_FAILED) else "sent"
 
 
 def _alert_count_rows(since) -> list[dict]:
@@ -379,30 +386,17 @@ def _alert_count_rows(since) -> list[dict]:
             "site": site,
             **{
                 kind: [(kinds.get(kind, {})[b], b) for b in ALERT_BUCKETS if kinds.get(kind, {}).get(b)]
-                for kind in ("live", "morning")
+                for kind in (ALERT_LIVE, ALERT_MORNING)
             },
         }
         for site, kinds in sorted(sites.items())
     ]
 
 
-def _baselines_rebuilt_at(baselines: dict) -> datetime | None:
-    """The newest snapshot's time; the service's own run marker when the
-    snapshot was empty (nobody to baseline yet)."""
-    stamps = [_as_datetime(row.get("computed_at")) for row in baselines.values()]
-    stamps = [s for s in stamps if s is not None]
-    if stamps:
-        return max(stamps)
-    return _as_datetime(database.setting(BASELINES_AT_KEY))
-
-
-def _as_datetime(value: object) -> datetime | None:
-    if isinstance(value, datetime):
-        return value
-    try:
-        return datetime.fromisoformat(str(value).strip()) if value else None
-    except ValueError:
-        return None
+def _baselines_rebuilt_at() -> datetime | None:
+    """The newest snapshot's time; the service's own run marker when there is
+    no snapshot (nobody to baseline yet)."""
+    return database.latest_baseline_at() or _parse_ts(database.setting(alert_settings.BASELINES_AT_KEY))
 
 
 def _alerts_panel() -> dict:
@@ -410,7 +404,7 @@ def _alerts_panel() -> dict:
     people = database.employees()
     active_ids = {person["id"] for person in people}
     baselines = database.latest_baselines()
-    rebuilt_at = _baselines_rebuilt_at(baselines)
+    rebuilt_at = _baselines_rebuilt_at()
     return {
         "settings": alert_settings.read(database),
         "counts": _alert_count_rows(since),

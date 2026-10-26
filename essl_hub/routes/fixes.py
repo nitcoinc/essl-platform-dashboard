@@ -19,8 +19,18 @@ from datetime import date, datetime, time, timedelta
 from flask import Blueprint, Response, abort, current_app, g, make_response, redirect, render_template, request, url_for
 
 from .. import access, alert_mail, config
-from ..day_story import punch_flags
-from ..db import FIX_MAX_LINES, FIX_NOTE_MAX_CHARS, FixLineLimit, RuleViolation, device_ids_of
+from ..day_story import CORRECTION_FLAGS, punch_flags
+from ..db import (
+    FIX_ADD_KINDS,
+    FIX_CLOSED_STATUSES,
+    FIX_DECIDED_STATUSES,
+    FIX_MAX_LINES,
+    FIX_NOTE_MAX_CHARS,
+    OPPOSITE_DIRECTION,
+    FixLineLimit,
+    RuleViolation,
+    device_ids_of,
+)
 from ..hashing import sha256_hex
 from ..hours import (
     CORRECTION_ADDED,
@@ -42,6 +52,7 @@ from .common import (
     _require_csrf,
     _role_required,
     _target_minutes,
+    _today,
     database,
 )
 from .people import _FLASH_COOKIE, _redirect_with_flash, _take_flash
@@ -59,13 +70,13 @@ IP_POSTS_PER_MINUTE = 10
 LINK_POSTS_PER_HOUR = 20
 
 CLOSING_ACTIONS = {"correct": "closed_correct", "left": "closed_left"}
-DECIDED = ("approved", "partial", "rejected")
-CLOSED = ("closed_correct", "closed_left")
 
-_CORRECTION_CHIPS = {
-    CORRECTION_ADDED: "added by HR",
-    CORRECTION_DIRECTION: "direction fixed",
-    CORRECTION_IGNORED: "ignored",
+# Chip tones for a swipe's correction (day_story.CORRECTION_FLAGS labels);
+# every other chip on a swipe is a device flag and reads as a warning.
+_CORRECTION_TONES = {
+    CORRECTION_ADDED: "info",
+    CORRECTION_DIRECTION: "info",
+    CORRECTION_IGNORED: "neutral",
 }
 _DIRECTION_LABELS = {"entry": "In", "exit": "Out"}
 _EMAIL_KINDS = {
@@ -137,10 +148,11 @@ _limits_lock = threading.Lock()
 
 def _limits() -> tuple[_SlidingWindow, _SlidingWindow]:
     with _limits_lock:
-        return current_app.extensions.setdefault(
-            "essl_fix_report_limits",
-            (_SlidingWindow(IP_POSTS_PER_MINUTE, 60), _SlidingWindow(LINK_POSTS_PER_HOUR, 3600)),
-        )
+        limits = current_app.extensions.get("essl_fix_report_limits")
+        if limits is None:
+            limits = (_SlidingWindow(IP_POSTS_PER_MINUTE, 60), _SlidingWindow(LINK_POSTS_PER_HOUR, 3600))
+            current_app.extensions["essl_fix_report_limits"] = limits
+        return limits
 
 
 def _too_many() -> Response:
@@ -176,11 +188,14 @@ def _actionable(row: dict) -> bool:
 
 
 def _swipes(rows: list[dict], day: date) -> list[dict]:
+    """Each swipe for the list, its chips as (label, tone) pairs."""
     swipes = []
     for row in rows:
         correction = row.get("correction")
-        chips = [_CORRECTION_CHIPS[correction]] if correction in _CORRECTION_CHIPS else []
-        chips.extend(punch_flags(row.get("raw_state")))
+        chips = []
+        if correction in CORRECTION_FLAGS:
+            chips.append((CORRECTION_FLAGS[correction], _CORRECTION_TONES[correction]))
+        chips.extend((flag, "warn") for flag in punch_flags(row.get("raw_state")))
         at = row["event_timestamp"]
         swipes.append({
             "fingerprint": row.get("fingerprint"),
@@ -193,7 +208,8 @@ def _swipes(rows: list[dict], day: date) -> list[dict]:
     return swipes
 
 
-def _reportable(day: date, today: date) -> bool:
+def reportable(day: date, today: date) -> bool:
+    """True while ``day`` is one of the last REPORT_DAYS work days."""
     return 0 <= (today - day).days < REPORT_DAYS
 
 
@@ -203,7 +219,7 @@ def _line_view(line: dict, times: dict) -> dict:
     stored = line.get("hr_direction") or line.get("direction")
     direction = {"entry": "in", "exit": "out"}.get(stored)
     kind = line["kind"]
-    if kind in ("add_in", "add_out") and stored in ("entry", "exit"):
+    if kind in FIX_ADD_KINDS and stored in ("entry", "exit"):
         # HR may turn a missed IN into a missed OUT before approving.
         kind = "add_in" if stored == "entry" else "add_out"
     status = line.get("status") or "pending"
@@ -257,25 +273,34 @@ def _missed_at(value: str, day: date, day_start_hour: int) -> datetime | None:
     return at
 
 
+def _check_missed_time(raw: str, day: date, day_start_hour: int,
+                       now: datetime) -> tuple[datetime | None, str | None]:
+    """A typed missed-swipe time on work day ``day``: (time, None) when it is
+    usable, else (None, the message to show)."""
+    if not raw:
+        return None, "Enter the time of the missed swipe, like 13:40."
+    at = _missed_at(raw, day, day_start_hour)
+    if at is None:
+        return None, "Enter a time like 13:40."
+    start, end = work_day_window(day, day_start_hour)
+    if not start <= at < end:
+        return None, f"Enter a time inside this work day ({start:%H:%M} to {end:%H:%M} next day)."
+    if at > now:
+        return None, "That time hasn't happened yet. Enter a time that has passed."
+    return at, None
+
+
 def _validate(form: dict, action: str, rows: list[dict], day: date, day_start_hour: int,
               now: datetime) -> tuple[list[dict], dict]:
     """The fix lines a submission asks for, and any form errors."""
     errors: dict[str, str] = {}
-    start, end = work_day_window(day, day_start_hour)
     lines: list[dict] = []
     for row in form["adds"]:
         if not row["time"] and not row["dir"]:
             continue
+        at, row["error"] = _check_missed_time(row["time"], day, day_start_hour, now)
         if not row["time"]:
-            row["error"] = "Enter the time of the missed swipe, like 13:40."
-            continue
-        at = _missed_at(row["time"], day, day_start_hour)
-        if at is None:
-            row["error"] = "Enter a time like 13:40."
-        elif not start <= at < end:
-            row["error"] = f"Enter a time inside this work day ({start:%H:%M} to {end:%H:%M} next day)."
-        elif at > now:
-            row["error"] = "That time hasn't happened yet. Enter a time that has passed."
+            continue  # the direction is checked once there is a time
         if row["dir"] not in ("in", "out"):
             row["dir_error"] = "Choose In or Out."
         if row["error"] or row["dir_error"]:
@@ -294,7 +319,7 @@ def _validate(form: dict, action: str, rows: list[dict], day: date, day_start_ho
         for fp in sorted(picked, key=lambda f: by_fingerprint[f]["event_timestamp"]):
             row = by_fingerprint[fp]
             if fp in form["flips"]:
-                direction = {"entry": "exit", "exit": "entry"}.get(row.get("trusted_direction"))
+                direction = OPPOSITE_DIRECTION.get(row.get("trusted_direction"))
                 lines.append({"kind": "flip", "target_fingerprint": fp,
                               "event_time": row["event_timestamp"], "direction": direction})
             else:
@@ -325,11 +350,7 @@ def _validate(form: dict, action: str, rows: list[dict], day: date, day_start_ho
 
 
 def _review_url(request_id: int) -> str | None:
-    try:
-        base = config.public_url()
-    except RuntimeError as exc:
-        _logger.warning("Fix request %s: %s; HR email sent without a review link", request_id, exc)
-        return None
+    base = config.public_url_or_none(f"Fix request {request_id}: HR email sent without a review link")
     return f"{base}/fixes/review/{request_id}" if base else None
 
 
@@ -340,9 +361,7 @@ def _notify_new_request(employee: dict, day: date, request_id: int, note: str, r
     times = {row.get("fingerprint"): row["event_timestamp"] for row in rows}
     lines = [_line_view(line, times)["fix"] for line in (filed or {}).get("lines", [])]
     requester = employee["id"]
-    approvers = [p for p in database.active_hr_users() if p["id"] != requester]
-    if not approvers:
-        approvers = [p for p in database.active_admins() if p["id"] != requester]
+    approvers = access.fix_approvers(requester, database)
     manager = None
     if employee.get("manager_id") and employee["manager_id"] != requester:
         manager = database.employee_by_id(employee["manager_id"])
@@ -377,7 +396,7 @@ def _render(employee: dict, day: date, *, token: str | None = None, form: dict |
     state = None
     if filed is not None:
         state = ("pending" if filed["status"] == "pending"
-                 else "closed" if filed["status"] in CLOSED else "decided")
+                 else "closed" if filed["status"] in FIX_CLOSED_STATUSES else "decided")
     if token is not None:
         page_url = url_for("fixes.link_view", token=token)
         action_url = url_for("fixes.link_submit", token=token)
@@ -447,10 +466,6 @@ def _submit(employee: dict, day: date, *, source: str, token: str | None, done_u
     return redirect(done_url)
 
 
-def _today() -> date:
-    return work_day(common._now_naive(), _day_start_hour(database))
-
-
 # --- Report link (no session) ------------------------------------------------
 
 
@@ -469,9 +484,7 @@ def _link_target(token: str) -> tuple[dict, date] | None:
         return None
     employee = database.employee_by_id(link["employee_id"])
     day = link["work_day"]
-    if isinstance(day, str):
-        day = date.fromisoformat(day)
-    if employee is None or not _reportable(day, _today()):
+    if employee is None or not reportable(day, _today()):
         return None
     return employee, day
 
@@ -513,7 +526,7 @@ def _own_day(raw: str) -> date:
     if other not in (None, "") and other != str(g.employee["id"]):
         abort(403)
     day = _parse_date(raw)
-    if day is None or not _reportable(day, _today()):
+    if day is None or not reportable(day, _today()):
         abort(404)
     return day
 
@@ -544,12 +557,7 @@ def report_submit(day: str) -> Response:
 _REVIEW_ROLES = access.FIX_REVIEW_ROLES
 _TO_DIRECTION = {"in": "entry", "out": "exit"}
 _FROM_DIRECTION = {"entry": "in", "exit": "out"}
-_ADD_KINDS = ("add_in", "add_out")
 _TARGET_KINDS = ("flip", "ignore")
-
-
-def _as_date(value) -> date:
-    return date.fromisoformat(value) if isinstance(value, str) else value
 
 
 def _review_request(request_id: int) -> tuple[dict, dict, date]:
@@ -561,7 +569,7 @@ def _review_request(request_id: int) -> tuple[dict, dict, date]:
     person = database.employee_by_id(filed["employee_id"], include_archived=True)
     if person is None:
         abort(404)
-    return filed, person, _as_date(filed["work_day"])
+    return filed, person, filed["work_day"]
 
 
 def _readonly_reason(filed: dict) -> str | None:
@@ -582,7 +590,7 @@ def _default_direction(line: dict, rows_by_fp: dict) -> str | None:
     if line["kind"] == "flip":
         row = rows_by_fp.get(line.get("target_fingerprint"))
         current = row.get("trusted_direction") if row else None
-        return {"entry": "out", "exit": "in"}.get(current)
+        return _FROM_DIRECTION.get(OPPOSITE_DIRECTION.get(current))
     return None
 
 
@@ -599,7 +607,7 @@ def _review_lines(filed: dict, rows: list[dict], values: dict | None = None,
         asked_dir = _default_direction(line, rows_by_fp)
         defaults = {
             "decision": "approved",
-            "time": line["event_time"].strftime("%H:%M") if kind in _ADD_KINDS and line.get("event_time") else "",
+            "time": line["event_time"].strftime("%H:%M") if kind in FIX_ADD_KINDS and line.get("event_time") else "",
             "dir": asked_dir or "",
         }
         hr_edits = []
@@ -617,7 +625,7 @@ def _review_lines(filed: dict, rows: list[dict], values: dict | None = None,
             "decided_by_name": line.get("decided_by_name"),
             "asked_at": asked_at,
             "asked_dir": asked_dir,
-            "edit_time": kind in _ADD_KINDS,
+            "edit_time": kind in FIX_ADD_KINDS,
             "edit_dir": kind != "ignore",
             "target_missing": kind in _TARGET_KINDS and line.get("target_fingerprint") not in device_fps,
             "hr_edits": hr_edits,
@@ -664,7 +672,6 @@ def _read_review(filed: dict, day: date, form) -> tuple[list[dict], dict, dict, 
     the raw values per line, errors, note). Edits are passed only when they
     differ from what the employee asked, so the audit shows real changes."""
     day_start_hour = _day_start_hour(database)
-    start, end = work_day_window(day, day_start_hour)
     now = common._now_naive()
     decisions: list[dict] = []
     values: dict[int, dict] = {}
@@ -687,25 +694,19 @@ def _read_review(filed: dict, day: date, form) -> tuple[list[dict], dict, dict, 
         entry = {"line_id": line["id"], "status": decision}
         if decision not in ("approved", "rejected"):
             problems["decision"] = "Choose Approve or Reject."
-        elif decision == "approved":
-            if line["kind"] in _ADD_KINDS:
-                at = _missed_at(raw["time"], day, day_start_hour) if raw["time"] else None
-                if not raw["time"]:
-                    problems["time"] = "Enter the time of the missed swipe, like 13:40."
-                elif at is None:
-                    problems["time"] = "Enter a time like 13:40."
-                elif not start <= at < end:
-                    problems["time"] = f"Enter a time inside this work day ({start:%H:%M} to {end:%H:%M} next day)."
-                elif at > now:
-                    problems["time"] = "That time hasn't happened yet. Enter a time that has passed."
-                elif at != line.get("event_time"):
-                    entry["event_time"] = at
-            if line["kind"] != "ignore":
-                direction = _TO_DIRECTION.get(raw["dir"])
-                if direction is None:
-                    problems["dir"] = "Choose In or Out."
-                elif direction != line.get("direction"):
-                    entry["direction"] = direction
+        approved = decision == "approved"
+        if approved and line["kind"] in FIX_ADD_KINDS:
+            at, problem = _check_missed_time(raw["time"], day, day_start_hour, now)
+            if problem:
+                problems["time"] = problem
+            elif at != line.get("event_time"):
+                entry["event_time"] = at
+        if approved and line["kind"] != "ignore":
+            direction = _TO_DIRECTION.get(raw["dir"])
+            if direction is None:
+                problems["dir"] = "Choose In or Out."
+            elif direction != line.get("direction"):
+                entry["direction"] = direction
         if problems:
             line_errors[line["id"]] = problems
         decisions.append(entry)
@@ -753,7 +754,7 @@ def _proposed_rows(rows: list[dict], filed: dict, person: dict, decisions: list[
         line = lines[decision["line_id"]]
         if decision["status"] != "approved" or line.get("status") != "pending":
             continue
-        if line["kind"] in _ADD_KINDS:
+        if line["kind"] in FIX_ADD_KINDS:
             # A unique id per proposed add, so their "correction:<id>" rows
             # never collide with each other or with stored ones.
             proposed.append({
@@ -806,7 +807,6 @@ def _summary(filed: dict, decisions: list[dict], rows: list[dict]) -> list[dict]
 def review_list() -> Response:
     rows = database.fix_requests_for_review()
     for row in rows:
-        row["work_day"] = _as_date(row["work_day"])
         row["day_label"] = alert_mail.fmt_day(row["work_day"])
         row["own"] = row["employee_id"] == g.employee["id"]
     response = make_response(render_template(
@@ -875,11 +875,7 @@ def _notify_decision(filed: dict, person: dict, day: date, outcome: str, note: s
     times = {row.get("fingerprint"): row["event_timestamp"] for row in rows}
     lines = [_line_view(line, times)["fix"] for line in decided["lines"]]
     day_url = None
-    try:
-        base = config.public_url()
-    except RuntimeError as exc:
-        _logger.warning("Fix request %s: %s; decision email sent without a link", filed["id"], exc)
-        base = None
+    base = config.public_url_or_none(f"Fix request {filed['id']}: decision email sent without a link")
     if base:
         day_url = base + url_for("me.day_view", date=day.isoformat())
     email = alert_mail.decision(employee_name=employee["name"], work_day=day, outcome=outcome,
@@ -924,7 +920,7 @@ def review_confirm(request_id: int) -> Response:
     except ValueError as exc:
         errors = {"form": common._sentence(str(exc))}
         return _render_review(filed, person, day, values=values, errors=errors, note=note, status=400)
-    if result["decided"] and result["status"] in DECIDED:
+    if result["decided"] and result["status"] in FIX_DECIDED_STATUSES:
         _notify_decision(filed, person, day, result["status"], note)
     return _redirect_with_flash("fixes.review_list", **_saved_message(decisions, result))
 

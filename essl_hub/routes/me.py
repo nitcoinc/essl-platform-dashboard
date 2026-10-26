@@ -24,7 +24,7 @@ from .common import (
     _vary_htmx,
     database,
 )
-from .fixes import REPORT_DAYS
+from .fixes import reportable
 
 bp = Blueprint("me", __name__)
 
@@ -53,9 +53,10 @@ def _day_context(subject: dict, day, today, request_now, target_minutes: int, da
     """The context _day_live.html needs for one subject and day; shared by
     /day and the quick-view drawer so both render the same Today."""
     windows = database.device_windows()
+    rows = database.punches_for_employee_range(device_ids_of(subject), *work_day_window(day, day_start_hour))
     result = _day_for_employee(
         database, subject, day, target_minutes, now=request_now, day_start_hour=day_start_hour,
-        windows=windows,
+        windows=windows, rows=rows,
     )
     is_today = day == today
     now = request_now if is_today else None
@@ -92,8 +93,7 @@ def _day_context(subject: dict, day, today, request_now, target_minutes: int, da
         live_state=day_story.live_state(result, target_minutes),
         left_text=day_story.left_text(result.effective_seconds, target_minutes * 60),
         breaks=day_story.break_view(
-            result, now,
-            database.punches_for_employee_range(device_ids_of(subject), *work_day_window(day, day_start_hour)),
+            result, now, rows,
             database.fix_request_days([subject["id"]], day, day).get((subject["id"], day), ()),
         ),
         ring_percent=day_story.ring_percent(result, target_minutes),
@@ -254,7 +254,7 @@ def day_view():
         next_date=day + timedelta(days=1),
         strip=strip,
         # U7: only on your own day, and only while it can still be reported.
-        can_report=subject["id"] == g.employee["id"] and 0 <= (today - day).days < REPORT_DAYS,
+        can_report=subject["id"] == g.employee["id"] and reportable(day, today),
     )
     template = "_day_live.html" if partial else "day.html"
     return _vary_htmx(make_response(render_template(template, **context)))

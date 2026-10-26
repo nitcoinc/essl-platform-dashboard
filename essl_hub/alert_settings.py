@@ -16,6 +16,9 @@ MODE_KEY = "alerts_mode"
 START_HOUR_KEY = "alerts_start_hour"
 END_HOUR_KEY = "alerts_end_hour"
 MORNING_HOUR_KEY = "alerts_morning_hour"
+# Written by the alerts service after each weekly baseline run, so the settings
+# page can show a rebuild time even when the snapshot was empty.
+BASELINES_AT_KEY = "alerts_baselines_at"
 
 MODE_OFF = "off"
 MODE_SHADOW = "shadow"

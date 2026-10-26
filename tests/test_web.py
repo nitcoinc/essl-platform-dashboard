@@ -586,11 +586,20 @@ class FakeDatabase:
     def active_hr_users(self) -> list[dict]:
         return self._with_role("hr")
 
+    def has_active_hr_other_than(self, employee_id) -> bool:
+        return any(p["id"] != employee_id for p in self._with_role("hr"))
+
     def active_admins(self) -> list[dict]:
         return self._with_role("admin")
 
     def latest_baselines(self) -> dict[int, dict]:
         return dict(self.baselines)
+
+    def latest_baseline_at(self):
+        """Database.latest_baseline_at: the newest snapshot's computed_at
+        (``baselines`` holds only the newest snapshot)."""
+        stamps = [row["computed_at"] for row in self.baselines.values() if row.get("computed_at")]
+        return max(stamps) if stamps else None
 
     def alert_counts(self, since) -> list[dict]:
         counts: dict[tuple, int] = {}

@@ -67,7 +67,7 @@ def live_decision(
     unpaired swipes; collapsed duplicates never count) is an exit, and the day
     has at least one swipe-in. The out-stretch runs from that exit. A C3
     realtime exit (byte 15) already reaches compute_day as a trusted exit."""
-    if not _in_hours(now, alert_start_hour, alert_end_hour):
+    if not in_alert_hours(now, alert_start_hour, alert_end_hour):
         return "outside_alert_hours"
     if day.status == "empty":
         return "no_punch_today"
@@ -165,7 +165,7 @@ def _out_since(day: DayResult) -> datetime | None:
     return timestamp if direction == "exit" else None
 
 
-def _in_hours(now: datetime, start_hour: int, end_hour: int) -> bool:
+def in_alert_hours(now: datetime, start_hour: int, end_hour: int) -> bool:
     """[start, end) on the wall clock; a window that wraps midnight works."""
     start, end, current = time(start_hour), time(end_hour), now.time()
     if start <= end:

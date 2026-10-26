@@ -16,6 +16,7 @@ import libsql
 from .config import C3_PROTOCOL, DeviceConfig, TIMEZONE_NAME, db_path
 from .hashing import sha256_hex
 from .hours import apply_corrections
+from .mail import dedupe_recipients
 
 _TZ = ZoneInfo(TIMEZONE_NAME)
 _logger = logging.getLogger(__name__)
@@ -680,21 +681,31 @@ DEVICE_CHANGE_KINDS = frozenset(
 )
 
 # Missed-punch alerts and fix requests (v8).
-ALERT_KINDS = frozenset({"live", "morning"})
+ALERT_LIVE = "live"
+ALERT_MORNING = "morning"
+ALERT_KINDS = frozenset({ALERT_LIVE, ALERT_MORNING})
 ALERT_MODES = frozenset({"shadow", "live"})
 # Not a CHECK: the alerts service may grow statuses without a table rebuild.
 # "recorded" is a shadow-mode row, "breaker" a candidate held by the circuit
 # breaker (KTD9); "queued" / "sent" / "failed" follow its outbox row.
-ALERT_STATUSES = frozenset({"recorded", "queued", "breaker", "sent", "failed"})
+STATUS_RECORDED = "recorded"
+STATUS_QUEUED = "queued"
+STATUS_BREAKER = "breaker"
+STATUS_SENT = "sent"
+STATUS_FAILED = "failed"
+ALERT_STATUSES = frozenset({STATUS_RECORDED, STATUS_QUEUED, STATUS_BREAKER, STATUS_SENT, STATUS_FAILED})
 # Up to 3 attempts per email; retries wait base x 2^(attempts - 1) (KTD8).
 MAIL_MAX_ATTEMPTS = 3
 MAIL_RETRY_BASE = timedelta(minutes=5)
-# Baseline snapshots kept by prune_baselines.
+# Retention, enforced by the alerts service's weekly job.
 BASELINE_SNAPSHOTS_KEPT = 4
+ALERT_RETENTION_DAYS = 90
+MAIL_RETENTION_DAYS = 30
 # KTD7 limits, also enforced here so no caller can exceed them.
 FIX_MAX_LINES = 10
 FIX_NOTE_MAX_CHARS = 500
-FIX_LINE_KINDS = frozenset({"add_in", "add_out", "flip", "ignore"})
+FIX_ADD_KINDS = ("add_in", "add_out")
+FIX_LINE_KINDS = frozenset({*FIX_ADD_KINDS, "flip", "ignore"})
 FIX_CLOSED_STATUSES = frozenset({"closed_correct", "closed_left"})
 FIX_DECIDED_STATUSES = frozenset({"approved", "partial", "rejected"})
 FIX_SOURCES = frozenset({"link", "session"})
@@ -702,6 +713,7 @@ FIX_EVENT_KINDS = frozenset(
     {"filed", "lines_added", "closed", "reopened", "line_approved", "line_rejected", "decided"}
 )
 DIRECTIONS = frozenset({"entry", "exit"})
+OPPOSITE_DIRECTION = {"entry": "exit", "exit": "entry"}
 
 _ADD_COLUMN = re.compile(r"^\s*ALTER TABLE (\w+) ADD COLUMN (\w+)", re.IGNORECASE)
 
@@ -1994,6 +2006,16 @@ class Database:
         """Active role-hr people: the approvers (KTD6) and request recipients."""
         return self._active_with_role("hr")
 
+    def has_active_hr_other_than(self, employee_id: int) -> bool:
+        """True when some active HR user other than ``employee_id`` exists:
+        the check that keeps admins out of deciding fixes (KTD6)."""
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM employees WHERE role = 'hr' AND archived_at IS NULL AND id <> ? LIMIT 1",
+                (employee_id,),
+            ).fetchone()
+        return row is not None
+
     def active_admins(self) -> list[dict[str, object]]:
         """Active admins: the fallback approvers when no other HR user exists (KTD6)."""
         return self._active_with_role("admin")
@@ -2120,7 +2142,7 @@ class Database:
             ).fetchall()
         return list(rows)
 
-    def prune_alerts(self, days: int = 90) -> int:
+    def prune_alerts(self, days: int = ALERT_RETENTION_DAYS) -> int:
         cutoff = _now().date() - timedelta(days=days)
         with self.transaction() as connection:
             cursor = connection.execute(
@@ -2193,7 +2215,7 @@ class Database:
             )
             return "pending"
 
-    def prune_mail(self, days: int = 30) -> int:
+    def prune_mail(self, days: int = MAIL_RETENTION_DAYS) -> int:
         with self.transaction() as connection:
             cursor = connection.execute(
                 "DELETE FROM mail_outbox WHERE created_at < ?", (_now() - timedelta(days=days),)
@@ -2391,10 +2413,11 @@ class Database:
             pending = connection.execute(
                 select + "WHERE r.status = 'pending' ORDER BY r.created_at, r.id"
             ).fetchall()
+            decided_statuses = sorted(FIX_DECIDED_STATUSES)
             decided = connection.execute(
-                select + "WHERE r.status IN ('approved', 'partial', 'rejected') "
+                select + f"WHERE r.status IN ({', '.join('?' * len(decided_statuses))}) "
                 "ORDER BY r.decided_at DESC, r.id DESC LIMIT ?",
-                (recent,),
+                (*decided_statuses, recent),
             ).fetchall()
         return [*pending, *decided]
 
@@ -2452,7 +2475,7 @@ class Database:
                 ).fetchone()
                 if line is None:
                     raise ValueError(f"line {decision['line_id']} is not on request {request_id}")
-                adds = line["kind"] in ("add_in", "add_out")
+                adds = line["kind"] in FIX_ADD_KINDS
                 hr_time = decision.get("event_time") if adds else None
                 hr_direction = decision.get("direction") if line["kind"] != "ignore" else None
                 cursor = connection.execute(
@@ -2605,6 +2628,12 @@ def _overlaid_punches(
     for row in rows:
         row["employee_id"] = owner_of.get(str(row["device_user_id"]))
     corrections = _corrections_for(connection, main_ids, start, end)
+    if not corrections:
+        # What apply_corrections returns with nothing to merge, without the
+        # copy and re-sort: these rows are fresh and already in time order.
+        for row in rows:
+            row["correction"] = None
+        return rows
     return apply_corrections(rows, corrections, main_ids)
 
 
@@ -2660,18 +2689,14 @@ def _insert_mail(
     html_body: str | None = None,
 ) -> int:
     """Queue one outbox row inside the caller's transaction (KTD8)."""
-    unique: dict[str, str] = {}
-    for address in recipients:
-        address = (address or "").strip()
-        if address:
-            unique.setdefault(address.lower(), address)
+    unique = dedupe_recipients(recipients)
     if not unique:
         raise ValueError("an email needs at least one recipient")
     now = _now()
     return connection.execute(
         "INSERT INTO mail_outbox (recipients, subject, text_body, html_body, next_attempt_at, "
         "created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (json.dumps(list(unique.values())), subject, text_body, html_body, now, now),
+        (json.dumps(unique), subject, text_body, html_body, now, now),
     ).lastrowid
 
 
@@ -2719,7 +2744,7 @@ def _fix_line_values(line: dict) -> tuple[object, ...]:
         raise ValueError(f"note is longer than {FIX_NOTE_MAX_CHARS} characters")
     if direction not in (None, *DIRECTIONS):
         raise ValueError(f"bad direction: {direction}")
-    if kind in ("add_in", "add_out"):
+    if kind in FIX_ADD_KINDS:
         implied = "entry" if kind == "add_in" else "exit"
         if not isinstance(event_time, datetime) or target is not None:
             raise ValueError(f"{kind} needs a time and no target swipe")
@@ -2736,7 +2761,7 @@ def _correction_values(
 ) -> dict[str, object]:
     """The punch_corrections row an approved line becomes (KTD4), with HR's
     edits taking precedence over the employee's values."""
-    if line["kind"] in ("add_in", "add_out"):
+    if line["kind"] in FIX_ADD_KINDS:
         return {
             "kind": "add", "fingerprint": None,
             "event_timestamp": hr_time or line["event_time"],
@@ -2753,7 +2778,7 @@ def _correction_values(
             (line["target_fingerprint"],),
         ).fetchone()
         stored = row["trusted_direction"] if row else None
-        direction = {"entry": "exit", "exit": "entry"}.get(stored)
+        direction = OPPOSITE_DIRECTION.get(stored)
     if direction is None:
         raise ValueError(f"line {line['id']} needs a direction to flip to")
     return {"kind": "set_direction", "fingerprint": line["target_fingerprint"],

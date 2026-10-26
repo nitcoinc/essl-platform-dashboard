@@ -100,5 +100,14 @@ def can_approve_fix(actor: dict | None, request: dict, database) -> bool:
     if actor["role"] == "hr":
         return True
     if actor["role"] == "admin":
-        return not any(person["id"] != requester for person in database.active_hr_users())
+        return not database.has_active_hr_other_than(requester)
     return False
+
+
+def fix_approvers(requester_id: int, database) -> list[dict]:
+    """Who decides a person's fix request, by the can_approve_fix rule: every
+    active HR user but the requester, else every active admin but them."""
+    approvers = [p for p in database.active_hr_users() if p["id"] != requester_id]
+    if approvers:
+        return approvers
+    return [p for p in database.active_admins() if p["id"] != requester_id]

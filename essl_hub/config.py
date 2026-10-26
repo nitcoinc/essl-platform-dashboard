@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -183,6 +186,16 @@ def public_url() -> str | None:
     if not value.startswith(("https://", "http://")):
         raise RuntimeError("ESSL_PUBLIC_URL must start with https:// or http://")
     return value
+
+
+def public_url_or_none(context: str) -> str | None:
+    """``public_url``, but a malformed value logs a warning (``context`` says
+    what goes out without a link) and reads as unset, so an email still sends."""
+    try:
+        return public_url()
+    except RuntimeError as exc:
+        _logger.warning("%s: %s", context, exc)
+        return None
 
 
 def hr_reply_to() -> str | None:
