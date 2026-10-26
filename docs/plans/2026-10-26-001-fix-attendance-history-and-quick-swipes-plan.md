@@ -531,3 +531,12 @@ stateDiagram-v2
 - github.com/vwout/zkaccess-c3-py: 0x03 used for `DateTime=` writes; replies 0xC8/0xC9.
 - ZKAccess 3.5 manual: punch interval 0–10 s, default 2.
 - ZKBioSecurity 3.2 manual: interlock requires door sensors; sensor delay default 15 s.
+
+### Pre-implementation Check results (2026-10-26)
+
+Live database was not reachable from the dev host; checks 1–2 ran on the 2026-10-12 replica, check 3 against the panel (read-only).
+
+1. **Collapsed swipes, 14 days before 2026-10-12.** C3: 71 same-person pairs under 60 s — 66 opposite-direction (counted), 3 exit→exit (collapsed), 2 entry→direction-less realtime row (collapsed). X990: 285 pairs under 60 s, all direction-less, all collapsed; gaps spread evenly 0–60 s. The X990 window is the larger "not counted" source.
+2. **15→exit gate.** History rows carry only in/out bytes 0 (14,195) and 1 (13,958); no 2 or 3. The library turns byte 1 into 15, so realtime 15 is exit in 100% of cases. The replica holds no history event-20 rows; the rule extends to event 20 because the panel emits only bytes 0/1. Gate passes. 22 realtime 15 rows (18:42–21:54 on 2026-10-12) were stored direction-less, confirming the realtime exposure.
+3. **Panel (AC Ver 18.1.2, LockCount 4).** `AntiPassback=0`, `InterLock=0`; every door: `Intertime=1`, `Drivertime=5`, `Detectortime=15`, `CloseAndLock=1`, `SensorType=0`, `VerifyType=7`. No door sensor is configured, so the panel never waits on door state; R8 has no current effect at Gachibowli. The event 24/25 count was not taken: the transaction download was reset by the panel (the production collector holds the session).
+   - Recommended windows: Gachibowli C3 10 s (directions are trusted after U3); Uppal X990 5–10 s.
