@@ -29,7 +29,7 @@
     <h3 class="raw-punches-title">All punches ({{ bv.punches|length }})</h3>
     <ol class="punch-list">
       {% for p in bv.punches %}
-      <li><span class="punch-time num">{{ p.time.strftime('%H:%M:%S') }}{% if p.time.date() > day %}<sup title="Next calendar day">+1</sup>{% endif %}</span><span class="punch-dir">{{ {'entry': 'In', 'exit': 'Out'}.get(p.direction, 'Swipe') }}</span>{% for f in p.flags %}{{ ui.chip(f, 'neutral' if f in ('not counted', 'inferred') else 'warn') }}{% endfor %}</li>
+      <li><span class="punch-time num">{{ p.time.strftime('%H:%M:%S') }}{% if p.time.date() > day %}<sup title="Next calendar day">+1</sup>{% endif %}</span><span class="punch-dir">{{ {'entry': 'In', 'exit': 'Out'}.get(p.direction, 'Swipe') }}</span>{% for f in p.flags %}{{ ui.chip(f, 'neutral' if f in ('not counted', 'inferred') else 'warn') }}{% endfor %}{% if p.note %}<span class="punch-note muted num">{{ p.note }}</span>{% endif %}</li>
       {% endfor %}
       {% if result.status != 'open' and result.segments and result.segments[-1].end is none %}<li class="is-missing"><span class="punch-time">--:--:--</span><span class="punch-dir">No exit recorded</span></li>{% endif %}
     </ol>

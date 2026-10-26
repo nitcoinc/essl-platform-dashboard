@@ -8,7 +8,7 @@ import unittest
 from datetime import datetime, timedelta
 
 from essl_hub import day_story
-from essl_hub.hours import Punch, Segment, compute_day
+from essl_hub.hours import Collapsed, Punch, Segment, compute_day
 
 
 def _t(h: int, m: int = 0, s: int = 0, day: int = 10) -> datetime:
@@ -102,8 +102,9 @@ class BreakMathTest(unittest.TestCase):
         self.assertEqual(r.break_seconds, 0)
 
     def test_mixed_device_duplicates_collapsed(self) -> None:
-        r = compute_day([Punch(_t(9), "entry"), Punch(_t(9, 1)), Punch(_t(13), "exit"),
-                         Punch(_t(14), "entry"), Punch(_t(14, 1)), Punch(_t(18), "exit")], target_minutes=480)
+        # 59 s: exactly 60 s counts since KTD3 made the window strict.
+        r = compute_day([Punch(_t(9), "entry"), Punch(_t(9, 0, 59)), Punch(_t(13), "exit"),
+                         Punch(_t(14), "entry"), Punch(_t(14, 0, 59)), Punch(_t(18), "exit")], target_minutes=480)
         self.assertEqual(r.effective_seconds, 8 * 3600)
         self.assertEqual(len(r.collapsed), 2)
         self.assertEqual(r.break_seconds, 3600)
@@ -202,6 +203,83 @@ class MagneticDoorPairingTest(unittest.TestCase):
                          Punch(_t(15), "entry"), Punch(_t(18), "exit")], target_minutes=480)
         self.assertEqual([(g.kind, g.seconds) for g in r.gaps], [("unclear", 7200)])
         self.assertEqual(r.gross_seconds, r.effective_seconds + r.break_seconds + r.unclear_seconds)
+
+
+class DefaultWindowCharacterizationTest(unittest.TestCase):
+    """Pinned at the default 60 s window before U2 made it per device (KTD3)."""
+
+    def test_direction_less_59s_collapses(self) -> None:
+        dup = Punch(_t(9, 0, 59))
+        r = compute_day([Punch(_t(9)), dup, Punch(_t(18))], target_minutes=480)
+        self.assertEqual(r.collapsed, (dup,))
+        self.assertEqual(r.segments, (Segment(_t(9), _t(18)),))
+
+    def test_direction_less_exactly_60s_counts(self) -> None:
+        # Collapsed before U2 (gap <= window); KTD3 makes the window strict.
+        r = compute_day([Punch(_t(9)), Punch(_t(9, 1)), Punch(_t(18))], target_minutes=480)
+        self.assertEqual(r.collapsed, ())
+        self.assertEqual(r.segments[0], Segment(_t(9), _t(9, 1)))
+
+    def test_same_direction_entry_30s_collapses(self) -> None:
+        again = Punch(_t(9, 0, 30), "entry")
+        r = compute_day([Punch(_t(9), "entry"), again, Punch(_t(18), "exit")], target_minutes=480)
+        self.assertEqual((r.collapsed, r.unpaired), ((again,), ()))
+        self.assertEqual(r.segments, (Segment(_t(9), _t(18)),))
+
+    def test_known_entry_then_exit_5s_both_count(self) -> None:
+        r = compute_day([Punch(_t(9), "entry"), Punch(_t(9, 0, 5), "exit")], target_minutes=480)
+        self.assertEqual(r.collapsed, ())
+        self.assertEqual(r.segments, (Segment(_t(9), _t(9, 0, 5)),))
+
+
+class PerDeviceWindowTest(unittest.TestCase):
+    """KTD3: each punch is judged by its own device's quick-swipe window."""
+
+    def test_x990_window_0_counts_every_swipe(self) -> None:
+        r = compute_day([Punch(_t(9), None, 0), Punch(_t(9, 0, 20), None, 0), Punch(_t(18), None, 0)],
+                        target_minutes=480)
+        self.assertEqual((r.collapsed, r.collapsed_reasons), ((), ()))
+        self.assertEqual(r.segments[0], Segment(_t(9), _t(9, 0, 20)))
+        self.assertEqual(r.unpaired, ((_t(18), "entry"),))
+
+    def test_x990_window_60_collapses_with_reason(self) -> None:
+        dup = Punch(_t(9, 0, 20), None, 60)
+        r = compute_day([Punch(_t(9), None, 60), dup, Punch(_t(18), None, 60)], target_minutes=480)
+        self.assertEqual(r.collapsed, (dup,))
+        self.assertEqual(r.collapsed_reasons, (Collapsed(dup, _t(9), "entry", 20),))
+        self.assertEqual(r.segments, (Segment(_t(9), _t(18)),))
+
+    def test_window_0_same_second_both_count(self) -> None:
+        r = compute_day([Punch(_t(9), None, 0), Punch(_t(9), None, 0)], target_minutes=480)
+        self.assertEqual(r.collapsed, ())
+        self.assertEqual(r.segments, (Segment(_t(9), _t(9)),))
+
+    def test_mixed_day_judges_by_current_punchs_window(self) -> None:
+        # C3 entry (window 10), X990 swipe 30 s later (window 60): judged by 60.
+        dup = Punch(_t(9, 0, 30), None, 60)
+        r = compute_day([Punch(_t(9), "entry", 10), dup, Punch(_t(18), "exit", 10)], target_minutes=480)
+        self.assertEqual(r.collapsed, (dup,))
+        self.assertEqual(r.collapsed_reasons[0].gap_seconds, 30)
+        self.assertEqual(r.segments, (Segment(_t(9), _t(18)),))
+
+    def test_known_entry_exit_5s_window_60_both_count(self) -> None:
+        r = compute_day([Punch(_t(9), "entry", 60), Punch(_t(9, 0, 5), "exit", 60)], target_minutes=480)
+        self.assertEqual(r.collapsed, ())
+        self.assertEqual(r.segments, (Segment(_t(9), _t(9, 0, 5)),))
+
+    def test_entry_entry_30s_window_60_collapses_second(self) -> None:
+        again = Punch(_t(9, 0, 30), "entry", 60)
+        r = compute_day([Punch(_t(9), "entry", 60), again, Punch(_t(18), "exit", 60)], target_minutes=480)
+        self.assertEqual(r.collapsed_reasons, (Collapsed(again, _t(9), "entry", 30),))
+        self.assertEqual((r.segments, r.unpaired), ((Segment(_t(9), _t(18)),), ()))
+
+    def test_entry_entry_30s_window_10_counts_both(self) -> None:
+        r = compute_day([Punch(_t(9), "entry", 10), Punch(_t(9, 0, 30), "entry", 10),
+                         Punch(_t(18), "exit", 10)], target_minutes=480)
+        self.assertEqual(r.collapsed, ())
+        # The first entry is superseded by the second and shown unpaired.
+        self.assertEqual(r.segments, (Segment(_t(9, 0, 30), _t(18)),))
+        self.assertEqual(r.unpaired, ((_t(9), "entry"),))
 
 
 if __name__ == "__main__":

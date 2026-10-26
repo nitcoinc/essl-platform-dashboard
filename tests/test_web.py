@@ -278,6 +278,7 @@ class FakeDatabase:
                 "trusted_direction": p.get("trusted_direction"),
                 "raw_direction_byte": p.get("raw_direction_byte"),
                 "raw_state": p.get("raw_state", ""),
+                "device_id": p.get("device_id"),
             }
             for p in rows
         ]
@@ -295,6 +296,7 @@ class FakeDatabase:
                 "event_timestamp": p["event_timestamp"],
                 "trusted_direction": p.get("trusted_direction"),
                 "site": p.get("site"),
+                "device_id": p.get("device_id"),
             }
             for p in rows
         ]
@@ -3494,6 +3496,35 @@ class PeopleManagementTest(unittest.TestCase):
         csv_text = self.client.get(f"/export.csv?from={day.isoformat()}&to={day.isoformat()}").text
         row = next(line for line in csv_text.splitlines() if "Kiran Kumar" in line)
         self.assertIn("09:00,17:00,2,8:00", row)
+
+    def _quick_swipe_day(self, window: int):
+        import csv as csv_module
+
+        from essl_hub import export
+        kiran = self._person("NP0128", "Kiran Kumar")
+        day = (_ist_now() - timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0)
+        self._punches(*[("NP0128", "Kiran", day.replace(hour=h, minute=0, second=s), None)
+                        for h, s in ((9, 0), (9, 20), (12, 0), (17, 0))])
+        self.database.set_device_policy(DEVICES[0].id, window_seconds=window, wait_for_door_close=True)
+        self._sign_in(self.hr)
+        page = self.client.get(f"/day?date={day.date().isoformat()}&employee={kiran['id']}").text
+        csv_text = self.client.get(f"/export.csv?from={day.date().isoformat()}&to={day.date().isoformat()}").text
+        row = next(r for r in csv_module.reader(io.StringIO(csv_text.lstrip("\ufeff"))) if "Kiran Kumar" in r)
+        return page, row[export.DAILY_HEADER.index("Effective")]
+
+    def test_day_page_and_export_agree_under_device_window(self) -> None:
+        # KTD3: window 0 counts 09:00:20 as Out; 12:00 In, 17:00 Out -> 5h.
+        page, effective = self._quick_swipe_day(0)
+        self.assertIn("5h 00m", page)
+        self.assertEqual(effective, "5:00")
+        self.assertNotIn("not counted", page)
+
+    def test_default_window_collapses_with_reason_on_day_page(self) -> None:
+        # 60 s: 09:00:20 is not counted; 09:00 In, 12:00 Out, 17:00 unpaired -> 3h.
+        page, effective = self._quick_swipe_day(60)
+        self.assertIn("3h 00m", page)
+        self.assertEqual(effective, "3:00")
+        self.assertIn("same as In 09:00:00, 20s earlier", page)
 
     def test_twin_of_never_punched_id_replaces_the_main_id(self) -> None:
         kiran = self._person("128", "Kiran Kumar")

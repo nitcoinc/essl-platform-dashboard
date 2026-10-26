@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from .hours import DayResult
+from .hours import Collapsed, DayResult
 
 
 @dataclass(frozen=True)
@@ -137,6 +137,7 @@ class RawPunch:
     time: datetime
     direction: str  # "entry" | "exit" | ""
     flags: tuple[str, ...]  # "not counted", "unpaired", "inferred", "interval too short"
+    note: str = ""  # R6: why a "not counted" swipe was dropped
 
 
 @dataclass(frozen=True)
@@ -274,16 +275,19 @@ def break_view(result: DayResult, now: datetime | None, raw_rows=()) -> BreakVie
     unpaired = {t: d for t, d in result.unpaired}
     for gap in result.gaps:
         unpaired.update({t: d for t, d in gap.unpaired})
-    collapsed = [p.timestamp for p in result.collapsed]
+    collapsed = list(result.collapsed_reasons)
     inferred = set(result.inferred)
     punches: list[RawPunch] = []
     for row in raw_rows:
         t = row["event_timestamp"]
         flags: list[str] = []
-        if t in collapsed:
-            collapsed.remove(t)
+        note = ""
+        reason = next((c for c in collapsed if c.punch.timestamp == t), None)
+        if reason is not None:
+            collapsed.remove(reason)
             direction = row.get("trusted_direction") or ""
             flags.append("not counted")
+            note = collapsed_note(reason)
         elif t in starts:
             direction = "entry"
         elif t in ends:
@@ -296,7 +300,7 @@ def break_view(result: DayResult, now: datetime | None, raw_rows=()) -> BreakVie
         if t in inferred and "not counted" not in flags:
             flags.append("inferred")
         flags.extend(punch_flags(row.get("raw_state")))
-        punches.append(RawPunch(t, direction, tuple(flags)))
+        punches.append(RawPunch(t, direction, tuple(flags), note))
     return BreakView(
         inside_seconds=result.effective_seconds,
         break_seconds=result.break_seconds,
@@ -310,6 +314,13 @@ def break_view(result: DayResult, now: datetime | None, raw_rows=()) -> BreakVie
         gaps=result.gaps,
         punches=tuple(punches),
     )
+
+
+def collapsed_note(reason: Collapsed) -> str:
+    """R6: "same as In 10:00:03, 12s earlier"; the kept swipe's direction is
+    the one its own row shows."""
+    label = {"entry": "In", "exit": "Out"}.get(reason.repeats_direction, "swipe")
+    return f"same as {label} {reason.repeats:%H:%M:%S}, {reason.gap_seconds}s earlier"
 
 
 def ring_percent(result: DayResult, target_minutes: int) -> int:

@@ -212,3 +212,28 @@ class BreakViewTest(unittest.TestCase):
         self.assertEqual(len(view.punches), 3)
         self.assertEqual(view.punches[1].flags, ("not counted",))
         self.assertEqual(view.punches[2].flags, ("interval too short",))
+
+    def test_not_counted_swipe_states_the_swipe_it_repeats(self) -> None:
+        # R6: X990 (no direction), window 60: 09:00:20 repeats the 09:00:00 In.
+        from essl_hub.hours import Punch, compute_day
+        swipes = [(_at(9), None), (D.replace(hour=9, second=20), None), (_at(18), None)]
+        r = compute_day([Punch(t, d, 60) for t, d in swipes], target_minutes=480)
+        self.assertEqual(r.collapsed_reasons[0].gap_seconds, 20)
+        view = day_story.break_view(r, None, self._rows(*swipes))
+        self.assertEqual([(p.flags, p.note) for p in view.punches], [
+            ((), ""), (("not counted",), "same as In 09:00:00, 20s earlier"), ((), "")])
+
+    def test_window_0_counts_every_swipe_with_no_note(self) -> None:
+        from essl_hub.hours import Punch, compute_day
+        swipes = [(_at(9), None), (D.replace(hour=9, second=20), None), (_at(18), None)]
+        r = compute_day([Punch(t, d, 0) for t, d in swipes], target_minutes=480)
+        view = day_story.break_view(r, None, self._rows(*swipes))
+        self.assertEqual([p.direction for p in view.punches], ["entry", "exit", "entry"])
+        self.assertEqual([p.note for p in view.punches], ["", "", ""])
+        self.assertNotIn("not counted", [f for p in view.punches for f in p.flags])
+
+    def test_reswipe_note_names_the_out_it_repeats(self) -> None:
+        again = D.replace(hour=13, second=12)
+        swipes = [(_at(9), "entry"), (_at(13), "exit"), (again, "exit"), (_at(14), "entry"), (_at(18), "exit")]
+        view = day_story.break_view(self._day(*swipes), None, self._rows(*swipes))
+        self.assertEqual(view.punches[2].note, "same as Out 13:00:00, 12s earlier")

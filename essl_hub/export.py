@@ -19,7 +19,7 @@ from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from .db import device_ids_of
-from .hours import DEFAULT_DAY_START_HOUR, DayResult, Punch, compute_day, work_day, work_day_window
+from .hours import DEFAULT_DAY_START_HOUR, DayResult, Punch, compute_day, punch_from_row, work_day, work_day_window
 
 MAX_RANGE_DAYS = 93
 # Spreadsheet apps treat these leading characters as a formula (CSV injection).
@@ -61,13 +61,14 @@ def _load(
         work_day_window(start, day_start_hour)[0],
         work_day_window(end, day_start_hour)[1],
     )
+    windows = database.device_windows()  # KTD3: once per report
     grouped: dict[tuple[str, date], list[Punch]] = defaultdict(list)
     seen_sites: dict[tuple[str, date], set[str]] = defaultdict(set)
     for row in rows:
         stamp = row["event_timestamp"]
         owner = main_of.get(row["device_user_id"], row["device_user_id"])
         key = (owner, work_day(stamp, day_start_hour))
-        grouped[key].append(Punch(timestamp=stamp, trusted_direction=row["trusted_direction"]))
+        grouped[key].append(punch_from_row(row, windows))
         if row.get("site"):
             seen_sites[key].add(row["site"])
     results, sites = {}, {}

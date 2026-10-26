@@ -49,11 +49,13 @@ def api_hours() -> tuple[Response, int] | Response:
 
     now = _now_naive()
     day_start_hour = _day_start_hour(database)
+    windows = database.device_windows()
     rows = []
     for employee in _people_for_range(database, start, end, day_start_hour):
         for day in _date_range(start, end):
             result = _day_for_employee(
-                database, employee, day, target_minutes, now=now, day_start_hour=day_start_hour
+                database, employee, day, target_minutes, now=now, day_start_hour=day_start_hour,
+                windows=windows,
             )
             rows.append(
                 {

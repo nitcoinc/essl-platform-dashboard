@@ -15,7 +15,7 @@ from werkzeug.local import LocalProxy
 from .. import config, roster
 from ..config import TIMEZONE_NAME
 from ..db import Database, device_ids_of
-from ..hours import DEFAULT_DAY_START_HOUR, DayResult, Punch, compute_day, work_day, work_day_window
+from ..hours import DEFAULT_DAY_START_HOUR, DayResult, compute_day, punch_from_row, work_day, work_day_window
 
 
 _TZ = ZoneInfo(TIMEZONE_NAME)
@@ -264,18 +264,19 @@ def _day_for_employee(
     now: datetime | None = None,
     *,
     day_start_hour: int | None = None,
+    windows: dict[str, int] | None = None,
 ) -> DayResult:
     """Score one work day. Pass ``now`` to share one instant across a request,
     so every figure on a page is measured from the same second (R17/U11).
-    Loop callers pass ``day_start_hour`` so the setting is read once."""
+    Loop callers pass ``day_start_hour`` and ``windows`` (device -> quick-swipe
+    window, KTD3) so each is read once."""
     if day_start_hour is None:
         day_start_hour = _day_start_hour(database)
+    if windows is None:
+        windows = database.device_windows()
     start, end = work_day_window(day, day_start_hour)
     rows = database.punches_for_employee_range(device_ids_of(employee), start, end)
-    punches = [
-        Punch(timestamp=row["event_timestamp"], trusted_direction=row["trusted_direction"])
-        for row in rows
-    ]
+    punches = [punch_from_row(row, windows) for row in rows]
     now = now or _now_naive()
     is_today = day == work_day(now, day_start_hour)
     now = now if is_today else None

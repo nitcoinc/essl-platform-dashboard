@@ -51,8 +51,10 @@ def _subject() -> dict:
 def _day_context(subject: dict, day, today, request_now, target_minutes: int, day_start_hour: int) -> dict:
     """The context _day_live.html needs for one subject and day; shared by
     /day and the quick-view drawer so both render the same Today."""
+    windows = database.device_windows()
     result = _day_for_employee(
-        database, subject, day, target_minutes, now=request_now, day_start_hour=day_start_hour
+        database, subject, day, target_minutes, now=request_now, day_start_hour=day_start_hour,
+        windows=windows,
     )
     is_today = day == today
     now = request_now if is_today else None
@@ -72,7 +74,7 @@ def _day_context(subject: dict, day, today, request_now, target_minutes: int, da
             # Rollover while inside: say where the open stretch went.
             previous = _day_for_employee(
                 database, subject, day - timedelta(days=1), target_minutes, now=request_now,
-                day_start_hour=day_start_hour,
+                day_start_hour=day_start_hour, windows=windows,
             )
             if previous.segments and previous.segments[-1].end is None:
                 previous_entry = previous.segments[-1].start
@@ -140,12 +142,15 @@ def week_view() -> str:
     monday = today - timedelta(days=today.weekday()) + timedelta(weeks=offset)
     days = []
     week_total = 0
+    windows = database.device_windows()
     for i in range(5):
         day = monday + timedelta(days=i)
         if day > today:
             days.append({"date": day, "result": None})
             continue
-        result = _day_for_employee(database, subject, day, target_minutes, day_start_hour=day_start_hour)
+        result = _day_for_employee(
+            database, subject, day, target_minutes, day_start_hour=day_start_hour, windows=windows
+        )
         week_total += result.effective_minutes
         days.append({"date": day, "result": result})
     chart = charts.render_week_bars(
