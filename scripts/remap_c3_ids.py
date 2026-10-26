@@ -2,8 +2,9 @@
 
 Also deletes stored C3 rows that are not attendance swipes (denied swipes,
 alarms), which the collector skips; interval-too-short swipes (event 20)
-are attendance since KTD11 and are kept, and duplicates of one swipe
-stored by both the realtime and the history path.
+are attendance since KTD11 and are kept, as are door-denied swipes (24/25)
+the collector stored under "Wait for door close" off (KTD5), and duplicates
+of one swipe stored by both the realtime and the history path.
 
 C3 punches collected before the PIN mapping carry the bare PIN (9) and a
 fingerprint over the realtime payload. This recomputes both from raw_json with
@@ -25,7 +26,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from essl_hub.collectors import _c3_is_punch, _normalized_event, c3_identity, c3_user_id  # noqa: E402
+from essl_hub.collectors import (  # noqa: E402
+    C3_DOOR_DENIED_NOTES,
+    _c3_is_punch,
+    _normalized_event,
+    c3_identity,
+    c3_user_id,
+)
 from essl_hub.config import DEVICES  # noqa: E402
 from essl_hub.db import Database  # noqa: E402
 
@@ -34,8 +41,14 @@ def _raw(row: dict) -> dict:
     return row["raw_json"] if isinstance(row["raw_json"], dict) else json.loads(row["raw_json"] or "{}")
 
 
+def _kept(event_type: str) -> bool:
+    # A stored 24/25 row passed the device's door_denied_since gate when
+    # collected; the script has no policy to re-check, so it stays.
+    return _c3_is_punch(event_type) or event_type.strip() in C3_DOOR_DENIED_NOTES
+
+
 def not_punches(rows: list[dict]) -> list[int]:
-    return [r["id"] for r in rows if not _c3_is_punch(str(_raw(r).get("event_type", _raw(r).get("EventType", "0"))))]
+    return [r["id"] for r in rows if not _kept(str(_raw(r).get("event_type", _raw(r).get("EventType", "0"))))]
 
 
 def planned_changes(rows: list[dict]) -> list[tuple[int, str, str]]:

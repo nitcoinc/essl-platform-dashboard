@@ -123,6 +123,11 @@ class PunchFlagsTest(unittest.TestCase):
         self.assertEqual(day_story.punch_flags("event 20 · in/out 1 · interval too short"), ("interval too short",))
         self.assertEqual(day_story.punch_flags("event 0 · in/out 1"), ())
         self.assertEqual(day_story.punch_flags(None), ())
+        # KTD5: door-denied swipes captured under "Wait for door close" off.
+        self.assertEqual(day_story.punch_flags("event 25 · in/out 1 · door denied: interlock"),
+                         ("door denied (interlock)",))
+        self.assertEqual(day_story.punch_flags("24 · 15 · door denied: anti-passback"),
+                         ("door denied (anti-passback)",))
 
     def test_same_person_event_0_then_20_counts_once(self) -> None:
         from essl_hub.hours import Punch, compute_day

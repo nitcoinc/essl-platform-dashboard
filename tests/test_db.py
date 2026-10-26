@@ -673,6 +673,15 @@ class DatabaseTest(unittest.TestCase):
             [r["device_user_id"] for r in self.database.checkins_since(since=None, limit=10)], ["NP0118"]
         )
 
+    def test_frappe_skips_door_denied_punches(self) -> None:
+        self.database.insert_punches([
+            self._punch(fingerprint="a", device_user_id="118"),
+            self._punch(fingerprint="b", device_user_id="118", raw_state="event 25 · in/out 1 · door denied: interlock",
+                        event_timestamp=datetime(2026, 9, 10, 18, 0)),
+        ])
+        pending = self.database.frappe_pending_punches(since=None, limit=10)
+        self.assertEqual([p["event_timestamp"] for p in pending], [datetime(2026, 9, 10, 9, 5, 0)])
+
     def test_main_id_change_requeues_skipped_punches(self) -> None:
         asha = self._employee("asha@x.com", "asha@x.com")
         self.database.insert_punches([self._punch(fingerprint="b", device_user_id="777")])
@@ -1222,6 +1231,37 @@ class DatabaseTest(unittest.TestCase):
             rows = {r["fingerprint"]: r["trusted_direction"] for r in connection.execute(
                 "SELECT fingerprint, trusted_direction FROM punches").fetchall()}
         self.assertEqual(rows, {"c3-set": "entry", "x990": None})
+
+    def test_fill_punch_directions_overwrites_a_contradicted_realtime_guess(self) -> None:
+        # KTD4: realtime 15 was guessed exit; the history byte 0 is authoritative.
+        realtime = {"pin": "118", "in_out_state": 15, "source": "realtime_fallback"}
+        self.database.insert_punches([
+            self._punch(fingerprint="rt", trusted_direction="exit", raw_direction_byte=15, raw=realtime),
+            self._punch(fingerprint="rt-ok", trusted_direction="exit", raw_direction_byte=15, raw=realtime),
+        ])
+        updated = self.database.fill_punch_directions([
+            self._punch(fingerprint="rt", trusted_direction="entry", raw_direction_byte=0),
+            self._punch(fingerprint="rt-ok", trusted_direction="exit", raw_direction_byte=1),
+        ])
+        self.assertEqual(updated, 1)
+        with self.database.connect() as connection:
+            rows = {r["fingerprint"]: (r["trusted_direction"], r["raw_direction_byte"]) for r in connection.execute(
+                "SELECT fingerprint, trusted_direction, raw_direction_byte FROM punches").fetchall()}
+        self.assertEqual(rows, {"rt": ("entry", 15), "rt-ok": ("exit", 15)})
+        self.assertEqual(self.database.fill_punch_directions([
+            self._punch(fingerprint="rt", trusted_direction="entry"),
+        ]), 0)
+
+    def test_fill_punch_directions_never_overwrites_a_history_sourced_row(self) -> None:
+        self.database.insert_punches([
+            self._punch(fingerprint="hist", trusted_direction="exit", raw={"Pin": "118", "InOutState": "1"}),
+        ])
+        self.assertEqual(self.database.fill_punch_directions([
+            self._punch(fingerprint="hist", trusted_direction="entry"),
+        ]), 0)
+        with self.database.connect() as connection:
+            row = connection.execute("SELECT trusted_direction FROM punches").fetchone()
+        self.assertEqual(row["trusted_direction"], "exit")
 
 
     def test_add_retire_and_reenable_device(self) -> None:

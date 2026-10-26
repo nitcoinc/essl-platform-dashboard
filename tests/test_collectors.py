@@ -260,8 +260,19 @@ class C3IntervalTooShortTest(unittest.TestCase):
         [hist] = self._history([self._row("20")])
         self.assertEqual(rt["fingerprint"], hist["fingerprint"])
         self.assertIn("interval too short", rt["raw_state"])
-        # 15 -> exit is evidence from granted events only; 20 alternates.
-        self.assertIsNone(rt["trusted_direction"])
+        # KTD4: the panel only emits bytes 0/1, so realtime 15 on event 20 is an exit.
+        self.assertEqual(rt["trusted_direction"], "exit")
+
+    def test_realtime_directions_for_granted_and_interval_too_short(self) -> None:
+        from c3.utils import C3DateTime
+
+        entry, short_exit = self._realtime([
+            _RtRecord(0, "173", 0, C3DateTime.from_value(800000000)),
+            _RtRecord(20, "173", 15, C3DateTime.from_value(800000005)),
+        ])
+        self.assertEqual(entry["trusted_direction"], "entry")
+        self.assertEqual(entry["raw_state"], "0 · 0")
+        self.assertEqual(short_exit["trusted_direction"], "exit")
 
     def test_event_20_without_pin_or_card_is_dropped(self) -> None:
         self.assertEqual(self._history([self._row("20", pin="", card="0")]), [])
@@ -273,6 +284,76 @@ class C3IntervalTooShortTest(unittest.TestCase):
     def test_two_people_back_to_back_both_stored(self) -> None:
         events = self._history([self._row("0", pin="173"), self._row("20", pin="39", second=800000001)])
         self.assertEqual({e["device_user_id"] for e in events}, {c3_user_id("173"), c3_user_id("39")})
+
+
+class C3DoorDeniedTest(unittest.TestCase):
+    """KTD5: interlock (25) and anti-passback (24) denials are captured only
+    at/after the device's door_denied_since."""
+
+    SINCE_SECOND = 800000000
+
+    def setUp(self) -> None:
+        from dataclasses import replace
+
+        from c3.utils import C3DateTime
+
+        base = next(d for d in DEVICES if d.protocol == "c3-pullsdk")
+        self.since = C3DateTime.from_value(self.SINCE_SECOND)
+        self.policy_off = base
+        self.policy_on = replace(base, door_denied_since=self.since)
+
+    def _history(self, rows, device):
+        from essl_hub import collectors
+
+        with patch("c3.C3", _FakeC3), patch.object(collectors, "read_c3_table", return_value=rows), \
+                patch.dict(os.environ, {"ESSL_C3_MODE": "history"}):
+            return collectors.collect_c3(device).events
+
+    def _realtime(self, records, device):
+        from essl_hub import collectors
+
+        _FakeC3.rt_batches = [records]
+        with patch("c3.C3", _FakeC3), patch.dict(os.environ, {"ESSL_C3_MODE": "realtime"}):
+            return collectors.collect_c3(device).events
+
+    _row = staticmethod(C3IntervalTooShortTest._row)
+
+    def test_history_event_25_after_since_is_a_flagged_exit(self) -> None:
+        [event] = self._history([self._row("25", second=self.SINCE_SECOND + 60)], self.policy_on)
+        self.assertEqual(event["trusted_direction"], "exit")
+        self.assertIn("door denied: interlock", event["raw_state"])
+        [event] = self._history([self._row("24", in_out="0", second=self.SINCE_SECOND)], self.policy_on)
+        self.assertEqual(event["trusted_direction"], "entry")  # at `since` counts
+        self.assertIn("door denied: anti-passback", event["raw_state"])
+
+    def test_door_denied_before_since_or_with_policy_off_is_dropped(self) -> None:
+        self.assertEqual(self._history([self._row("25", second=self.SINCE_SECOND - 1)], self.policy_on), [])
+        self.assertEqual(self._history([self._row("25", second=self.SINCE_SECOND + 60)], self.policy_off), [])
+
+    def test_door_denied_without_pin_or_card_is_dropped(self) -> None:
+        rows = [self._row(e, pin=pin, card=card, second=self.SINCE_SECOND + 60)
+                for e in ("24", "25") for pin, card in (("", "0"), ("0", ""))]
+        self.assertEqual(self._history(rows, self.policy_on), [])
+
+    def test_event_27_is_always_dropped(self) -> None:
+        self.assertEqual(self._history([self._row("27", second=self.SINCE_SECOND + 60)], self.policy_on), [])
+
+    def test_realtime_event_25_with_15_has_no_direction_and_dedupes_with_history(self) -> None:
+        from c3.utils import C3DateTime
+
+        when = C3DateTime.from_value(self.SINCE_SECOND + 60)
+        [rt] = self._realtime([_RtRecord(25, "173", 15, when)], self.policy_on)
+        self.assertIsNone(rt["trusted_direction"])
+        self.assertIn("door denied: interlock", rt["raw_state"])
+        [hist] = self._history([self._row("25", second=self.SINCE_SECOND + 60)], self.policy_on)
+        self.assertEqual(rt["fingerprint"], hist["fingerprint"])
+        self.assertEqual(hist["trusted_direction"], "exit")  # what fill_punch_directions applies
+
+    def test_realtime_event_25_with_policy_off_is_dropped(self) -> None:
+        from c3.utils import C3DateTime
+
+        when = C3DateTime.from_value(self.SINCE_SECOND + 60)
+        self.assertEqual(self._realtime([_RtRecord(25, "173", 15, when)], self.policy_off), [])
 
 
 class C3TrustedDirectionTest(unittest.TestCase):
@@ -288,9 +369,24 @@ class C3TrustedDirectionTest(unittest.TestCase):
         for event_type in (0, 1, 2, 3):
             self.assertEqual(_c3_trusted_direction(15, event_type), "exit")
 
+    def test_byte_fifteen_on_interval_too_short_is_an_exit(self) -> None:
+        # KTD4: history carries only bytes 0/1, so 15 is byte 1 for event 20 too.
+        self.assertEqual(_c3_trusted_direction(15, 20), "exit")
+
+    def test_byte_fifteen_on_event_20_is_unknown_when_the_rule_is_off(self) -> None:
+        from essl_hub import collectors
+
+        # Gate-miss branch: the pre-implementation check could have failed.
+        with patch.object(collectors, "C3_REALTIME_15_EXIT_EVENT_TYPES", frozenset(collectors.C3_GRANTED_EVENT_TYPES)):
+            self.assertIsNone(_c3_trusted_direction(15, 20))
+            self.assertEqual(_c3_trusted_direction(15, 0), "exit")
+
     def test_byte_fifteen_without_a_card_event_is_not_trusted(self) -> None:
         self.assertIsNone(_c3_trusted_direction(15))
         self.assertIsNone(_c3_trusted_direction(15, 8))
+        # Door-denied rows wait for a history read (KTD4).
+        self.assertIsNone(_c3_trusted_direction(15, 24))
+        self.assertIsNone(_c3_trusted_direction(15, 25))
 
     def test_entry_and_exit_bytes_ignore_the_event_type(self) -> None:
         self.assertEqual(_c3_trusted_direction(0, 0), "entry")

@@ -53,10 +53,20 @@ def merge_device_configs(
             protocol=str(protocol),
             password_env=base.password_env if base else "",
             password=row.get("comm_password") or None,
+            door_denied_since=_as_datetime(row.get("door_denied_since")),
         )
         if device_id is None or device.id == device_id:
             merged.append(device)
     return merged
+
+
+def _as_datetime(value: object) -> datetime | None:
+    if value is None or isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
 
 
 def static_devices(device_id: str | None = None) -> list[DeviceConfig]:

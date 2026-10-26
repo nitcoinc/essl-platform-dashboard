@@ -102,10 +102,18 @@ def log_items(result: DayResult, now: datetime | None) -> list[LogItem]:
     return items
 
 
+_PUNCH_FLAGS = (
+    ("interval too short", "interval too short"),
+    ("door denied: interlock", "door denied (interlock)"),
+    ("door denied: anti-passback", "door denied (anti-passback)"),
+)
+
+
 def punch_flags(raw_state: str | None) -> tuple[str, ...]:
     """Chips for a stored swipe in the raw-punch list: a C3 swipe the door
-    denied for punch interval still counts (KTD11) but is marked."""
-    return ("interval too short",) if "interval too short" in (raw_state or "") else ()
+    denied for punch interval (KTD11), or for interlock / anti-passback while
+    "Wait for door close" is off (KTD5), still counts but is marked."""
+    return tuple(chip for note, chip in _PUNCH_FLAGS if note in (raw_state or ""))
 
 
 @dataclass(frozen=True)

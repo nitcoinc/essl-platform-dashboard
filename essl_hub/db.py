@@ -1004,28 +1004,36 @@ class Database:
             return inserted + _insert_punches(connection, rest)
 
     def fill_punch_directions(self, punches: Iterable[dict[str, object]]) -> int:
-        """Fill trusted_direction on stored C3 punches that have none, from a
-        history download carrying the same fingerprints. Collector metadata,
-        not a punch edit: rows with a direction and non-C3 rows are never
-        touched, and nothing is inserted. Returns the rows updated."""
-        updates = [
-            (str(p["trusted_direction"]), str(p["fingerprint"]))
+        """Set trusted_direction on stored C3 punches from a history download
+        carrying the same fingerprints: rows with none, and realtime-sourced
+        rows whose guess the history byte contradicts (KTD4; history is
+        authoritative). Collector metadata, not a punch edit: history-sourced
+        and non-C3 rows are never touched, and nothing is inserted. Returns
+        the rows updated."""
+        wanted = {
+            str(p["fingerprint"]): str(p["trusted_direction"])
             for p in punches
             if p.get("trusted_direction") in ("entry", "exit") and p.get("fingerprint")
-        ]
-        if not updates:
+        }
+        if not wanted:
             return 0
         # Read first: a history download is the device's whole log, so only
-        # rows still missing a direction are updated.
+        # rows still open to repair are compared.
         with self.connect() as connection:
-            missing = {
-                row["fingerprint"]
+            stored = {
+                row["fingerprint"]: row["trusted_direction"]
                 for row in connection.execute(
-                    "SELECT fingerprint FROM punches WHERE trusted_direction IS NULL "
+                    "SELECT fingerprint, trusted_direction FROM punches "
+                    "WHERE (trusted_direction IS NULL "
+                    "OR json_extract(raw_json, '$.source') = 'realtime_fallback') "
                     "AND device_id IN (SELECT id FROM devices WHERE protocol = 'c3-pullsdk')"
                 ).fetchall()
             }
-        updates = [u for u in updates if u[1] in missing]
+        updates = [
+            (direction, fingerprint)
+            for fingerprint, direction in wanted.items()
+            if fingerprint in stored and stored[fingerprint] != direction
+        ]
         if not updates:
             return 0
         updated = 0
@@ -1033,7 +1041,8 @@ class Database:
             for direction, fingerprint in updates:
                 cursor = connection.execute(
                     "UPDATE punches SET trusted_direction = ? "
-                    "WHERE fingerprint = ? AND trusted_direction IS NULL "
+                    "WHERE fingerprint = ? AND (trusted_direction IS NULL "
+                    "OR json_extract(raw_json, '$.source') = 'realtime_fallback') "
                     "AND device_id IN (SELECT id FROM devices WHERE protocol = 'c3-pullsdk')",
                     (direction, fingerprint),
                 )
@@ -1649,12 +1658,14 @@ class Database:
     # --- Frappe HR push (essl_hub.frappe_sync) ---------------------------
 
     def frappe_pending_punches(self, *, since: datetime | None, limit: int) -> list[dict]:
-        """Punches with no frappe_sync_log row, oldest first."""
+        """Punches with no frappe_sync_log row, oldest first. Door-denied C3
+        rows (KTD5) stay local: payroll cannot see their flag."""
         sql = (
             f"SELECT p.id, p.device_id, {_MAIN_ID_SQL} AS device_user_id, "
             "p.event_timestamp, p.trusted_direction "
             "FROM punches p LEFT JOIN frappe_sync_log f ON f.punch_id = p.id "
-            "WHERE f.punch_id IS NULL"
+            "WHERE f.punch_id IS NULL "
+            "AND COALESCE(p.raw_state, '') NOT LIKE '%door denied:%'"
         )
         params: list[object] = []
         if since is not None:

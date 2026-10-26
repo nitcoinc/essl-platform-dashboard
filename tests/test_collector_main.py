@@ -20,7 +20,9 @@ def _seeded_rows() -> list[dict]:
     """What device_connection_info returns right after seeding config.DEVICES."""
     return [
         {"id": d.id, "site": d.site, "model": d.model, "protocol": d.protocol,
-         "ip": d.ip, "port": d.port, "comm_password": None, "connection_updated_at": None}
+         "ip": d.ip, "port": d.port, "comm_password": None, "connection_updated_at": None,
+         "duplicate_window_seconds": 60, "door_denied_since": None,
+         "door_params_request": None, "door_params_requested_at": None}
         for d in DEVICES
     ]
 
@@ -442,6 +444,18 @@ class MergeDeviceConfigsTest(unittest.TestCase):
         device = merge_device_configs(DEVICES, rows)[0]
         with patch.dict(os.environ, {"ESSL_X990_PASSWORD": "envpw"}):
             self.assertEqual(config.password_for(device), "dbpw")
+
+    def test_door_denied_since_comes_from_the_row(self) -> None:
+        # KTD5: the collector gates 24/25 capture on the device's policy.
+        from datetime import datetime
+
+        rows = _seeded_rows()
+        rows[1]["door_denied_since"] = datetime(2026, 10, 26, 9, 0)
+        merged = merge_device_configs(DEVICES, rows)
+        self.assertIsNone(merged[0].door_denied_since)
+        self.assertEqual(merged[1].door_denied_since, datetime(2026, 10, 26, 9, 0))
+        rows[1]["door_denied_since"] = "2026-10-26 09:00:00"
+        self.assertEqual(merge_device_configs(DEVICES, rows)[1].door_denied_since, datetime(2026, 10, 26, 9, 0))
 
     def test_no_rows_means_nothing_to_poll(self) -> None:
         # every device retired: nothing is polled, the static list is not a fallback

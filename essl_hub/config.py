@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import datetime
 
 
 @dataclass(frozen=True)
@@ -14,6 +15,9 @@ class DeviceConfig:
     protocol: str
     password_env: str
     password: str | None = None
+    # KTD5: set while "Wait for door close" is unchecked; C3 door-denied
+    # swipes (24/25) at or after it are captured. None = drop them.
+    door_denied_since: datetime | None = None
 
 # Seed-only: inserted into the devices table when missing, never overwritten.
 # The database is authoritative; admins add and retire devices there.
