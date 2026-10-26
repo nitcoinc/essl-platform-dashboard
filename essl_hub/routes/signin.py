@@ -70,11 +70,20 @@ BOT_CHECK_MESSAGE = "We could not confirm you are human. Complete the check and 
 
 # --- Sign-in -----------------------------------------------------
 
+
+def _next_path(raw: str | None) -> str | None:
+    """The page to land on after sign-in (U8 deep links), kept only when it
+    is a same-site path; anything else is dropped, never echoed."""
+    target = _safe_next(raw, "")
+    return target or None
+
+
 @bp.get("/signin")
 def signin() -> str | Response:
+    next_path = _next_path(request.args.get("next"))
     if g.employee is not None:
-        return redirect(_home_for(g.employee))
-    return render_template("signin_email.html")
+        return redirect(next_path or _home_for(g.employee))
+    return render_template("signin_email.html", next=next_path)
 
 
 @bp.post("/signin")
@@ -84,12 +93,14 @@ def signin_submit() -> Response:
     # mail failure is logged inside auth.request_code, never reported
     # here, so neither case is distinguishable from the outside.
     email = (request.form.get("email") or "").strip()
+    next_path = _next_path(request.form.get("next"))
     if _bot_check_failed():
         # Before any roster lookup or mail, so bots cannot trigger sends.
         return Response(
-            render_template("signin_email.html", email=email, bot_error=BOT_CHECK_MESSAGE), 400
+            render_template("signin_email.html", email=email, bot_error=BOT_CHECK_MESSAGE, next=next_path),
+            400,
         )
-    response = Response(render_template("signin_code.html", email=email))
+    response = Response(render_template("signin_code.html", email=email, next=next_path))
     if email:
         result = auth.request_code(database, email, requested_ip=_client_ip())
         _set_pending_cookie(response, result.pending_token)
@@ -100,15 +111,16 @@ def signin_submit() -> Response:
 def signin_verify() -> str | Response:
     pending_token = request.cookies.get(PENDING_COOKIE) or ""
     code = (request.form.get("code") or "").strip()
+    next_path = _next_path(request.form.get("next"))
     outcome = auth.verify_code(database, pending_token=pending_token, code=code)
     if not outcome.ok:
         message = {
             "expired": "That code has expired. Request a new one.",
             "locked": "Too many wrong attempts. Request a new code.",
         }.get(outcome.error, "That code is not correct.")
-        return render_template("signin_code.html", error=message, error_kind=outcome.error)
+        return render_template("signin_code.html", error=message, error_kind=outcome.error, next=next_path)
 
-    return _start_session(outcome, _home_for(outcome.employee))
+    return _start_session(outcome, next_path or _home_for(outcome.employee))
 
 
 # --- First-run setup (one-time) -----------------------------------

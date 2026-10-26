@@ -143,6 +143,39 @@ class AccessTest(unittest.TestCase):
         self.assertFalse(access.can_modify_employee(self.a, self.c, "name"))
         self.assertFalse(access.can_modify_employee(self.c, self.c, "email"))
 
+    # fix requests (KTD6) --------------------------------------------------
+
+    def _request_by(self, person: dict) -> dict:
+        return {"id": 1, "employee_id": person["id"], "status": "pending"}
+
+    def test_only_hr_and_admin_open_fix_reviews(self) -> None:
+        self.assertTrue(access.can_view_fix_reviews(self.hr))
+        self.assertTrue(access.can_view_fix_reviews(self.admin))
+        self.assertFalse(access.can_view_fix_reviews(self.a))
+        self.assertFalse(access.can_view_fix_reviews(self.c))
+        self.assertFalse(access.can_view_fix_reviews(None))
+
+    def test_hr_approves_anyone_but_themselves(self) -> None:
+        self.assertTrue(access.can_approve_fix(self.hr, self._request_by(self.c), self.db))
+        self.assertTrue(access.can_approve_fix(self.hr, self._request_by(self.admin), self.db))
+        self.assertFalse(access.can_approve_fix(self.hr, self._request_by(self.hr), self.db))
+
+    def test_managers_and_employees_never_approve(self) -> None:
+        self.assertFalse(access.can_approve_fix(self.a, self._request_by(self.c), self.db))
+        self.assertFalse(access.can_approve_fix(self.c, self._request_by(self.b), self.db))
+
+    def test_admin_approves_only_when_no_other_hr_user_exists(self) -> None:
+        self.assertFalse(access.can_approve_fix(self.admin, self._request_by(self.c), self.db))
+        # The requester is the only HR user: the admin may decide.
+        self.assertTrue(access.can_approve_fix(self.admin, self._request_by(self.hr), self.db))
+        self.db.set_employee_role(self.hr["id"], "employee")
+        self.assertTrue(access.can_approve_fix(self.admin, self._request_by(self.c), self.db))
+        self.assertFalse(access.can_approve_fix(self.admin, self._request_by(self.admin), self.db))
+
+    def test_archived_hr_does_not_block_the_admin_fallback(self) -> None:
+        self.db.archive_employee(self.hr["id"])
+        self.assertTrue(access.can_approve_fix(self.admin, self._request_by(self.c), self.db))
+
 
 if __name__ == "__main__":
     unittest.main()

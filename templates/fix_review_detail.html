@@ -1,0 +1,143 @@
+{% extends "base.html" %}
+{% import "_ui.html" as ui %}
+{% block title %}Fix request: {{ person.name }}, {{ day_label }} - eSSL Attendance Hub{% endblock %}
+{% set chip_tone = {'added by HR': 'info', 'direction fixed': 'info', 'ignored': 'neutral'} %}
+{% set line_chip = {'pending': ('Pending', 'info'), 'approved': ('Approved', 'ok'), 'rejected': ('Not approved', 'bad')} %}
+{% set event_labels = {'filed': 'Filed', 'lines_added': 'Added changes', 'closed': 'Closed the day', 'reopened': 'Reopened', 'line_approved': 'Approved a change', 'line_rejected': 'Rejected a change', 'decided': 'Decided the request'} %}
+{% block content %}
+<div class="review-page">
+<header class="topbar">
+  <div>
+    <a class="back-link" href="{{ url_for('fixes.review_list') }}">{{ ui.icon('arrow-left') }}<span>All fix requests</span></a>
+    <h1>{{ person.name }} · {{ day_label }}</h1>
+    <p class="review-meta">{% with status = filed.status %}{% include "_fix_status_chip.html" %}{% endwith %}
+      <span>Filed {{ filed.created_at.strftime('%d %b, %H:%M') if filed.created_at else '' }}{% if filed.source == 'link' %} from the email link{% elif filed.source == 'session' %} from the day view{% endif %}</span>
+      <a href="{{ url_for('me.day_view', employee=person.id, date=day.isoformat()) }}">Open their day</a></p>
+  </div>
+</header>
+
+{% if errors.form %}<div class="notice notice-bad" role="alert">{{ ui.icon('circle-alert') }}<p>{{ errors.form }}</p></div>{% endif %}
+{% if day_changed %}
+<div class="notice notice-warn" role="status">{{ ui.icon('triangle-alert') }}<p><strong>Day changed since report.</strong> New device data or a history read changed this day's swipes after the employee reported it. Check the swipes below before deciding.</p></div>
+{% endif %}
+{% if readonly_reason and filed.status == 'pending' %}
+<div class="notice" role="status">{{ ui.icon('lock') }}<p><strong>View only.</strong> {{ readonly_reason }}</p></div>
+{% endif %}
+
+<section class="review-card" aria-labelledby="swipes-heading">
+  <h2 id="swipes-heading">Swipes on this day</h2>
+  {% if swipes %}
+  <ol class="report-swipes">
+    {% for s in swipes %}
+    <li class="report-swipe">
+      <div class="report-swipe-head">
+        <span class="punch-time num">{{ s.time.strftime('%H:%M:%S') }}{% if s.next_day %}<sup title="Next calendar day">+1</sup>{% endif %}</span>
+        <span class="punch-dir">{{ s.direction }}</span>
+        {% for c in s.chips %}{{ ui.chip(c, chip_tone.get(c, 'warn')) }}{% endfor %}
+      </div>
+    </li>
+    {% endfor %}
+  </ol>
+  {% else %}
+  <p class="muted">No swipes were recorded on this day.</p>
+  {% endif %}
+  <p class="field-hint">The work day runs from {{ day_start }} to {{ day_start }} the next morning.</p>
+</section>
+
+{% macro line_head(line) -%}
+<div class="review-line-head">
+  <span class="review-line-text">{{ line.text }}</span>
+  {% set chip = line_chip.get(line.status, ('Pending', 'info')) %}{{ ui.chip(chip[0], chip[1]) }}
+</div>
+{% if line.note %}<p class="review-line-note muted">Employee's note: "{{ line.note }}"</p>{% endif %}
+{% if line.target_missing %}<p class="review-flag">{{ ui.icon('triangle-alert') }}<span>The swipe this line points to no longer exists. Approving it changes nothing.</span></p>{% endif %}
+{%- endmacro %}
+
+{% if decided_lines %}
+<section class="review-card" aria-labelledby="decided-heading">
+  <h2 id="decided-heading">Decided changes</h2>
+  <ul class="review-lines">
+    {% for line in decided_lines %}
+    <li class="review-line">{{ line_head(line) }}
+      {% if line.hr_edits %}<p class="review-line-note muted">{{ line.hr_edits|join('. ') }}.</p>{% endif %}
+      {% if line.decided_by_name %}<p class="review-line-note muted">Decided by {{ line.decided_by_name }}</p>{% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% if filed.decision_note and not can_decide %}
+  <div class="report-note"><p class="report-note-label">Note from {{ filed.decided_by_name or 'HR' }}</p><p class="report-note-text">{{ filed.decision_note }}</p></div>
+  {% endif %}
+</section>
+{% endif %}
+
+{% if pending_lines %}
+{% if can_decide %}
+<form method="post" action="{{ url_for('fixes.review_preview', request_id=filed.id) }}" class="review-card review-form" novalidate aria-labelledby="decide-heading">
+  <h2 id="decide-heading">Decide {{ pending_lines|length }} {{ 'change' if pending_lines|length == 1 else 'changes' }}</h2>
+  <p class="field-hint">Each change is approved unless you choose Reject. You can correct a time or direction before approving.</p>
+  <input type="hidden" name="csrf" value="{{ csrf_token }}">
+  {% for line in pending_lines %}
+  {% set key = 'line-' ~ line.id %}
+  <fieldset class="review-line">
+    <legend class="visually-hidden">{{ line.text }}</legend>
+    {{ line_head(line) }}
+    {% if line.edit_time or line.edit_dir %}
+    <div class="review-line-edits">
+      {% if line.edit_time %}{{ ui.field(key ~ '-time', 'Time', line['values'].time, type='time', error=line.errors.time) }}{% endif %}
+      {% if line.edit_dir %}
+      <fieldset class="report-dir"{% if line.errors.dir %} aria-describedby="f-{{ key }}-dir-error"{% endif %}>
+        <legend>{{ 'Direction' if line.edit_time else 'Should be' }}</legend>
+        <div class="report-dir-options">
+          {% for value, label in (('in', 'In'), ('out', 'Out')) %}
+          <label class="report-check"><input type="radio" name="{{ key }}-dir" value="{{ value }}"{{ ' checked' if line['values'].dir == value }}{% if line.errors.dir %} aria-invalid="true"{% endif %}><span>{{ label }}</span></label>
+          {% endfor %}
+        </div>
+        {% if line.errors.dir %}{{ ui.inline_error(line.errors.dir, 'f-' ~ key ~ '-dir-error') }}{% endif %}
+      </fieldset>
+      {% endif %}
+    </div>
+    {% endif %}
+    <fieldset class="review-decision"{% if line.errors.decision %} aria-describedby="f-{{ key }}-decision-error"{% endif %}>
+      <legend>Decision</legend>
+      <div class="report-dir-options">
+        <label class="report-check"><input type="radio" name="{{ key }}-decision" value="approved"{{ ' checked' if line['values'].decision != 'rejected' }}><span>Approve</span></label>
+        <label class="report-check"><input type="radio" name="{{ key }}-decision" value="rejected"{{ ' checked' if line['values'].decision == 'rejected' }}><span>Reject</span></label>
+      </div>
+      {% if line.errors.decision %}{{ ui.inline_error(line.errors.decision, 'f-' ~ key ~ '-decision-error') }}{% endif %}
+    </fieldset>
+  </fieldset>
+  {% endfor %}
+
+  <div class="field">
+    <label for="f-note">Note to {{ person.name }}</label>
+    <textarea id="f-note" name="note" rows="3" maxlength="{{ note_max }}" aria-describedby="f-note-hint{% if errors.note %} f-note-error{% endif %}"{% if errors.note %} aria-invalid="true"{% endif %}>{{ note or '' }}</textarea>
+    <p class="field-hint" id="f-note-hint">Required when you reject a change. They see it in the decision email. Up to {{ note_max }} characters.</p>
+    {% if errors.note %}{{ ui.inline_error(errors.note, 'f-note-error') }}{% endif %}
+  </div>
+  <div class="review-actions">
+    {{ ui.button('Review decision', 'primary', type='submit') }}
+    {{ ui.button('Cancel', 'tertiary', href=url_for('fixes.review_list')) }}
+  </div>
+</form>
+{% else %}
+<section class="review-card" aria-labelledby="pending-heading">
+  <h2 id="pending-heading">Waiting for a decision</h2>
+  <ul class="review-lines">
+    {% for line in pending_lines %}<li class="review-line">{{ line_head(line) }}</li>{% endfor %}
+  </ul>
+</section>
+{% endif %}
+{% endif %}
+
+{% if events %}
+<section class="review-card" aria-labelledby="history-heading">
+  <h2 id="history-heading">History</h2>
+  <ol class="review-history">
+    {% for e in events %}
+    <li><span class="num muted">{{ e.created_at.strftime('%d %b, %H:%M') if e.created_at else '' }}</span> <span>{{ event_labels.get(e.kind, e.kind) }}{% if e.actor_name %} · {{ e.actor_name }}{% endif %}</span></li>
+    {% endfor %}
+  </ol>
+</section>
+{% endif %}
+</div>
+{% endblock %}

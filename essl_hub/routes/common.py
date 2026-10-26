@@ -98,10 +98,20 @@ def _login_required(view):
                 response = make_response("", 200)
                 response.headers["HX-Redirect"] = url_for("auth.signin")
                 return response
-            return redirect(url_for("auth.signin"))
+            return redirect(_signin_url())
         return view(*args, **kwargs)
 
     return wrapper
+
+
+def _signin_url() -> str:
+    """Sign-in for a signed-out visitor; a page they opened (a GET, e.g. the
+    "Review request" email button) rides along as ``next`` so they land back
+    on it once signed in. A POST is never replayed."""
+    if request.method != "GET":
+        return url_for("auth.signin")
+    target = request.full_path if request.query_string else request.path
+    return url_for("auth.signin", next=target)
 
 
 def _role_required(*roles: str):
@@ -109,7 +119,7 @@ def _role_required(*roles: str):
         @wraps(view)
         def wrapper(*args, **kwargs):
             if g.employee is None:
-                return redirect(url_for("auth.signin"))
+                return redirect(_signin_url())
             if g.employee["role"] not in roles:
                 abort(403)
             return view(*args, **kwargs)
@@ -293,6 +303,10 @@ def _safe_next(target: str | None, fallback: str) -> str:
     """A same-site path to return to; anything with a scheme or host (or a
     protocol-relative //host, or a backslash trick) falls back."""
     if not target or not target.startswith("/") or target.startswith("//") or "\\" in target:
+        return fallback
+    # Browsers drop tabs and newlines from URLs, so "/\t/host" would become
+    # "//host"; no real path here carries a control character or a space.
+    if any(ord(ch) <= 32 or ord(ch) == 127 for ch in target):
         return fallback
     return target
 

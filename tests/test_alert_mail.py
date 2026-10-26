@@ -85,6 +85,7 @@ def _all_templates(name: str = "Ajay Kumar", note: str = "A note"):
         "morning": _morning(employee_name=name),
         "hr": _request(employee_name=name, note=note, review_url=REVIEW),
         "manager": _request(employee_name=name, note=note),
+        "hr_no_link": _request(employee_name=name, note=note, for_hr=True),
         "decision": _decision(employee_name=name, hr_note=note),
     }
 
@@ -181,6 +182,21 @@ class RequestTest(unittest.TestCase):
         self.assertNotIn("http", email.text)
         self.assertIn("HR will review", email.text)
         self.assertIn("Missed swipe-in at 13:40", email.text)
+
+    def test_hr_variant_without_public_url_points_to_the_dashboard(self) -> None:
+        email = _request(for_hr=True)
+        self.assertNotIn("Review request", email.html)
+        self.assertNotIn("href=", email.html)
+        self.assertNotIn("http", email.text)
+        self.assertIn("Open Fix requests in the dashboard to review it.", email.text)
+        self.assertIn("Open Fix requests in the dashboard to review it.", email.html)
+        self.assertNotIn("HR will review", email.text)
+        self.assertNotIn("for your information", email.text)
+
+    def test_review_url_implies_the_hr_variant(self) -> None:
+        email = _request(review_url=REVIEW, for_hr=False)
+        self.assertIn("Review request", email.html)
+        self.assertNotIn("Open Fix requests in the dashboard", email.text)
 
     def test_manager_who_is_also_hr_gets_one_copy_the_hr_variant(self) -> None:
         hr, manager = am.request_recipients(

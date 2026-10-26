@@ -782,8 +782,15 @@ class FakeDatabase:
         self._check_online()
         decisions = list(decisions)
         note = (note or "").strip() or None
+        for decision in decisions:
+            if decision.get("status") not in ("approved", "rejected"):
+                raise ValueError(f"bad line decision: {decision.get('status')}")
+            if decision.get("direction") not in (None, *db_module.DIRECTIONS):
+                raise ValueError(f"bad direction: {decision.get('direction')}")
         if note is None and any(d["status"] == "rejected" for d in decisions):
             raise ValueError("A note is required when rejecting.")
+        if note is not None and len(note) > db_module.FIX_NOTE_MAX_CHARS:
+            raise ValueError(f"note is longer than {db_module.FIX_NOTE_MAX_CHARS} characters")
         request = self.fix_requests.get(request_id)
         if request is None:
             raise db_module.RuleViolation("No such fix request.")
@@ -831,16 +838,19 @@ class FakeDatabase:
                                    "hr_direction": hr_direction, "decided_by": actor_id,
                                    "decided_at": now}
             events.append((line["id"], "line_approved" if decision["status"] == "approved"
-                           else "line_rejected", {"status": decision["status"], "correction": correction}))
+                           else "line_rejected",
+                           {"status": "pending", "kind": line["kind"],
+                            "target_fingerprint": line["target_fingerprint"],
+                            "event_time": line["event_time"], "direction": line["direction"]},
+                           {"status": decision["status"], "correction": correction}))
             decided.append(line["id"])
         # All checks passed: apply together, like the real transaction.
         for line_id, values in updates.items():
             self.fix_lines[line_id].update(values)
         for correction in corrections:
             self.corrections.append({"id": len(self.corrections) + 1, **correction})
-        for line_id, kind, new_value in events:
-            self._fix_event(request_id, line_id, actor_id, kind, {"status": "pending"},
-                            {**new_value, "note": note})
+        for line_id, kind, old_value, new_value in events:
+            self._fix_event(request_id, line_id, actor_id, kind, old_value, {**new_value, "note": note})
         if note is not None and decided:
             request["decision_note"] = note
         statuses = {l["status"] for l in self._request_lines(request_id)}
@@ -3559,8 +3569,8 @@ class AppShellTest(unittest.TestCase):
         # The manager role arrives with U5.
         expected = {
             "employee": ["Today", "Week"],
-            "hr": ["Today", "Week", "Employees", "People"],
-            "admin": ["Today", "Week", "Employees", "People", "Devices", "Settings"],
+            "hr": ["Today", "Week", "Employees", "People", "Fix requests"],
+            "admin": ["Today", "Week", "Employees", "People", "Fix requests", "Devices", "Settings"],
         }
         for role, labels in expected.items():
             with self.subTest(role=role):
@@ -3961,7 +3971,7 @@ class RolesAndVisibilityTest(unittest.TestCase):
         expected = {
             "employee": ["Today", "Week"],
             "manager": ["Today", "Week", "Team"],
-            "hr": ["Today", "Week", "Employees", "People"],
+            "hr": ["Today", "Week", "Employees", "People", "Fix requests"],
         }
         for i, (role, labels) in enumerate(expected.items()):
             self._sign_in(self._person(f"5{i}", role))
@@ -5181,3 +5191,353 @@ class FixReportTest(unittest.TestCase):
         [record] = records
         self.assertNotIn(self.token, record.getMessage())
         self.assertIn("/fix/[redacted]?sent=1", record.getMessage())
+
+
+class FixReviewTest(unittest.TestCase):
+    """U8: the HR review page, confirm-then-apply, and the sign-in deep link."""
+
+    DAY = datetime(2026, 10, 26).date()
+    NOW = datetime(2026, 10, 26, 18, 0)
+
+    def setUp(self) -> None:
+        self.app, self.database = _make_app()
+        self.client = self.app.test_client()
+        from essl_hub import mail as mail_module
+
+        self.captured = {}
+        original = mail_module.send_login_code
+        mail_module.send_login_code = lambda e, c: self.captured.update(code=c)
+        self.addCleanup(lambda: setattr(mail_module, "send_login_code", original))
+        for patcher in (*_fixed_now(self.NOW), patch.dict(os.environ, {"ESSL_PUBLIC_URL": "https://hub.example.com"})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.asha = self._person("118", "Asha Rao")
+        self.boss = self._person("200", "Meera Boss", "manager")
+        self.hari = self._person("300", "Hari HR", "hr")
+        self.admin = self._person("400", "Ada Admin", "admin")
+        self.database.set_employee_manager(self.asha["id"], self.boss["id"])
+        # 09:00-13:00, then an Out at 17:00 with no In before it: 4h 00m.
+        self.database.insert_punches([
+            _punch_row("a-in", datetime(2026, 10, 26, 9, 0), "entry", uid="118"),
+            _punch_row("a-out", datetime(2026, 10, 26, 13, 0), "exit", uid="118"),
+            _punch_row("a-last", datetime(2026, 10, 26, 17, 0), "exit", uid="118"),
+        ])
+
+    def _person(self, uid: str, name: str, role: str = "employee") -> dict:
+        email = f"{name.split()[0].lower()}@example.com"
+        self.database.upsert_employee(device_user_id=uid, name=name, email=email)
+        person = self.database.employee_by_email(email)
+        self.database.set_employee_role(person["id"], role)
+        return person
+
+    def _sign_in(self, person: dict, client=None) -> None:
+        client = client or self.client
+        client.post("/signout")
+        client.post("/signin", data={"email": person["email"]})
+        client.post("/signin/verify", data={"code": self.captured["code"]})
+
+    def _csrf(self, client=None) -> str:
+        html = (client or self.client).get("/day").text
+        marker = 'name="csrf-token" content="'
+        start = html.index(marker) + len(marker)
+        return html[start : html.index('"', start)]
+
+    def _file(self, *lines, person=None) -> int:
+        from essl_hub.db import device_ids_of
+        from essl_hub.routes.fixes import punch_set_hash
+
+        person = person or self.asha
+        start, end = datetime(2026, 10, 26, 6), datetime(2026, 10, 27, 6)
+        rows = self.database.punches_for_employee_range(device_ids_of(person), start, end)
+        lines = lines or ({"kind": "add_in", "event_time": datetime(2026, 10, 26, 13, 40)},)
+        return self.database.file_fix_lines(person["id"], self.DAY, list(lines), source="link",
+                                            punch_set_hash=punch_set_hash(rows))["request_id"]
+
+    def _lines(self, request_id: int) -> list[dict]:
+        return self.database.fix_request(request_id)["lines"]
+
+    def _approve_all(self, request_id: int) -> dict:
+        form = {}
+        for line in self._lines(request_id):
+            form[f"line-{line['id']}-decision"] = "approved"
+            if line["kind"] in ("add_in", "add_out"):
+                form[f"line-{line['id']}-time"] = line["event_time"].strftime("%H:%M")
+            if line["kind"] != "ignore":
+                form[f"line-{line['id']}-dir"] = {"entry": "in", "exit": "out"}.get(line["direction"], "in")
+        return form
+
+    def _post(self, request_id: int, form: dict, step: str = "", client=None):
+        client = client or self.client
+        return client.post(f"/fixes/review/{request_id}{step}",
+                           data={"csrf": self._csrf(client), **form})
+
+    def _flash(self, client=None) -> str:
+        return (client or self.client).get("/fixes/review").text
+
+    def _decision_mail(self) -> dict:
+        mails = [m for m in self.database.outbox if m["recipients"] == ["asha@example.com"]]
+        self.assertEqual(len(mails), 1)
+        return mails[0]
+
+    # --- Approving ----------------------------------------------------------
+
+    def test_approving_a_missed_in_corrects_hours_audits_and_emails(self) -> None:
+        request_id = self._file()
+        self._sign_in(self.hari)
+        detail = self.client.get(f"/fixes/review/{request_id}")
+        self.assertEqual(detail.status_code, 200)
+        self.assertIn("Missed swipe-in at 13:40", detail.text)
+        self.assertIn("Waiting for review", detail.text)
+        self.assertIn("17:00:00", detail.text)
+        self.assertIn('value="approved" checked', detail.text)
+        self.assertNotIn("Day changed since report", detail.text)
+        form = self._approve_all(request_id)
+        preview = self._post(request_id, form)
+        self.assertEqual(preview.status_code, 200)
+        self.assertIn("Confirm decision", preview.text)
+        self.assertIn("4h 00m", preview.text)
+        self.assertIn("7h 20m", preview.text)
+        self.assertEqual(self.database.corrections, [])  # the preview writes nothing
+        response = self._post(request_id, form, "/confirm")
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.headers["Location"].endswith("/fixes/review"))
+        self.assertIn("Saved. 1 line approved, 0 rejected.", self._flash())
+        [correction] = self.database.corrections
+        self.assertEqual((correction["kind"], correction["event_timestamp"], correction["direction"]),
+                         ("add", datetime(2026, 10, 26, 13, 40), "entry"))
+        self.assertEqual(self.database.fix_request(request_id)["status"], "approved")
+        approved = [e for e in self.database.fix_request_events(request_id) if e["kind"] == "line_approved"]
+        self.assertEqual([e["actor_name"] for e in approved], ["Hari HR"])
+        mail = self._decision_mail()
+        self.assertIn("was approved", mail["subject"])
+        self.assertIn("Missed swipe-in at 13:40: approved", mail["text_body"])
+        self.assertIn("https://hub.example.com/day?date=2026-10-26", mail["text_body"])
+        day = self.client.get(f"/day?employee={self.asha['id']}&date=2026-10-26").text
+        self.assertIn("7h 20m", day)
+        self.assertIn("added by HR", day)
+
+    def test_hr_edit_of_the_time_is_applied_and_audited_with_both_values(self) -> None:
+        request_id = self._file()
+        self._sign_in(self.hari)
+        form = {**self._approve_all(request_id), f"line-{self._lines(request_id)[0]['id']}-time": "13:35"}
+        preview = self._post(request_id, form)
+        self.assertIn("Missed swipe-in at 13:35", preview.text)
+        self.assertIn("Employee asked: Missed swipe-in at 13:40", preview.text)
+        self.assertIn("7h 25m", preview.text)
+        self.assertEqual(self._post(request_id, form, "/confirm").status_code, 302)
+        [correction] = self.database.corrections
+        self.assertEqual(correction["event_timestamp"], datetime(2026, 10, 26, 13, 35))
+        [line] = self._lines(request_id)
+        self.assertEqual(line["hr_event_time"], datetime(2026, 10, 26, 13, 35))
+        [event] = [e for e in self.database.fix_request_events(request_id) if e["kind"] == "line_approved"]
+        self.assertEqual(event["old_value"]["event_time"], datetime(2026, 10, 26, 13, 40))
+        self.assertEqual(event["new_value"]["correction"]["event_timestamp"], datetime(2026, 10, 26, 13, 35))
+        self.assertIn("Missed swipe-in at 13:35: approved", self._decision_mail()["text_body"])
+
+    def test_change_decisions_returns_to_the_form_with_the_edits(self) -> None:
+        request_id = self._file()
+        self._sign_in(self.hari)
+        line_id = self._lines(request_id)[0]["id"]
+        form = {**self._approve_all(request_id), f"line-{line_id}-time": "13:35", "action": "edit"}
+        page = self._post(request_id, form)
+        self.assertEqual(page.status_code, 200)
+        self.assertIn('value="13:35"', page.text)
+        self.assertEqual(self.database.corrections, [])
+
+    def test_day_changed_since_report_warns_and_still_approves(self) -> None:
+        request_id = self._file()
+        self.database.insert_punches([_punch_row("a-new", datetime(2026, 10, 26, 15, 0), "entry", uid="118")])
+        self._sign_in(self.hari)
+        self.assertIn("Day changed since report", self.client.get(f"/fixes/review/{request_id}").text)
+        self.assertEqual(self._post(request_id, self._approve_all(request_id), "/confirm").status_code, 302)
+        self.assertEqual(self.database.fix_request(request_id)["status"], "approved")
+        self.assertNotIn("Day changed since report", self.client.get(f"/fixes/review/{request_id}").text)
+
+    def test_a_line_whose_swipe_is_gone_is_flagged(self) -> None:
+        request_id = self._file({"kind": "flip", "target_fingerprint": "a-last", "direction": "entry",
+                                 "event_time": datetime(2026, 10, 26, 17, 0)})
+        self.database.punches = [p for p in self.database.punches if p["fingerprint"] != "a-last"]
+        self._sign_in(self.hari)
+        self.assertIn("The swipe this line points to no longer exists",
+                      self.client.get(f"/fixes/review/{request_id}").text)
+
+    def test_bad_time_and_long_note_rerender_the_form(self) -> None:
+        request_id = self._file()
+        self._sign_in(self.hari)
+        line_id = self._lines(request_id)[0]["id"]
+        bad = self._post(request_id, {**self._approve_all(request_id), f"line-{line_id}-time": "25:99"})
+        self.assertEqual(bad.status_code, 400)
+        self.assertIn("Enter a time like 13:40.", bad.text)
+        long_note = self._post(request_id, {**self._approve_all(request_id), "note": "x" * 501}, "/confirm")
+        self.assertEqual(long_note.status_code, 400)
+        self.assertIn("Keep the note to 500 characters", long_note.text)
+        self.assertEqual(self.database.corrections, [])
+
+    # --- Rejecting ----------------------------------------------------------
+
+    def test_reject_needs_a_note_and_the_note_reaches_the_employee(self) -> None:
+        request_id = self._file()
+        self._sign_in(self.hari)
+        line_id = self._lines(request_id)[0]["id"]
+        form = {f"line-{line_id}-decision": "rejected", f"line-{line_id}-time": "13:40", f"line-{line_id}-dir": "in"}
+        for step in ("", "/confirm"):
+            refused = self._post(request_id, form, step)
+            self.assertEqual(refused.status_code, 400)
+            self.assertIn("Add a note for the employee", refused.text)
+        self.assertEqual(self.database.fix_request(request_id)["status"], "pending")
+        form["note"] = "The reader log shows you outside until 15:00."
+        self.assertEqual(self._post(request_id, form, "/confirm").status_code, 302)
+        self.assertIn("Saved. 0 lines approved, 1 rejected.", self._flash())
+        self.assertEqual(self.database.corrections, [])
+        self.assertEqual(self.database.fix_request(request_id)["status"], "rejected")
+        # Alert suppression reads the day's request statuses: rejected never re-alerts.
+        self.assertEqual(self.database.fix_request_days([self.asha["id"]], self.DAY, self.DAY),
+                         {(self.asha["id"], self.DAY): ["rejected"]})
+        mail = self._decision_mail()
+        self.assertIn("wasn't approved", mail["subject"])
+        self.assertIn("The reader log shows you outside until 15:00.", mail["text_body"])
+
+    def test_mixed_decisions_give_partial(self) -> None:
+        request_id = self._file({"kind": "add_in", "event_time": datetime(2026, 10, 26, 13, 40)},
+                                {"kind": "ignore", "target_fingerprint": "a-in",
+                                 "event_time": datetime(2026, 10, 26, 9, 0)})
+        self._sign_in(self.hari)
+        add, ignore = self._lines(request_id)
+        form = {**self._approve_all(request_id), f"line-{ignore['id']}-decision": "rejected", "note": "Keep 09:00."}
+        self.assertEqual(self._post(request_id, form, "/confirm").status_code, 302)
+        self.assertEqual(self.database.fix_request(request_id)["status"], "partial")
+        self.assertEqual([c["kind"] for c in self.database.corrections], ["add"])
+        self.assertIn("Saved. 1 line approved, 1 rejected.", self._flash())
+        self.assertIn("partly approved", self._decision_mail()["subject"])
+
+    # --- Who can approve ----------------------------------------------------
+
+    def test_hr_sees_their_own_request_read_only(self) -> None:
+        self.database.insert_punches([_punch_row("h-in", datetime(2026, 10, 26, 9, 0), "entry", uid="300")])
+        request_id = self._file(person=self.hari)
+        self._sign_in(self.hari)
+        page = self.client.get(f"/fixes/review/{request_id}")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("This is your own request", page.text)
+        self.assertNotIn('name="line-', page.text)
+        form = self._approve_all(request_id)
+        self.assertEqual(self._post(request_id, form).status_code, 403)
+        self.assertEqual(self._post(request_id, form, "/confirm").status_code, 403)
+        self.assertEqual(self.database.corrections, [])
+        # Hari is the only HR user, so the admin decides it.
+        self._sign_in(self.admin)
+        self.assertIn('name="line-', self.client.get(f"/fixes/review/{request_id}").text)
+        self.assertEqual(self._post(request_id, form, "/confirm").status_code, 302)
+        self.assertEqual(self.database.fix_request(request_id)["status"], "approved")
+
+    def test_admin_cannot_approve_while_another_hr_user_exists(self) -> None:
+        request_id = self._file()
+        self._sign_in(self.admin)
+        page = self.client.get(f"/fixes/review/{request_id}")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("Admins approve only when no HR user", page.text)
+        self.assertNotIn('name="line-', page.text)
+        self.assertEqual(self._post(request_id, self._approve_all(request_id), "/confirm").status_code, 403)
+        self.assertEqual(self.database.fix_request(request_id)["status"], "pending")
+
+    def test_admin_never_approves_their_own_request(self) -> None:
+        self.database.set_employee_role(self.hari["id"], "employee")
+        request_id = self._file(person=self.admin)
+        self._sign_in(self.admin)
+        self.assertIn("This is your own request", self.client.get(f"/fixes/review/{request_id}").text)
+        self.assertEqual(self._post(request_id, self._approve_all(request_id), "/confirm").status_code, 403)
+
+    def test_managers_and_employees_get_403(self) -> None:
+        request_id = self._file()
+        for person in (self.boss, self.asha):
+            self._sign_in(person)
+            csrf = self._csrf()
+            self.assertEqual(self.client.get("/fixes/review").status_code, 403)
+            self.assertEqual(self.client.get(f"/fixes/review/{request_id}").status_code, 403)
+            for step in ("", "/confirm"):
+                response = self.client.post(f"/fixes/review/{request_id}{step}",
+                                            data={"csrf": csrf, **self._approve_all(request_id)})
+                self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.database.corrections, [])
+
+    def test_confirm_needs_csrf(self) -> None:
+        request_id = self._file()
+        self._sign_in(self.hari)
+        response = self.client.post(f"/fixes/review/{request_id}/confirm", data=self._approve_all(request_id))
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.database.corrections, [])
+
+    # --- Concurrency --------------------------------------------------------
+
+    def test_two_hr_users_confirming_the_same_line_make_one_correction(self) -> None:
+        gita = self._person("301", "Gita HR", "hr")
+        request_id = self._file()
+        other = self.app.test_client()
+        self._sign_in(self.hari)
+        self._sign_in(gita, client=other)
+        form = self._approve_all(request_id)
+        self.assertEqual(self._post(request_id, form, "/confirm").status_code, 302)
+        self.assertEqual(self._post(request_id, form, "/confirm", client=other).status_code, 302)
+        self.assertEqual(len(self.database.corrections), 1)
+        page = self._flash(client=other)
+        self.assertIn("Nothing was saved.", page)
+        self.assertIn("already decided by Hari HR", page)
+        self.assertEqual(len([m for m in self.database.outbox if m["recipients"] == ["asha@example.com"]]), 1)
+
+    # --- List and nav -------------------------------------------------------
+
+    def test_list_shows_pending_then_decisions_and_empty_states(self) -> None:
+        self._sign_in(self.hari)
+        page = self.client.get("/fixes/review").text
+        self.assertIn("No fix requests waiting.", page)
+        self.assertIn("No decisions yet.", page)
+        request_id = self._file()
+        page = self.client.get("/fixes/review").text
+        self.assertIn("Asha Rao", page)
+        self.assertIn(f'href="/fixes/review/{request_id}"', page)
+        self.assertIn("Waiting for review", page)
+        self.assertNotIn("No fix requests waiting.", page)
+        self._post(request_id, self._approve_all(request_id), "/confirm")
+        page = self.client.get("/fixes/review").text
+        self.assertIn("No fix requests waiting.", page)
+        self.assertIn('class="chip chip-ok">Approved</span>', page)
+
+    def test_nav_badge_counts_pending_requests_for_hr_and_admin(self) -> None:
+        self._file()
+        self.database.insert_punches([_punch_row("h-in", datetime(2026, 10, 26, 9, 0), "entry", uid="300")])
+        self._file(person=self.hari)
+        for person in (self.hari, self.admin):
+            self._sign_in(person)
+            nav = self.client.get("/day").text.split('<nav aria-label="Main">')[1].split("</nav>")[0]
+            self.assertIn('aria-label="Fix requests, 2 pending"', nav)
+            self.assertIn('aria-hidden="true">2</span>', nav)
+        self._sign_in(self.asha)
+        self.assertNotIn("Fix requests", self.client.get("/day").text)
+
+    # --- Sign-in deep link --------------------------------------------------
+
+    def test_signed_out_hr_follows_the_email_link_to_the_request(self) -> None:
+        request_id = self._file()
+        path = f"/fixes/review/{request_id}"
+        response = self.client.get(path)
+        self.assertEqual(response.status_code, 302)
+        signin_url = response.headers["Location"]
+        self.assertIn("/signin?next=", signin_url)
+        self.assertIn(f'name="next" value="{path}"', self.client.get(signin_url).text)
+        code_page = self.client.post("/signin", data={"email": self.hari["email"], "next": path})
+        self.assertIn(f'name="next" value="{path}"', code_page.text)
+        verify = self.client.post("/signin/verify", data={"code": self.captured["code"], "next": path})
+        self.assertEqual(verify.status_code, 302)
+        self.assertEqual(verify.headers["Location"], path)
+        self.assertIn("Missed swipe-in at 13:40", self.client.get(path).text)
+
+    def test_off_site_next_is_ignored(self) -> None:
+        for target in ("https://evil.example.com/x", "//evil.example.com/x", "/\t/evil.example.com"):
+            with self.subTest(target=target):
+                self.client.post("/signout")
+                page = self.client.get("/signin", query_string={"next": target}).text
+                self.assertNotIn('name="next"', page)
+                self.client.post("/signin", data={"email": self.hari["email"], "next": target})
+                verify = self.client.post("/signin/verify", data={"code": self.captured["code"], "next": target})
+                self.assertEqual(verify.status_code, 302)
+                self.assertEqual(verify.headers["Location"], "/team")

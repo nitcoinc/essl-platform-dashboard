@@ -98,6 +98,14 @@ def create_app(database: Database | None = None) -> Flask:
         return {"nav_issue_count": people_routes.issue_count()}
 
     @app.context_processor
+    def fix_review_badge() -> dict:
+        # HR and admin see how many fix requests wait on the Fix requests entry.
+        employee = g.get("employee")
+        if not access.can_view_fix_reviews(employee) or _htmx_partial():
+            return {}
+        return {"nav_fix_count": database.pending_fix_request_count()}
+
+    @app.context_processor
     def sync_health_indicator() -> dict:
         # Admin only (R4); status files are re-read per page, which is cheap.
         employee = g.get("employee")

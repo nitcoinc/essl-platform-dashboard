@@ -76,3 +76,29 @@ def can_archive(actor: dict, target: dict) -> tuple[str, int] | None:
     if target["role"] == "admin" and actor["role"] != "admin":
         return "Only an admin can archive or restore an admin.", 403
     return None
+
+
+# --- Fix requests (KTD6) ------------------------------------------------------
+
+FIX_REVIEW_ROLES = ("hr", "admin")
+
+
+def can_view_fix_reviews(actor: dict | None) -> bool:
+    """HR and admins open the fix review pages; deciding is can_approve_fix."""
+    return actor is not None and actor["role"] in FIX_REVIEW_ROLES
+
+
+def can_approve_fix(actor: dict | None, request: dict, database) -> bool:
+    """KTD6: HR decides, never the requester. An admin who is not the
+    requester decides only while no active HR user other than the requester
+    exists. Database.decide_fix_lines re-checks the requester rule."""
+    if actor is None or request is None:
+        return False
+    requester = request["employee_id"]
+    if actor["id"] == requester:
+        return False
+    if actor["role"] == "hr":
+        return True
+    if actor["role"] == "admin":
+        return not any(person["id"] != requester for person in database.active_hr_users())
+    return False

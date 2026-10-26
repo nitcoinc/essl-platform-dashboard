@@ -381,12 +381,16 @@ def new_request(
     lines: Sequence[FixLine],
     note: str | None = None,
     review_url: str | None = None,
+    for_hr: bool = False,
 ) -> RenderedEmail:
     """Notification of a new fix request.
 
-    With review_url: the HR variant, with a "Review request" button.
-    Without: the manager FYI variant, which states HR will decide.
+    for_hr (or a review_url): the variant for the people who decide. With a
+    review_url it carries a "Review request" button; without one (no
+    ESSL_PUBLIC_URL) it points to Fix requests in the dashboard instead.
+    Otherwise: the manager FYI variant, which states HR will decide.
     """
+    for_hr = for_hr or bool(review_url)
     day = fmt_day(work_day)
     name = _one_line(employee_name)
     subject = f"Fix request from {name} for {day}"
@@ -395,6 +399,11 @@ def new_request(
     note = (note or "").strip()
     if review_url:
         closing = "Please review it and approve or reject each change."
+    elif for_hr:
+        closing = (
+            "Please review it and approve or reject each change. "
+            "Open Fix requests in the dashboard to review it."
+        )
     else:
         closing = (
             "This is for your information only. HR will review the request "
