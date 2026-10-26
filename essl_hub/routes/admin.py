@@ -10,6 +10,18 @@ from datetime import timedelta
 from flask import Blueprint, Response, abort, g, redirect, render_template, request, url_for
 
 from .. import access, config, hashing
+from ..collectors import DOOR_REQUEST_TTL
+from ..db import DUPLICATE_WINDOW_MAX
+from ..door_params import (
+    PANEL_WIDE,
+    PER_DOOR,
+    DoorParamError,
+    key_label,
+    lock_count_of,
+    param_for,
+    validate_request,
+    writable_keys,
+)
 from .common import (
     _ago,
     _day_start_hour,
@@ -37,6 +49,25 @@ DEVICE_FAMILIES = {
 
 # Collector reads device rows every poll (ESSL_COLLECTOR_INTERVAL_SECONDS, 60s), plus margin.
 PICKUP_MINUTES = 2
+
+C3_PROTOCOL = "c3-pullsdk"
+# Quick-swipe window presets (U5); 0 counts every swipe.
+WINDOW_PRESETS = (0, 5, 10, 60)
+# Pre-implementation Check: the C3's directions are trusted after U3, the
+# X990 has none, so a double tap there needs a small window.
+WINDOW_ADVICE = {
+    C3_PROTOCOL: "Recommended for this C3: 10 s.",
+    "zk-attendance": "Recommended for the X990: 5-10 s. It records no direction, so a "
+    "double tap inside the window is not counted.",
+}
+_INTEGER = re.compile(r"-?\d+")
+# Door request outcomes as the card names them (door_params result JSON).
+DOOR_OUTCOME_LABELS = {
+    "applied": "Applied",
+    "unchanged": "Already set",
+    "failed": "Failed",
+    "not_attempted": "Not attempted",
+}
 
 
 def _validate_connection(
@@ -95,6 +126,7 @@ def _device_rows() -> list[dict]:
     # collector (or its host) has stopped, not that the device is idle.
     now = _now_naive()
     stale_after = timedelta(seconds=2 * config.heartbeat_write_seconds())
+    interval = config.collector_interval_seconds()
     rows = []
     for device in database.devices():
         checked = device.get("last_attempt")
@@ -110,9 +142,142 @@ def _device_rows() -> list[dict]:
                 "pending": not retired
                 and updated is not None
                 and (checked is None or checked < updated),
+                # Retired devices are not polled, so they get no door section.
+                "door": None if retired else _door_view(device, now, interval),
             }
         )
     return rows
+
+
+def _strict_int(raw: object) -> int | None:
+    """Whole number from form text; "1.5", "abc", "0,ComPwd=1" are None."""
+    text = str(raw or "").strip()
+    return int(text) if _INTEGER.fullmatch(text) else None
+
+
+def _dict_or_none(value: object) -> dict | None:
+    return value if isinstance(value, dict) else None
+
+
+def _value_text(key: str, value: object, *, unit: bool = False) -> str:
+    """A door value as the card shows it: the option label for a select
+    ("On"), the number otherwise; "not read" for a missing value."""
+    if value is None:
+        return "not read"
+    found = param_for(key)
+    if found is not None:
+        param = found[0]
+        labels = dict(param.options)
+        if value in labels:
+            return labels[value]
+        if unit and param.unit:
+            return f"{value} {param.unit}"
+    return str(value)
+
+
+def _door_field(key: str, param, value: object) -> dict:
+    return {
+        "key": key,
+        "label": param.label,
+        "full_label": key_label(key),
+        "value": value,
+        "text": _value_text(key, value, unit=True),
+        "param": param,
+    }
+
+
+def _door_close_note(params: dict, lock_count: int) -> str:
+    """One line on whether the panel can issue door-close denials at all
+    (Pre-implementation Check 3: no sensor, InterLock 0, AntiPassback 0)."""
+    sensors = [
+        str(door) for door in range(1, lock_count + 1)
+        if params.get(f"Door{door}SensorType") not in (None, 0)
+    ]
+    interlock, antipassback = params.get("InterLock"), params.get("AntiPassback")
+    if not sensors and interlock == 0 and antipassback == 0:
+        return ("Last read: no door sensor, InterLock 0, AntiPassback 0. "
+                "The panel issues no door-close denials, so this has no effect today.")
+    sensor_text = f"door sensor on door {', '.join(sensors)}" if sensors else "no door sensor"
+    return (f"Last read: {sensor_text}, InterLock {_value_text('InterLock', interlock)}, "
+            f"AntiPassback {_value_text('AntiPassback', antipassback)}.")
+
+
+def _door_view(device: dict, now, interval_seconds: int) -> dict | None:
+    """The C3 door-settings card state (U8), following the plan's diagram:
+
+    - ``not_read``: no read and no request; the edit form stays hidden.
+    - ``pending``: a request waits for the collector; ``stale`` once it is
+      older than two poll intervals (it still expires after 15 minutes).
+    - ``applied``: the last request applied, or a plain read.
+    - ``failed`` / ``expired``: per-key results, with Dismiss.
+
+    None for a device that is not a C3."""
+    if device.get("protocol") != C3_PROTOCOL:
+        return None
+    params = _dict_or_none(device.get("door_params"))
+    result = _dict_or_none(device.get("door_params_result"))
+    previous = _dict_or_none(device.get("door_params_previous"))
+    requested_at = device.get("door_params_requested_at")
+    lock_count = lock_count_of(params)
+
+    result_state = (result or {}).get("state")
+    if requested_at is not None:
+        state = "pending"
+    elif result_state in ("failed", "expired"):
+        state = result_state
+    elif result is not None or params is not None:
+        state = "applied"
+    else:
+        state = "not_read"
+
+    results = []
+    for key, entry in ((result or {}).get("keys") or {}).items():
+        entry = entry if isinstance(entry, dict) else {}
+        outcome = entry.get("outcome") or ""
+        results.append({
+            "label": key_label(key),
+            "old": _value_text(key, entry.get("old")),
+            "new": _value_text(key, entry.get("new")),
+            "outcome": outcome,
+            "outcome_label": DOOR_OUTCOME_LABELS.get(outcome, outcome),
+            "message": entry.get("message") or "",
+        })
+
+    panel, doors = [], []
+    if params is not None and lock_count is not None:
+        panel = [_door_field(p.name, p, params.get(p.name)) for p in PANEL_WIDE]
+        for door in range(1, lock_count + 1):
+            fields = [_door_field(f"Door{door}{p.name}", p, params.get(f"Door{door}{p.name}"))
+                      for p in PER_DOOR]
+            doors.append({
+                "number": door,
+                "fields": fields,
+                # Display only; never written (R12).
+                "verify_type": params.get(f"Door{door}VerifyType"),
+            })
+
+    return {
+        "state": state,
+        "result_state": result_state,
+        "result_message": (result or {}).get("message") or "",
+        "finished_at": (result or {}).get("finished_at"),
+        "results": results,
+        "requested_at": requested_at,
+        "stale": state == "pending"
+        and now - requested_at > timedelta(seconds=2 * interval_seconds),
+        "expires_at": requested_at + DOOR_REQUEST_TTL if requested_at is not None else None,
+        "params": params,
+        "read_at": device.get("door_params_read_at"),
+        "lock_count": lock_count,
+        "reader_count": (params or {}).get("ReaderCount"),
+        "panel": panel,
+        "doors": doors,
+        # KTD8: no form before the first read; none while a request waits.
+        "can_change": lock_count is not None and state != "pending",
+        "has_snapshot": bool(previous),
+        "snapshot_for": device.get("door_params_previous_for"),
+        "close_note": _door_close_note(params, lock_count) if lock_count else None,
+    }
 
 
 def _render_devices(status: int = 200, **overrides):
@@ -137,6 +302,18 @@ def _render_devices(status: int = 200, **overrides):
         "added": request.args.get("added"),
         "retired": request.args.get("retired"),
         "enabled": request.args.get("enabled"),
+        "policy_saved": request.args.get("policy"),
+        "policy_error": None,
+        "policy_error_id": None,
+        "policy_form": None,
+        "window_presets": WINDOW_PRESETS,
+        "window_max": DUPLICATE_WINDOW_MAX,
+        "window_advice": WINDOW_ADVICE,
+        "door_filed": request.args.get("door"),
+        "door_dismissed": request.args.get("dismissed"),
+        "door_error": None,
+        "door_error_id": None,
+        "poll_minutes": max(1, round(config.collector_interval_seconds() / 60)),
     }
     context.update(overrides)
     return render_template("devices.html", **context), status
@@ -299,6 +476,190 @@ def devices_enable(device_id: str):
             )
         database.set_device_retired(device_id, False)
     return redirect(url_for("admin.devices_view", enabled=device_id))
+
+
+def _device_anchor(device_id: str) -> str:
+    return f"device-{device_id}-name"
+
+
+@bp.post("/devices/<device_id>/policy")
+@_role_required("admin")
+def devices_policy(device_id: str):
+    """U5: quick-swipe window (every device) and, on a C3, Wait for door close."""
+    _require_csrf()
+    device = database.device_by_id(device_id)
+    if device is None:
+        abort(404)
+    raw = request.form.get("window_seconds") or ""
+    # Unchecked boxes are not posted; the X990 has no door-close setting.
+    wait = (
+        request.form.get("wait_for_door_close") is not None
+        if device["protocol"] == C3_PROTOCOL
+        else True
+    )
+    window = _strict_int(raw)
+    if window is None or not 0 <= window <= DUPLICATE_WINDOW_MAX:
+        return _render_devices(
+            status=400,
+            policy_error=f"Enter whole seconds from 0 to {DUPLICATE_WINDOW_MAX}.",
+            policy_error_id=device_id,
+            policy_form={"window_seconds": raw, "wait_for_door_close": wait},
+        )
+    database.set_device_policy(
+        device_id, window_seconds=window, wait_for_door_close=wait, actor_id=g.employee["id"]
+    )
+    return redirect(url_for("admin.devices_view", policy=device_id, _anchor=_device_anchor(device_id)))
+
+
+def _door_device(device_id: str) -> dict:
+    """Door routes act on a polled C3 only; anything else is not found."""
+    device = database.device_by_id(device_id)
+    if device is None or device.get("protocol") != C3_PROTOCOL or device.get("retired_at"):
+        abort(404)
+    return device
+
+
+def _door_error(device_id: str, message: str, status: int):
+    return _render_devices(status=status, door_error=message, door_error_id=device_id)
+
+
+def _door_pending_error(device: dict):
+    """One request at a time: a new one waits until the pending one is
+    applied, expires or is dismissed."""
+    if device.get("door_params_requested_at") is None:
+        return None
+    return _door_error(
+        device["id"],
+        "A door request is already waiting for the collector. Wait for it, or dismiss it.",
+        409,
+    )
+
+
+def _door_confirm(device: dict, request_map: dict[str, int], *, restore: bool):
+    current = _dict_or_none(device.get("door_params")) or {}
+    changes = [
+        {
+            "label": key_label(key),
+            "old": _value_text(key, current.get(key)),
+            "new": _value_text(key, value),
+        }
+        for key, value in request_map.items()
+    ]
+    endpoint = "admin.devices_door_restore" if restore else "admin.devices_door"
+    return render_template(
+        "device_door_confirm.html",
+        employee=g.employee,
+        csrf_token=g.csrf_token,
+        device=device,
+        changes=changes,
+        # Restore recomputes from the snapshot on confirm, so it posts no values.
+        fields={} if restore else request_map,
+        action=url_for(endpoint, device_id=device["id"]),
+        restore=restore,
+        snapshot_for=device.get("door_params_previous_for"),
+        poll_minutes=max(1, round(config.collector_interval_seconds() / 60)),
+    )
+
+
+@bp.post("/devices/<device_id>/door")
+@_role_required("admin")
+def devices_door(device_id: str):
+    """U8: changed door settings go to a confirm page; ``confirm=1`` files
+    them for the collector. Every posted key and value goes through
+    validate_request (KTD8), so a non-whitelisted key is refused, not dropped."""
+    _require_csrf()
+    device = _door_device(device_id)
+    current = _dict_or_none(device.get("door_params")) or {}
+    lock_count = lock_count_of(current)
+    if lock_count is None:
+        return _door_error(device_id, "Read the door settings from the device first.", 400)
+    busy = _door_pending_error(device)
+    if busy is not None:
+        return busy
+
+    allowed = set(writable_keys(lock_count))
+    changes: dict[str, object] = {}
+    for key in request.form:
+        if key in ("csrf", "confirm"):
+            continue
+        values = request.form.getlist(key)
+        raw = values[0].strip() if len(values) == 1 else ",".join(values)
+        if key in allowed and raw == "":
+            continue  # left blank: unchanged
+        parsed = _strict_int(raw)
+        value = parsed if parsed is not None else raw
+        if key in allowed and value == current.get(key):
+            continue
+        changes[key] = value
+    try:
+        clean = validate_request(changes, lock_count)
+    except DoorParamError as exc:
+        return _door_error(device_id, str(exc), 400)
+    if not clean:
+        return _door_error(device_id, "Nothing changed.", 200)
+
+    if request.form.get("confirm") != "1":
+        return _door_confirm(device, clean, restore=False)
+    database.file_door_request(device_id, clean, kind="door_write", actor_id=g.employee["id"])
+    return redirect(url_for("admin.devices_view", door=device_id, _anchor=_device_anchor(device_id)))
+
+
+@bp.post("/devices/<device_id>/door/read")
+@_role_required("admin")
+def devices_door_read(device_id: str):
+    _require_csrf()
+    device = _door_device(device_id)
+    busy = _door_pending_error(device)
+    if busy is not None:
+        return busy
+    database.file_door_request(device_id, {}, kind="door_read", actor_id=g.employee["id"])
+    return redirect(url_for("admin.devices_view", door=device_id, _anchor=_device_anchor(device_id)))
+
+
+@bp.post("/devices/<device_id>/door/restore")
+@_role_required("admin")
+def devices_door_restore(device_id: str):
+    """KTD9: put back the values read before the last write, for the
+    whitelisted keys that now differ. Same confirm page as a change."""
+    _require_csrf()
+    device = _door_device(device_id)
+    previous = _dict_or_none(device.get("door_params_previous"))
+    if not previous:
+        abort(400)
+    busy = _door_pending_error(device)
+    if busy is not None:
+        return busy
+    current = _dict_or_none(device.get("door_params")) or {}
+    lock_count = lock_count_of(current)
+    if lock_count is None:
+        return _door_error(device_id, "Read the door settings from the device first.", 400)
+    restore = {
+        key: previous[key]
+        for key in writable_keys(lock_count)
+        if key in previous and previous[key] != current.get(key)
+    }
+    try:
+        clean = validate_request(restore, lock_count)
+    except DoorParamError as exc:
+        return _door_error(device_id, str(exc), 400)
+    if not clean:
+        return _door_error(device_id, "The door settings already match the saved values.", 200)
+
+    if request.form.get("confirm") != "1":
+        return _door_confirm(device, clean, restore=True)
+    database.file_door_request(device_id, clean, kind="door_restore", actor_id=g.employee["id"])
+    return redirect(url_for("admin.devices_view", door=device_id, _anchor=_device_anchor(device_id)))
+
+
+@bp.post("/devices/<device_id>/door/dismiss")
+@_role_required("admin")
+def devices_door_dismiss(device_id: str):
+    """Clear a failed or expired result (or a request the collector never
+    picked up); files nothing."""
+    _require_csrf()
+    _door_device(device_id)
+    database.dismiss_door_request(device_id, actor_id=g.employee["id"])
+    return redirect(url_for("admin.devices_view", dismissed=device_id, _anchor=_device_anchor(device_id)))
 @bp.get("/health")
 @_login_required
 def health_view():

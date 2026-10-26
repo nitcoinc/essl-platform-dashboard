@@ -879,6 +879,35 @@ input[type="file"]::file-selector-button {
 .device-retired > summary { margin-bottom: var(--s4); color: var(--text-secondary); }
 .device-retired .device { opacity: 0.85; }
 
+/* Devices: swipe policy (U5) and C3 door settings (U8). Values are label/value
+   lists, not tables, so a door group stacks at 375px without side scroll. */
+.summary-value { margin-left: var(--s1); font-weight: 400; color: var(--text-tertiary); }
+.policy-window { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2); }
+.policy-window input { width: 96px; }
+.policy-presets { display: flex; flex-wrap: wrap; gap: var(--s2); }
+.policy-presets[hidden] { display: none; }
+.door-settings { display: flex; flex-direction: column; gap: var(--s3); min-width: 0; border-top: 1px solid var(--border); padding-top: var(--s3); }
+.door-head { display: flex; justify-content: space-between; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+.door-head h3 { font-size: var(--text-13); color: var(--text-secondary); }
+.door-state { font-size: var(--text-13); color: var(--text-secondary); }
+.door-results, .door-changes { display: grid; gap: var(--s2); margin: 0; padding: 0; list-style: none; font-size: var(--text-13); }
+.door-results li { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s1) var(--s2); }
+.door-result-what, .door-changes li { font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.door-result-message { flex-basis: 100%; color: var(--text-secondary); }
+.door-changes li { padding: var(--s2) var(--s3); background: var(--surface-sunken); border-radius: var(--radius); font-size: var(--text-14); }
+.door-group > summary { cursor: pointer; width: fit-content; font-size: var(--text-13); font-weight: 500; color: var(--text-secondary); border-radius: var(--radius-sm); }
+.door-group > summary:hover { color: var(--text); }
+.door-values { display: grid; gap: var(--s1); margin: var(--s2) 0 0; font-size: var(--text-13); }
+.door-values > div { display: flex; justify-content: space-between; gap: var(--s3); padding: var(--s1) 0; border-bottom: 1px solid var(--border); }
+.door-values dt { min-width: 0; color: var(--text-secondary); }
+.door-values dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+.door-actions { display: flex; flex-wrap: wrap; gap: var(--s2); }
+.door-form fieldset { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 170px), 1fr)); gap: var(--s3); min-width: 0; margin: 0; padding: var(--s3); border: 1px solid var(--border); border-radius: var(--radius); }
+.door-form legend { padding: 0 var(--s1); font-size: var(--text-13); font-weight: 600; }
+.door-form select { width: 100%; min-width: 0; }
+.door-confirm { max-width: 640px; }
+.door-confirm-actions { display: flex; flex-wrap: wrap; gap: var(--s2); }
+
 /* ---------- Quick-view drawer (U6) ----------
    A right-anchored sheet. The dialog has no padding so a click on the dialog
    itself is a backdrop click; content lives in .qv-panel. */

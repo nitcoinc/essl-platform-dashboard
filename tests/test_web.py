@@ -2205,6 +2205,383 @@ class AdminDeviceLifecycleTest(AdminDeviceEditTest):
         self.assertIsNone(self.database.device_by_id("uppal-x990")["retired_at"])
 
 
+# A four-door C3 as the Pre-implementation Check read it.
+_C3_PARAMS = {
+    "LockCount": 4, "ReaderCount": 4, "AntiPassback": 0, "InterLock": 0,
+    **{
+        f"Door{door}{name}": value
+        for door in range(1, 5)
+        for name, value in (
+            ("Intertime", 1), ("Drivertime", 5), ("Detectortime", 15),
+            ("CloseAndLock", 1), ("SensorType", 0), ("VerifyType", 7),
+        )
+    },
+}
+_C3 = "gachibowli-c3-400"
+_X990 = "uppal-x990"
+
+
+class _DeviceSettingsBase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.app, self.database = _make_app()
+        self.admin = self._person("1", "Admin", "admin@example.com", "admin")
+        self.client = self.app.test_client()
+        self._sign_in("admin@example.com")
+
+    def _person(self, uid: str, name: str, email: str, role: str) -> dict:
+        self.database.upsert_employee(device_user_id=uid, name=name, email=email)
+        person = self.database.employee_by_email(email)
+        self.database.set_employee_role(person["id"], role)
+        return person
+
+    def _sign_in(self, email: str) -> None:
+        from essl_hub import mail as mail_module
+
+        captured = {}
+        original = mail_module.send_login_code
+        mail_module.send_login_code = lambda e, c: captured.update(code=c)
+        self.addCleanup(lambda: setattr(mail_module, "send_login_code", original))
+        self.client.post("/signin", data={"email": email})
+        self.client.post("/signin/verify", data={"code": captured["code"]})
+
+    def _sign_in_as(self, role: str) -> None:
+        self.client.post("/signout")
+        self._person("900", f"Priya {role}", f"{role}@example.com", role)
+        self._sign_in(f"{role}@example.com")
+
+    def _csrf(self) -> str:
+        html = self.client.get("/settings").text
+        marker = 'name="csrf" value="'
+        start = html.index(marker) + len(marker)
+        return html[start : html.index('"', start)]
+
+    def _card(self, device_id: str, html: str | None = None) -> str:
+        html = html if html is not None else self.client.get("/devices").text
+        start = html.index(f'aria-labelledby="device-{device_id}-name"')
+        end = html.find('<section class="device"', start)
+        return html[start : end if end != -1 else len(html)]
+
+    def _read_c3(self, **overrides) -> dict:
+        device = self.database.device_by_id(_C3)
+        device["door_params"] = {**_C3_PARAMS, **overrides}
+        device["door_params_read_at"] = _ist_now() - timedelta(minutes=30)
+        return device
+
+
+class DevicePolicyTest(_DeviceSettingsBase):
+    """U5: per-device quick-swipe window and, on a C3, Wait for door close."""
+
+    def _policy(self, device_id: str, **data):
+        data.setdefault("csrf", self._csrf())
+        return self.client.post(f"/devices/{device_id}/policy", data=data)
+
+    def test_admin_saves_window_with_one_audit_row(self) -> None:
+        response = self._policy(_X990, window_seconds="10")
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(f"policy={_X990}", response.headers["Location"])
+        device = self.database.device_by_id(_X990)
+        self.assertEqual(device["duplicate_window_seconds"], 10)
+        self.assertIsNotNone(device["policy_updated_at"])
+        rows = self.database.device_change_rows
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["kind"], rows[0]["actor_employee_id"]), ("policy", self.admin["id"]))
+        self.assertEqual(rows[0]["new_value"]["duplicate_window_seconds"], 10)
+        page = self.client.get(f"/devices?policy={_X990}").text
+        self.assertIn("Swipe policy saved", self._card(_X990, page))
+
+    def test_window_zero_and_max_are_accepted(self) -> None:
+        for raw, expected in (("0", 0), (" 300 ", 300)):
+            with self.subTest(raw=raw):
+                self.assertEqual(self._policy(_X990, window_seconds=raw).status_code, 302)
+                self.assertEqual(self.database.device_by_id(_X990)["duplicate_window_seconds"], expected)
+
+    def test_invalid_window_rerenders_with_error_and_stores_nothing(self) -> None:
+        for raw in ("abc", "1.5", "400", "-1", "", "10s"):
+            with self.subTest(raw=raw):
+                response = self._policy(_X990, window_seconds=raw)
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("Enter whole seconds from 0 to 300.", self._card(_X990, response.text))
+                self.assertEqual(self.database.device_by_id(_X990)["duplicate_window_seconds"], 60)
+        self.assertEqual(self.database.device_change_rows, [])
+
+    def test_hr_and_manager_are_forbidden(self) -> None:
+        for role in ("hr", "manager"):
+            with self.subTest(role=role):
+                self._sign_in_as(role)
+                response = self.client.post(
+                    f"/devices/{_X990}/policy", data={"csrf": "x", "window_seconds": "10"})
+                self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.database.device_by_id(_X990)["duplicate_window_seconds"], 60)
+
+    def test_missing_csrf_is_rejected(self) -> None:
+        response = self.client.post(f"/devices/{_X990}/policy", data={"window_seconds": "10"})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.database.device_change_rows, [])
+
+    def test_unknown_device_is_404(self) -> None:
+        self.assertEqual(self._policy("ghost", window_seconds="10").status_code, 404)
+
+    def test_only_the_c3_card_has_the_door_close_checkbox(self) -> None:
+        page = self.client.get("/devices").text
+        self.assertIn("Swipe policy", self._card(_X990, page))
+        self.assertIn("0 = count every swipe", self._card(_X990, page))
+        self.assertNotIn('name="wait_for_door_close"', self._card(_X990, page))
+        self.assertIn('name="wait_for_door_close"', self._card(_C3, page))
+        self.assertIn("Recommended for this C3: 10 s.", self._card(_C3, page))
+        self.assertIn("Recommended for the X990: 5-10 s.", self._card(_X990, page))
+
+    def test_x990_post_never_starts_door_denials(self) -> None:
+        self._policy(_X990, window_seconds="10")  # no checkbox posted
+        self.assertIsNone(self.database.device_by_id(_X990)["door_denied_since"])
+
+    def test_unchecking_door_close_starts_denials_and_rechecking_clears(self) -> None:
+        self.assertIn(" checked", self._card(_C3).split('name="wait_for_door_close"')[1][:120])
+        self._policy(_C3, window_seconds="10")
+        since = self.database.device_by_id(_C3)["door_denied_since"]
+        self.assertIsNotNone(since)
+        card = self._card(_C3)
+        self.assertIn("Counting door denials since", card)
+        self.assertNotIn(" checked", card.split('name="wait_for_door_close"')[1][:120])
+        self._policy(_C3, window_seconds="10", wait_for_door_close="1")
+        self.assertIsNone(self.database.device_by_id(_C3)["door_denied_since"])
+        self.assertEqual(len(self.database.device_change_rows), 2)
+
+    def test_door_close_note_follows_the_last_read(self) -> None:
+        self.assertNotIn("Last read:", self._card(_C3))
+        self._read_c3()
+        self.assertIn("Last read: no door sensor, InterLock 0, AntiPassback 0.", self._card(_C3))
+        self._read_c3(Door2SensorType=2, InterLock=1)
+        self.assertIn("door sensor on door 2, InterLock Doors 1 and 2", self._card(_C3))
+
+
+class DeviceDoorSettingsTest(_DeviceSettingsBase):
+    """U8: reading, changing, restoring and dismissing C3 door parameters."""
+
+    def _door(self, path: str = "", device_id: str = _C3, **data):
+        data.setdefault("csrf", self._csrf())
+        return self.client.post(f"/devices/{device_id}/door{path}", data=data)
+
+    def _form(self, **changes) -> dict:
+        # What the browser posts: every writable key at its current value.
+        from essl_hub.door_params import writable_keys
+
+        form = {key: str(_C3_PARAMS[key]) for key in writable_keys(4)}
+        form.update(changes)
+        return form
+
+    def test_x990_card_has_no_door_section_and_door_routes_404(self) -> None:
+        self.assertNotIn("Door settings", self._card(_X990))
+        self.assertIn("Door settings", self._card(_C3))
+        for path in ("", "/read", "/restore", "/dismiss"):
+            with self.subTest(path=path):
+                self.assertEqual(self._door(path, device_id=_X990).status_code, 404)
+                self.assertEqual(self._door(path, device_id="ghost").status_code, 404)
+        self.assertEqual(self.database.device_change_rows, [])
+
+    def test_before_any_read_form_is_hidden_and_read_is_offered(self) -> None:
+        card = self._card(_C3)
+        self.assertIn("Not read yet. Use Read from device.", card)
+        self.assertNotIn("Change door settings", card)
+        self.assertIn(f"/devices/{_C3}/door/read", card)
+        response = self._door("", **self._form(Door1Intertime="0"))
+        self.assertEqual(response.status_code, 400)
+        self.assertIsNone(self.database.device_by_id(_C3)["door_params_request"])
+
+    def test_read_from_device_files_an_empty_request(self) -> None:
+        response = self._door("/read")
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(f"door={_C3}", response.headers["Location"])
+        device = self.database.device_by_id(_C3)
+        self.assertEqual(device["door_params_request"], {})
+        self.assertEqual(self.database.device_change_rows[-1]["kind"], "door_read")
+        card = self._card(_C3)
+        self.assertIn("Pending", card)
+        self.assertIn("applied on the device's next poll (about 1 min)", card)
+
+    def test_values_show_labels_per_door(self) -> None:
+        self._read_c3()
+        card = self._card(_C3)
+        for text in ("Door 1", "Door 4", "Punch interval", "Lock when door closes",
+                     "Verify mode (read only)", "Panel-wide", "Anti-passback", "Busy door: 0"):
+            self.assertIn(text, card)
+        self.assertIn("Change door settings", card)
+        self.assertNotIn('name="Door1VerifyType"', card)
+        self.assertNotIn('name="LockCount"', card)
+
+    def test_change_confirms_then_files_with_audit(self) -> None:
+        self._read_c3()
+        response = self._door("", **self._form(Door1Intertime="0"))
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Punch interval, door 1: 1 → 0", response.text)
+        self.assertEqual(response.text.count("→"), 1)
+        self.assertIsNone(self.database.device_by_id(_C3)["door_params_request"])
+        self.assertEqual(self.database.device_change_rows, [])
+
+        response = self._door("", Door1Intertime="0", confirm="1")
+        self.assertEqual(response.status_code, 302)
+        device = self.database.device_by_id(_C3)
+        self.assertEqual(device["door_params_request"], {"Door1Intertime": 0})
+        (row,) = self.database.device_change_rows
+        self.assertEqual((row["kind"], row["actor_employee_id"]), ("door_write", self.admin["id"]))
+        self.assertEqual((row["old_value"], row["new_value"]), ({"Door1Intertime": 1}, {"Door1Intertime": 0}))
+        card = self._card(_C3)
+        self.assertIn("Pending", card)
+        self.assertIn(f"Requested {device['door_params_requested_at'].strftime('%H:%M')}", card)
+        self.assertNotIn("Change door settings", card)
+
+    def test_select_change_shows_option_labels(self) -> None:
+        self._read_c3()
+        response = self._door("", **self._form(Door2CloseAndLock="0"))
+        self.assertIn("Lock when door closes, door 2: On → Off", response.text)
+
+    def test_nothing_changed_files_nothing(self) -> None:
+        self._read_c3()
+        response = self._door("", **self._form())
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Nothing changed.", self._card(_C3, response.text))
+        self.assertIsNone(self.database.device_by_id(_C3)["door_params_request"])
+
+    def test_forbidden_keys_and_smuggled_values_are_400(self) -> None:
+        self._read_c3()
+        cases = [
+            {"ComPwd": "1"},
+            {"Door1Intertime": "0,ComPwd=1"},
+            {"Door1VerifyType": "4"},
+            {"IPAddress": "1"},
+            {"Door5Intertime": "0"},
+            {"Door1Intertime": "11"},
+            {"Door1Intertime": "1.5"},
+        ]
+        for extra in cases:
+            for confirm in ({}, {"confirm": "1"}):
+                with self.subTest(extra=extra, confirm=confirm):
+                    response = self._door("", **self._form(**extra), **confirm)
+                    self.assertEqual(response.status_code, 400)
+        self.assertIsNone(self.database.device_by_id(_C3)["door_params_request"])
+        self.assertEqual(self.database.device_change_rows, [])
+
+    def test_restore_without_snapshot_is_disabled_and_400(self) -> None:
+        self._read_c3()
+        card = self._card(_C3)
+        button = card.split("/door/restore")[1].split("</form>")[0]
+        self.assertIn("disabled", button)
+        self.assertEqual(self._door("/restore").status_code, 400)
+        self.assertEqual(self._door("/restore", confirm="1").status_code, 400)
+        self.assertIsNone(self.database.device_by_id(_C3)["door_params_request"])
+
+    def test_restore_lists_only_differing_whitelisted_keys(self) -> None:
+        device = self._read_c3(Door1Intertime=0, Door2Drivertime=5)
+        device["door_params_previous"] = {
+            **_C3_PARAMS, "Door2Drivertime": 8, "Door1VerifyType": 4, "LockCount": 2,
+            "ComPwd": 5,
+        }
+        device["door_params_previous_for"] = _ist_now() - timedelta(hours=1)
+        card = self._card(_C3)
+        self.assertNotIn("disabled", card.split("/door/restore")[1].split("</form>")[0])
+        response = self._door("/restore")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Punch interval, door 1: 0 → 1", response.text)
+        self.assertIn("Unlock time, door 2: 5 → 8", response.text)
+        self.assertEqual(response.text.count("→"), 2)
+        self.assertIsNone(device["door_params_request"])
+
+        response = self._door("/restore", confirm="1")
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(device["door_params_request"], {"Door1Intertime": 1, "Door2Drivertime": 8})
+        self.assertEqual(self.database.device_change_rows[-1]["kind"], "door_restore")
+
+    def test_failed_shows_per_key_messages_and_dismiss_clears(self) -> None:
+        device = self._read_c3()
+        device["door_params_result"] = {
+            "state": "failed", "requested_at": "2026-10-26 10:00:00",
+            "finished_at": "2026-10-26 10:00:41", "message": "",
+            "keys": {
+                "Door1Intertime": {"outcome": "failed", "old": 1, "new": 0, "now": 1,
+                                   "message": "panel kept 1"},
+                "Door2Intertime": {"outcome": "not_attempted", "old": 1, "new": 0,
+                                   "now": None, "message": ""},
+            },
+        }
+        card = self._card(_C3)
+        self.assertIn("Failed", card)
+        self.assertIn("Punch interval, door 1: 1 → 0", card)
+        self.assertIn("panel kept 1", card)
+        self.assertIn("Not attempted", card)
+        self.assertIn(f"/devices/{_C3}/door/dismiss", card)
+
+        response = self._door("/dismiss")
+        self.assertEqual(response.status_code, 302)
+        self.assertIsNone(device["door_params_result"])
+        self.assertIsNone(device["door_params_request"])
+        (row,) = self.database.device_change_rows
+        self.assertEqual(row["kind"], "door_dismiss")
+        self.assertNotIn("panel kept 1", self._card(_C3))
+
+    def test_pending_past_two_polls_says_collector_has_not_picked_it_up(self) -> None:
+        device = self._read_c3()
+        device["door_params_request"] = {"Door1Intertime": 0}
+        device["door_params_requested_at"] = _ist_now()
+        self.assertNotIn("Collector has not picked this up.", self._card(_C3))
+        device["door_params_requested_at"] = _ist_now() - timedelta(minutes=3)
+        card = self._card(_C3)
+        self.assertIn("Collector has not picked this up.", card)
+        self.assertIn("Cancel request", card)
+
+    def test_a_pending_request_blocks_another(self) -> None:
+        device = self._read_c3()
+        device["door_params_request"] = {}
+        device["door_params_requested_at"] = _ist_now()
+        self.assertEqual(self._door("/read").status_code, 409)
+        self.assertEqual(self._door("", **self._form(Door1Intertime="0"), confirm="1").status_code, 409)
+        self.assertEqual(device["door_params_request"], {})
+
+    def test_hr_is_forbidden_on_every_door_route(self) -> None:
+        self._read_c3()
+        self._sign_in_as("hr")
+        for path in ("", "/read", "/restore", "/dismiss"):
+            with self.subTest(path=path):
+                response = self.client.post(f"/devices/{_C3}/door{path}", data={"csrf": "x"})
+                self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.database.device_change_rows, [])
+
+    def test_missing_csrf_is_400_on_every_door_route(self) -> None:
+        self._read_c3()
+        for path in ("", "/read", "/restore", "/dismiss"):
+            with self.subTest(path=path):
+                response = self.client.post(
+                    f"/devices/{_C3}/door{path}", data={"Door1Intertime": "0", "confirm": "1"})
+                self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.database.device_change_rows, [])
+
+
+class DoorViewStateTest(unittest.TestCase):
+    """The card-state helper behind U8, one case per diagram state."""
+
+    def _view(self, **device):
+        from essl_hub.routes.admin import _door_view
+
+        base = {"protocol": "c3-pullsdk", **_V7_DEVICE_DEFAULTS}
+        return _door_view({**base, **device}, datetime(2026, 10, 26, 10, 10), 60)
+
+    def test_states(self) -> None:
+        requested = datetime(2026, 10, 26, 10, 0)
+        self.assertIsNone(self._view(protocol="zk-attendance"))
+        self.assertEqual(self._view()["state"], "not_read")
+        self.assertFalse(self._view()["can_change"])
+        pending = self._view(door_params_request={}, door_params_requested_at=requested)
+        self.assertEqual((pending["state"], pending["stale"]), ("pending", True))
+        self.assertEqual(pending["expires_at"], datetime(2026, 10, 26, 10, 15))
+        read = self._view(door_params=_C3_PARAMS, door_params_result={"state": "read", "keys": {}})
+        self.assertEqual((read["state"], read["can_change"], len(read["doors"])), ("applied", True, 4))
+        for state in ("failed", "expired"):
+            view = self._view(door_params=_C3_PARAMS, door_params_result={"state": state, "keys": {}})
+            self.assertEqual(view["state"], state)
+        pending_after_read = self._view(
+            door_params=_C3_PARAMS, door_params_requested_at=requested,
+            door_params_request={"Door1Intertime": 0})
+        self.assertFalse(pending_after_read["can_change"])
+
+
 class AdminRosterUploadTest(unittest.TestCase):
     """Covers R1, R2, R18: .xlsx roster uploads and every per-file failure."""
 

@@ -4,6 +4,161 @@
 {% macro when(value) -%}
 {% if value %}<time datetime="{{ value.isoformat() }}">{{ value.strftime('%d %b, %H:%M') }}</time>{% else %}<span class="muted">Never</span>{% endif %}
 {%- endmacro %}
+{% macro swipe_policy(row) %}
+{% set device = row.device %}
+{% set d = device.id %}
+{% set is_c3 = device.protocol == 'c3-pullsdk' %}
+{% set p_err = policy_error_id == d %}
+{% set waits = (policy_form.wait_for_door_close if p_err else device.door_denied_since is none) %}
+<details class="device-edit"{% if p_err %} open{% endif %}>
+  <summary>Swipe policy <span class="summary-value">{{ device.duplicate_window_seconds }} s{% if is_c3 %}, {{ 'waits for door close' if device.door_denied_since is none else 'counts door denials' }}{% endif %}</span></summary>
+  <form method="post" action="{{ url_for('admin.devices_policy', device_id=d) }}" class="device-edit-form">
+    <input type="hidden" name="csrf" value="{{ csrf_token }}">
+    {% if p_err %}{{ ui.inline_error(policy_error, d ~ '-window-error') }}{% endif %}
+    <div class="field">
+      <label for="{{ d }}-window">Quick-swipe window (seconds)</label>
+      <div class="policy-window">
+        <input id="{{ d }}-window" name="window_seconds" type="number" min="0" max="{{ window_max }}" step="1" inputmode="numeric" required list="window-presets"
+          value="{{ policy_form.window_seconds if p_err else device.duplicate_window_seconds }}"
+          aria-describedby="{{ d }}-window-hint{% if p_err %} {{ d }}-window-error{% endif %}"{% if p_err %} aria-invalid="true"{% endif %}>
+        <div class="policy-presets" role="group" aria-label="Presets" data-window-presets hidden>
+          {% for preset in window_presets %}<button class="button button-secondary button-sm" type="button" data-window-preset="{{ preset }}" aria-controls="{{ d }}-window">{{ 'Off' if preset == 0 else preset ~ ' s' }}</button>{% endfor %}
+        </div>
+      </div>
+      <p class="field-hint" id="{{ d }}-window-hint">0 = count every swipe. Applies to every past and future day for this device; reports recalculate. {{ window_advice.get(device.protocol, '') }}</p>
+    </div>
+    {% if is_c3 %}
+    <div class="field">
+      <label class="check-label">
+        <input type="checkbox" name="wait_for_door_close" value="1" aria-describedby="{{ d }}-wait-hint"{% if waits %} checked{% endif %}>
+        Wait for door close
+      </label>
+      <p class="field-hint" id="{{ d }}-wait-hint">Unchecking counts the interlock and anti-passback denials the panel still issues, from now on; past denials are not added. Setting InterLock and AntiPassback to 0 stops those denials at the source.</p>
+      {% if row.door and row.door.close_note %}<p class="field-hint">{{ row.door.close_note }}</p>{% endif %}
+      {% if device.door_denied_since %}<p class="field-hint">Counting door denials since {{ when(device.door_denied_since) }}.</p>{% endif %}
+    </div>
+    {% endif %}
+    <p class="field-hint">Last changed: {% if device.policy_updated_at %}{{ when(device.policy_updated_at) }}{% else %}never (default 60 s){% endif %}</p>
+    <div>{{ ui.button('Save swipe policy', 'primary', type='submit') }}</div>
+  </form>
+</details>
+{% endmacro %}
+{% macro door_value_list(fields) %}
+<dl class="door-values">
+  {% for f in fields %}<div><dt>{{ f.label }}</dt><dd>{{ f.text }}</dd></div>{% endfor %}
+  {{ caller() if caller is defined }}
+</dl>
+{% endmacro %}
+{% macro door_input(d, f) %}
+{% set p = f.param %}
+<div class="field">
+  <label for="{{ d }}-{{ f.key }}">{{ p.label }}{% if p.unit %} ({{ p.unit }}){% endif %}</label>
+  {% if p.options %}
+  <select id="{{ d }}-{{ f.key }}" name="{{ f.key }}" aria-describedby="{{ d }}-{{ f.key }}-hint">
+    {% if f.value is not none and f.value not in p.options|map('first')|list %}<option value="{{ f.value }}" selected>{{ f.value }} (current)</option>{% endif %}
+    {% for value, label in p.options %}<option value="{{ value }}"{% if value == f.value %} selected{% endif %}>{{ label }}</option>{% endfor %}
+  </select>
+  {% else %}
+  <input id="{{ d }}-{{ f.key }}" name="{{ f.key }}" type="number" min="{{ p.minimum }}" max="{{ p.maximum }}" step="1" inputmode="numeric" value="{{ f.value if f.value is not none else '' }}" aria-describedby="{{ d }}-{{ f.key }}-hint">
+  {% endif %}
+  <p class="field-hint" id="{{ d }}-{{ f.key }}-hint">Busy door: {{ p.suggestion }}</p>
+</div>
+{% endmacro %}
+{% macro door_settings(row) %}
+{% set device = row.device %}
+{% set door = row.door %}
+{% set d = device.id %}
+<section class="door-settings" aria-labelledby="{{ d }}-door-title">
+  <div class="door-head">
+    <h3 id="{{ d }}-door-title">Door settings</h3>
+    {% if door.state == 'pending' %}{{ ui.chip('Pending', 'info') }}
+    {% elif door.state == 'failed' %}{{ ui.chip('Failed', 'bad') }}
+    {% elif door.state == 'expired' %}{{ ui.chip('Expired, not applied', 'warn') }}
+    {% elif door.state == 'applied' and door.result_state == 'applied' %}{{ ui.chip('Applied', 'ok') }}
+    {% elif door.state == 'applied' %}{{ ui.chip('Read', 'neutral') }}
+    {% else %}{{ ui.chip('Not read') }}{% endif %}
+  </div>
+  {% if door_filed == d %}<p class="device-note" role="status">{{ ui.icon('check') }}<span>Request filed. The collector applies it on the device's next poll.</span></p>{% endif %}
+  {% if door_dismissed == d %}<p class="device-note" role="status">{{ ui.icon('check') }}<span>Dismissed.</span></p>{% endif %}
+  {% if door_error_id == d %}{{ ui.inline_error(door_error) }}{% endif %}
+
+  {% if door.state == 'not_read' %}
+  <p class="door-state">Not read yet. Use Read from device.</p>
+  {% elif door.state == 'pending' %}
+  <p class="door-state">Requested {{ door.requested_at.strftime('%H:%M') }}, applied on the device's next poll (about {{ poll_minutes }} min).</p>
+  {% if door.stale %}<p class="device-warning">{{ ui.icon('triangle-alert') }}<span>Collector has not picked this up. The request expires at {{ door.expires_at.strftime('%H:%M') }} if it is still not applied.</span></p>{% endif %}
+  {% elif door.result_state %}
+  <p class="door-state">
+    {% if door.state == 'failed' %}The last request failed{% elif door.state == 'expired' %}The last request expired and was not applied{% elif door.result_state == 'read' %}Read from device{% else %}Applied{% endif %}{% if door.finished_at %} at {{ door.finished_at[11:16] if door.finished_at is string else door.finished_at.strftime('%H:%M') }}{% endif %}.
+    {% if door.result_message %}{{ door.result_message }}{% endif %}
+  </p>
+  {% endif %}
+  {% if door.results and door.state != 'pending' %}
+  <ul class="door-results" aria-label="Result per setting">
+    {% for r in door.results %}
+    <li>
+      <span class="door-result-what">{{ r.label }}: {{ r.old }} → {{ r.new }}</span>
+      {{ ui.chip(r.outcome_label, 'ok' if r.outcome in ('applied', 'unchanged') else ('bad' if r.outcome == 'failed' else 'neutral')) }}
+      {% if r.message %}<span class="door-result-message">{{ r.message }}</span>{% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+
+  {% if door.params and door.lock_count %}
+  <p class="field-hint">Read from the panel {{ when(door.read_at) }}. {{ door.lock_count }} {{ 'door' if door.lock_count == 1 else 'doors' }}{% if door.reader_count is not none %}, {{ door.reader_count }} readers{% endif %}.</p>
+  <details class="door-group">
+    <summary>Panel-wide</summary>
+    {{ door_value_list(door.panel) }}
+  </details>
+  {% for group in door.doors %}
+  <details class="door-group">
+    <summary>Door {{ group.number }} <span class="summary-value">punch interval {{ group.fields[0].text }}</span></summary>
+    {% call door_value_list(group.fields) %}<div><dt>Verify mode (read only)</dt><dd>{{ group.verify_type if group.verify_type is not none else 'not read' }}</dd></div>{% endcall %}
+  </details>
+  {% endfor %}
+  {% endif %}
+
+  <div class="door-actions">
+    <form method="post" action="{{ url_for('admin.devices_door_read', device_id=d) }}">
+      <input type="hidden" name="csrf" value="{{ csrf_token }}">
+      {{ ui.button('Read from device', 'secondary', type='submit', size='sm', attrs='disabled' if door.state == 'pending' else '') }}
+    </form>
+    <form method="post" action="{{ url_for('admin.devices_door_restore', device_id=d) }}">
+      <input type="hidden" name="csrf" value="{{ csrf_token }}">
+      {{ ui.button('Restore previous values', 'secondary', type='submit', size='sm', attrs=('disabled aria-describedby="' ~ d ~ '-restore-hint"') if not door.has_snapshot else ('disabled' if door.state == 'pending' else '')) }}
+    </form>
+    {% if door.state in ('failed', 'expired') or door.stale %}
+    <form method="post" action="{{ url_for('admin.devices_door_dismiss', device_id=d) }}">
+      <input type="hidden" name="csrf" value="{{ csrf_token }}">
+      {{ ui.button('Dismiss' if door.state != 'pending' else 'Cancel request', 'tertiary', type='submit', size='sm') }}
+    </form>
+    {% endif %}
+  </div>
+  {% if not door.has_snapshot %}<p class="field-hint" id="{{ d }}-restore-hint">Restore needs values saved before a change; none yet.</p>{% endif %}
+
+  {% if door.can_change %}
+  <details class="device-edit">
+    <summary>Change door settings</summary>
+    <form method="post" action="{{ url_for('admin.devices_door', device_id=d) }}" class="device-edit-form door-form">
+      <input type="hidden" name="csrf" value="{{ csrf_token }}">
+      <p class="field-hint">You confirm the changes on the next page. Nothing is sent until then.</p>
+      <fieldset>
+        <legend>Panel-wide</legend>
+        {% for f in door.panel %}{{ door_input(d, f) }}{% endfor %}
+      </fieldset>
+      {% for group in door.doors %}
+      <fieldset>
+        <legend>Door {{ group.number }}</legend>
+        {% for f in group.fields %}{{ door_input(d, f) }}{% endfor %}
+      </fieldset>
+      {% endfor %}
+      <div>{{ ui.button('Review changes', 'primary', type='submit') }}</div>
+    </form>
+  </details>
+  {% endif %}
+</section>
+{% endmacro %}
 {% macro device_card(row) %}
 {% set device = row.device %}
   {% set errored = device_error_id == device.id %}
@@ -28,6 +183,7 @@
 
     {% if added == device.id %}<p class="device-note" role="status">{{ ui.icon('check') }}<span>Added as <code>{{ device.id }}</code>. The collector picks it up within about {{ pickup_minutes }} minutes.</span></p>{% endif %}
     {% if enabled == device.id %}<p class="device-note" role="status">{{ ui.icon('check') }}<span>Re-enabled. Polling resumes within about {{ pickup_minutes }} minutes.</span></p>{% endif %}
+    {% if policy_saved == device.id %}<p class="device-note" role="status">{{ ui.icon('check') }}<span>Swipe policy saved. Day views and reports use it now.</span></p>{% endif %}
     {% if saved == device.id %}<p class="device-note" role="status">{{ ui.icon('check') }}<span>Saved. The collector applies it within about {{ pickup_minutes }} minutes.</span></p>{% endif %}
     {% if row.stale %}
     <p class="device-warning" role="status">{{ ui.icon('triangle-alert') }}<span>Last checked {{ row.checked_ago }}. The collector writes at least every {{ stale_minutes // 2 }} minutes, so it may have stopped. Check the collector container on the office host.</span></p>
@@ -78,6 +234,8 @@
         <div>{{ ui.button('Save connection', 'primary', type='submit') }}</div>
       </form>
     </details>
+    {{ swipe_policy(row) }}
+    {% if row.door %}{{ door_settings(row) }}{% endif %}
     <form method="post" action="{{ url_for('admin.devices_retire', device_id=device.id) }}" class="device-actions"
       data-confirm="Retire {{ device.site }} {{ device.model }}? The collector stops polling it. Its punches stay." onsubmit="return confirm(this.dataset.confirm)">
       <input type="hidden" name="csrf" value="{{ csrf_token }}">
@@ -140,6 +298,22 @@
   </div>
 </details>
 {% endif %}
+
+<datalist id="window-presets">{% for preset in window_presets %}<option value="{{ preset }}">{{ 'Off' if preset == 0 else preset ~ ' s' }}</option>{% endfor %}</datalist>
+<script>
+  // Progressive enhancement: preset buttons fill the window input. Without JS
+  // the input's datalist offers the same values.
+  document.querySelectorAll("[data-window-presets]").forEach(function (group) {
+    group.hidden = false;
+    group.addEventListener("click", function (event) {
+      var button = event.target.closest("[data-window-preset]");
+      if (!button) return;
+      var input = document.getElementById(button.getAttribute("aria-controls"));
+      input.value = button.dataset.windowPreset;
+      input.focus();
+    });
+  });
+</script>
 
 {% if issue_count %}
 <div class="notice">{{ ui.icon('circle-alert') }}<p><strong>{{ issue_count }} device ID {{ 'issue' if issue_count == 1 else 'issues' }} to check.</strong> <a href="{{ url_for('people.id_issues_view') }}">Review ID issues</a></p></div>
