@@ -145,5 +145,108 @@ class ResendSendTest(unittest.TestCase):
         self.assertIn("RESEND_API_KEY", str(ctx.exception))
 
 
+class GenericSendTest(unittest.TestCase):
+    RESEND_ENV = {
+        "ESSL_MAIL_PROVIDER": "resend",
+        "RESEND_API_KEY": "k",
+        "RESEND_FROM_ADDRESS": "a@b.c",
+    }
+
+    def _fake_resend(self):
+        return types.SimpleNamespace(
+            api_key=None, Emails=types.SimpleNamespace(send=MagicMock())
+        )
+
+    def test_dedupes_case_insensitively_keeping_first_spelling_and_order(self) -> None:
+        self.assertEqual(
+            mail.dedupe_recipients(
+                ["HR@Example.com", "boss@example.com", " hr@example.com ", "", "Boss@example.com"]
+            ),
+            ["HR@Example.com", "boss@example.com"],
+        )
+
+    def test_resend_sends_once_with_html_logo_and_auto_submitted(self) -> None:
+        fake = self._fake_resend()
+        with patch.dict(os.environ, self.RESEND_ENV, clear=True), patch.dict(
+            sys.modules, {"resend": fake}
+        ):
+            sent_to = mail.send_email(
+                "Subject\r\nBcc: evil@example.com",
+                ["A@example.com", "a@example.com", "b@example.com"],
+                "plain body",
+                "<p>html</p>",
+                reply_to="hr@example.com",
+            )
+        self.assertEqual(sent_to, ["A@example.com", "b@example.com"])
+        payload = fake.Emails.send.call_args[0][0]
+        self.assertEqual(payload["to"], ["A@example.com", "b@example.com"])
+        self.assertEqual(payload["subject"], "Subject Bcc: evil@example.com")
+        self.assertEqual(payload["headers"], {"Auto-Submitted": "auto-generated"})
+        self.assertEqual(payload["reply_to"], "hr@example.com")
+        self.assertEqual(payload["html"], "<p>html</p>")
+        self.assertEqual(payload["attachments"][0]["content_id"], mail.LOGO_CID)
+
+    def test_resend_without_html_sends_text_only(self) -> None:
+        fake = self._fake_resend()
+        with patch.dict(os.environ, self.RESEND_ENV, clear=True), patch.dict(
+            sys.modules, {"resend": fake}
+        ):
+            mail.send_email("S", ["a@example.com"], "plain")
+        payload = fake.Emails.send.call_args[0][0]
+        self.assertNotIn("html", payload)
+        self.assertNotIn("attachments", payload)
+        self.assertNotIn("reply_to", payload)
+
+    def test_resend_failure_raises_mailerror(self) -> None:
+        fake = self._fake_resend()
+        fake.Emails.send.side_effect = RuntimeError("boom")
+        with patch.dict(os.environ, self.RESEND_ENV, clear=True), patch.dict(
+            sys.modules, {"resend": fake}
+        ):
+            with self.assertRaises(mail.MailError) as ctx:
+                mail.send_email("S", ["a@example.com"], "plain", "<p>h</p>")
+        self.assertIn("boom", str(ctx.exception))
+        self.assertNotIn("sign-in", str(ctx.exception))
+
+    def test_cloudflare_sends_text_only_with_headers(self) -> None:
+        with patch.dict(os.environ, CloudflareSendTest.ENV, clear=True), patch(
+            "urllib.request.urlopen", return_value=_fake_response({"success": True})
+        ) as opener:
+            mail.send_email(
+                "S", ["a@example.com", "b@example.com"], "plain", "<p>h</p>",
+                reply_to="hr@example.com",
+            )
+        body = json.loads(opener.call_args[0][0].data)
+        self.assertEqual(body["to"], ["a@example.com", "b@example.com"])
+        self.assertEqual(body["text"], "plain")
+        self.assertNotIn("html", body)
+        self.assertEqual(body["reply_to"], "hr@example.com")
+        self.assertEqual(body["headers"], {"Auto-Submitted": "auto-generated"})
+
+    def test_cloudflare_failure_raises_mailerror(self) -> None:
+        payload = {"success": False, "errors": [{"code": 10102}]}
+        with patch.dict(os.environ, CloudflareSendTest.ENV, clear=True), patch(
+            "urllib.request.urlopen", return_value=_fake_response(payload)
+        ):
+            with self.assertRaises(mail.MailError):
+                mail.send_email("S", ["a@example.com"], "plain")
+
+    def test_console_prints_and_sends_nothing(self) -> None:
+        with patch.dict(os.environ, {"ESSL_MAIL_PROVIDER": "console"}, clear=True), \
+                patch.object(mail, "_send_via_resend") as resend, \
+                patch.object(mail, "_send_via_cloudflare") as cloudflare, \
+                patch("builtins.print") as printed:
+            mail.send_email("Hello", ["a@example.com"], "the body")
+        resend.assert_not_called()
+        cloudflare.assert_not_called()
+        self.assertIn("the body", printed.call_args.args[0])
+        self.assertIn("Hello", printed.call_args.args[0])
+
+    def test_no_recipients_raises_mailerror(self) -> None:
+        with patch.dict(os.environ, {"ESSL_MAIL_PROVIDER": "console"}, clear=True):
+            with self.assertRaises(mail.MailError):
+                mail.send_email("S", ["", "  "], "plain")
+
+
 if __name__ == "__main__":
     unittest.main()
