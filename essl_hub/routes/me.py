@@ -8,7 +8,7 @@ from flask import Blueprint, abort, g, make_response, redirect, render_template,
 
 from .. import access, charts, config, day_story, export
 from ..db import device_ids_of
-from ..hours import work_day, work_day_window
+from ..hours import reportable, work_day, work_day_window
 from .common import (
     ROLE_LABELS,
     _TZ,
@@ -24,7 +24,6 @@ from .common import (
     _vary_htmx,
     database,
 )
-from .fixes import reportable
 
 bp = Blueprint("me", __name__)
 

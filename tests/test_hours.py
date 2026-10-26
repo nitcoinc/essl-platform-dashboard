@@ -3,7 +3,19 @@ from __future__ import annotations
 import unittest
 from datetime import date, datetime, timedelta
 
-from essl_hub.hours import Punch, Segment, compute_day, work_day, work_day_window
+from essl_hub.hours import (
+    DEFAULT_DAY_START_HOUR,
+    DEFAULT_TARGET_MINUTES,
+    REPORT_DAYS,
+    Punch,
+    Segment,
+    compute_day,
+    read_day_start_hour,
+    read_target_minutes,
+    reportable,
+    work_day,
+    work_day_window,
+)
 
 
 def _t(hour: int, minute: int, day: int = 10) -> datetime:
@@ -291,3 +303,46 @@ class ExactSecondsTest(unittest.TestCase):
     def test_incomplete_day_has_no_gross(self) -> None:
         result = compute_day([Punch(_t(9, 0), "exit")], target_minutes=480)
         self.assertEqual((result.status, result.gross_seconds, result.effective_seconds), ("incomplete", None, 0))
+
+
+class _Settings:
+    """Just enough of Database for the setting readers."""
+
+    def __init__(self, **values) -> None:
+        self.values = values
+
+    def setting(self, key, default=None):
+        return self.values.get(key, default)
+
+
+class StoredSettingsTest(unittest.TestCase):
+    def test_corrupt_day_start_hour_falls_back_to_the_default(self) -> None:
+        self.assertEqual(read_day_start_hour(_Settings()), DEFAULT_DAY_START_HOUR)
+        for stored in (None, "abc", "25", "-1", "24", "6.5"):
+            with self.subTest(stored=stored):
+                database = _Settings(day_start_hour=stored)
+                self.assertEqual(read_day_start_hour(database), DEFAULT_DAY_START_HOUR)
+        for stored, hour in (("0", 0), ("23", 23), (" 4 ", 4)):
+            with self.subTest(stored=stored):
+                self.assertEqual(read_day_start_hour(_Settings(day_start_hour=stored)), hour)
+
+    def test_corrupt_target_minutes_falls_back_to_the_default(self) -> None:
+        self.assertEqual(read_target_minutes(_Settings()), DEFAULT_TARGET_MINUTES)
+        for stored in (None, "abc", "-1", "0", "1441", "7.5"):
+            with self.subTest(stored=stored):
+                database = _Settings(daily_target_minutes=stored)
+                self.assertEqual(read_target_minutes(database), DEFAULT_TARGET_MINUTES)
+        # The settings page stores 1 minute to 24 hours.
+        for stored, minutes in (("25", 25), ("1", 1), ("1440", 1440), ("450", 450)):
+            with self.subTest(stored=stored):
+                self.assertEqual(read_target_minutes(_Settings(daily_target_minutes=stored)), minutes)
+
+
+class ReportableTest(unittest.TestCase):
+    def test_last_seven_work_days_today_included(self) -> None:
+        today = date(2026, 10, 27)
+        self.assertEqual(REPORT_DAYS, 7)
+        self.assertTrue(reportable(today, today))
+        self.assertTrue(reportable(today - timedelta(days=6), today))
+        self.assertFalse(reportable(today - timedelta(days=7), today))
+        self.assertFalse(reportable(today + timedelta(days=1), today))

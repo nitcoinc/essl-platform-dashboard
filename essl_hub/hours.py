@@ -231,11 +231,24 @@ def read_day_start_hour(database) -> int:
 
 
 def read_target_minutes(database) -> int:
-    """The stored daily target; a missing or corrupt value is the default."""
+    """The stored daily target; a missing or corrupt value (outside the
+    1 minute to 24 hours the settings page accepts) is the default."""
     try:
-        return int(database.setting("daily_target_minutes", str(DEFAULT_TARGET_MINUTES)))
+        minutes = int(database.setting("daily_target_minutes", str(DEFAULT_TARGET_MINUTES)))
     except (TypeError, ValueError):
         return DEFAULT_TARGET_MINUTES
+    return minutes if 1 <= minutes <= 24 * 60 else DEFAULT_TARGET_MINUTES
+
+
+# A work day can be reported while it is one of the last REPORT_DAYS work
+# days, today included; an emailed report link expires REPORT_DAYS after its
+# work day ends (KTD7), and the form refuses the day once it is too old.
+REPORT_DAYS = 7
+
+
+def reportable(day: date, today: date) -> bool:
+    """True while ``day`` is one of the last REPORT_DAYS work days."""
+    return 0 <= (today - day).days < REPORT_DAYS
 
 
 # KTD4: what an approved fix did to a punch row (its ``correction`` key).

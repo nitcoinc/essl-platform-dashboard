@@ -17,6 +17,7 @@ from ..db import (
     STATUS_BREAKER,
     STATUS_FAILED,
     STATUS_QUEUED,
+    STATUS_SENT,
 )
 from ..door_params import (
     DOOR_REQUEST_TTL,
@@ -360,17 +361,18 @@ ALERT_MODE_LABELS = {
 # Would-have-sent counts cover this many work days, today included (KTD11).
 ALERT_COUNT_DAYS = 7
 # How an alert row reads in the counts table, in display order.
-ALERT_BUCKETS = ("would send", "sent", STATUS_QUEUED, STATUS_FAILED, "held")
+ALERT_BUCKETS = ("would send", STATUS_SENT, STATUS_QUEUED, STATUS_FAILED, "not emailed", "held")
 
 
 def _alert_bucket(mode: str, status: str) -> str:
     """"held" is a candidate the circuit breaker stopped (KTD9); shadow rows
-    are what live mode would have sent; live rows follow their outbox row."""
+    are what live mode would have sent; live rows follow their outbox row,
+    and a live row with none (no email address) was "not emailed"."""
     if status == STATUS_BREAKER:
         return "held"
     if mode == alert_settings.MODE_SHADOW:
         return "would send"
-    return status if status in (STATUS_QUEUED, STATUS_FAILED) else "sent"
+    return status if status in (STATUS_SENT, STATUS_QUEUED, STATUS_FAILED) else "not emailed"
 
 
 def _alert_count_rows(since) -> list[dict]:

@@ -48,10 +48,10 @@ from .db import (
     Database,
     DatabaseMissing,
     OfflineError,
-    _schema_version,
     device_ids_of,
 )
 from .hours import (
+    REPORT_DAYS,
     DayResult,
     compute_day,
     counted_punches,
@@ -92,9 +92,11 @@ BASELINE_MAX_AGE = timedelta(days=6)
 # The morning job re-checks a finished day at most this often, so late data
 # is still picked up without a full reload every tick.
 MORNING_RECHECK = timedelta(minutes=30)
-# Report links live until the end of the work day + 7 days (KTD7).
-REPORT_LINK_DAYS = 7
 OUTBOX_BATCH = 50
+# One drain stops starting sends after this long, or after this many failures
+# in a row (the provider looks down); the rest wait, untouched, for next tick.
+OUTBOX_TIME_BUDGET = 45.0
+OUTBOX_MAX_CONSECUTIVE_FAILURES = 3
 
 # Settings this service writes for itself (and alert_settings.BASELINES_AT_KEY).
 BREAKER_WARNED_KEY = "alerts_breaker_warned_{kind}"
@@ -135,9 +137,11 @@ class AlertsService:
         clock: Clock = ist_now,
         send: Sender | None = None,
         status_path: str | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ):
         self.database = database
         self.clock = clock
+        self.monotonic = monotonic
         self._send = send
         self.status_path = status_path or config.collector_status_path()
         self.last_live_at: datetime | None = None
@@ -177,8 +181,7 @@ class AlertsService:
         if self._schema_ready:
             return True
         try:
-            with self.database.connect() as connection:
-                version = _schema_version(connection)
+            version = self.database.schema_version()
         except DatabaseMissing as exc:
             self._wait(f"database not set up ({exc}); waiting for one of: " + "; ".join(SETUP_COMMANDS))
             return False
@@ -274,9 +277,11 @@ class AlertsService:
     # --- Stale guard (KTD9) ------------------------------------------------
 
     def stale_reason(self, now: datetime) -> str | None:
-        """Why collector data cannot be trusted now, or None. Reads only the
-        collector status file; device last_success is not used (the collector
-        rewrites it only every 15 minutes when idle)."""
+        """Why collector data cannot be trusted now, or None. Reads the
+        collector status file and each active device's status: a device in
+        'error' is unreachable, so its punches are missing, even while the
+        collector itself polls on time. Device last_success is not used (the
+        collector rewrites it only every 15 minutes when idle)."""
         try:
             with open(self.status_path, encoding="utf-8") as handle:
                 status = json.load(handle)
@@ -295,6 +300,9 @@ class AlertsService:
             return "collector spool depth unreadable"
         if spool_depth > 0:
             return f"{spool_depth} spooled punch batch(es) not yet written"
+        unreachable = self.database.unreachable_devices()
+        if unreachable:
+            return "device(s) unreachable: " + ", ".join(unreachable)
         return None
 
     # --- Live check (R4, R6) -----------------------------------------------
@@ -470,7 +478,9 @@ class AlertsService:
                 _logger.info("shadow %s alert: employee %s (%s) on %s: %s", kind, employee["id"],
                              employee.get("name"), day.isoformat(), json.dumps(candidate.detail))
             return recorded
-        expires_at = work_day_window(day, day_start_hour)[1] + timedelta(days=REPORT_LINK_DAYS)
+        # KTD7: the link lives until the end of the work day + REPORT_DAYS;
+        # the form also refuses a day that is no longer reportable.
+        expires_at = work_day_window(day, day_start_hour)[1] + timedelta(days=REPORT_DAYS)
         token = self.database.create_report_link(employee["id"], day, expires_at=expires_at)
         rendered = candidate.render(f"{url}/fix/{token}", f"{url}/privacy")
         recorded = self.database.record_alert(
@@ -517,12 +527,22 @@ class AlertsService:
     # --- Outbox (KTD8) -----------------------------------------------------
 
     def drain_outbox(self) -> tuple[int, int]:
-        """Send every due outbox row; returns (sent, failed attempts). One
-        failure never stops the batch."""
+        """Send due outbox rows; returns (sent, failed attempts). One failure
+        never stops the batch, but OUTBOX_MAX_CONSECUTIVE_FAILURES in a row or
+        OUTBOX_TIME_BUDGET seconds end it, so a down or hung provider never
+        stalls the tick; rows not tried stay due for the next one."""
         send = self._send or mail.send_email
         reply_to = config.hr_reply_to()
-        sent = failed = 0
+        sent = failed = streak = 0
+        deadline = self.monotonic() + OUTBOX_TIME_BUDGET
         for row in self.database.due_mail(limit=OUTBOX_BATCH):
+            if streak >= OUTBOX_MAX_CONSECUTIVE_FAILURES:
+                _logger.warning("outbox drain stopped after %d failed sends in a row", streak)
+                break
+            if self.monotonic() >= deadline:
+                _logger.warning("outbox drain stopped after %.0f s; the rest go next tick",
+                                OUTBOX_TIME_BUDGET)
+                break
             try:
                 send(
                     row["subject"], list(row["recipients"]), row["text_body"] or "",
@@ -530,6 +550,7 @@ class AlertsService:
                 )
             except Exception as exc:  # noqa: BLE001 - provider errors of every kind
                 failed += 1
+                streak += 1
                 error = str(exc).strip() or type(exc).__name__
                 try:
                     status = self.database.mark_mail_failed(row["id"], error)
@@ -539,6 +560,7 @@ class AlertsService:
                 _logger.warning("sending outbox row %s failed (%s): %s", row["id"], status, error)
                 continue
             sent += 1
+            streak = 0
             try:
                 self.database.mark_mail_sent(row["id"])
             except Exception:  # noqa: BLE001

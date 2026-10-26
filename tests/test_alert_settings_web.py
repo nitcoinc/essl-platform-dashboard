@@ -117,6 +117,10 @@ class AlertSettingsWebTest(_DeviceSettingsBase):
             ("Gachibowli", "live", "shadow", "recorded", today),
             ("Gachibowli", "live", "shadow", "recorded", today - timedelta(days=1)),
             ("Gachibowli", "live", "live", "sent", today),
+            # Live, but nobody was emailed (no address): never counted as sent.
+            ("Gachibowli", "live", "live", "recorded", today),
+            ("Gachibowli", "morning", "live", "queued", today),
+            ("Gachibowli", "morning", "live", "failed", today),
             ("Gachibowli", "morning", "shadow", "breaker", today),
             ("Uppal", "morning", "shadow", "recorded", today),
             # Outside the 7-day window: not counted.
@@ -131,8 +135,8 @@ class AlertSettingsWebTest(_DeviceSettingsBase):
         self.assertIn(f"Baselines last rebuilt {computed.strftime('%d %b %Y')}", section)
         self.assertNotIn("No alerts yet", section)
         gachibowli = section[section.index(">Gachibowli<") : section.index("</tr>", section.index(">Gachibowli<"))]
-        self.assertIn("2 would send, 1 sent", gachibowli)
-        self.assertIn("1 held", gachibowli)
+        self.assertIn("2 would send, 1 sent, 1 not emailed", gachibowli)
+        self.assertIn("1 queued, 1 failed, 1 held", gachibowli)
         uppal = section[section.index(">Uppal<") : section.index("</tr>", section.index(">Uppal<"))]
         self.assertIn("1 would send", uppal)
         self.assertIn("None", uppal)

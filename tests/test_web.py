@@ -696,7 +696,12 @@ class FakeDatabase:
         latest = self.latest_fix_request(employee_id, work_day)
         if latest is not None and latest["status"] in db_module.FIX_CLOSED_STATUSES | {"pending"}:
             request_id = latest["id"]
-            existing = len(self._request_lines(request_id))
+            held = self._request_lines(request_id)
+            existing = len(held)
+            keys = {db_module._fix_line_key(line) for line in held}
+            prepared = [values for values in prepared if db_module._fix_line_key(values) not in keys]
+            if not prepared:
+                return {"request_id": request_id, "first_lines": False}
         else:
             request_id, existing = len(self.fix_requests) + 1, 0
         if existing + len(prepared) > db_module.FIX_MAX_LINES:
@@ -707,7 +712,7 @@ class FakeDatabase:
             if latest["status"] != "pending":
                 self.fix_requests[request_id].update(
                     status="pending", source=source, punch_set_hash=punch_set_hash,
-                    decided_at=None, decided_by=None)
+                    decided_at=None, decided_by=None, created_at=now)
                 self._fix_event(request_id, None, employee_id, "reopened",
                                 {"status": latest["status"]}, {"status": "pending"})
         else:
@@ -914,9 +919,15 @@ class FakeFixRequestsTest(unittest.TestCase):
         line = {"kind": "add_in", "event_time": datetime(2026, 10, 26, 13, 40)}
         first = self.db.file_fix_lines(1, self.day, [line], source="link")
         self.assertEqual(first, {"request_id": 1, "first_lines": True})
-        self.assertFalse(self.db.file_fix_lines(1, self.day, [line], source="session")["first_lines"])
+        # A double-submitted line is skipped, as in essl_hub.db.
+        self.assertFalse(self.db.file_fix_lines(1, self.day, [line], source="link")["first_lines"])
+        self.assertEqual(len(self.db.fix_request(1)["lines"]), 1)
+        later = {"kind": "add_in", "event_time": datetime(2026, 10, 26, 13, 45)}
+        self.assertFalse(self.db.file_fix_lines(1, self.day, [later], source="session")["first_lines"])
         with self.assertRaises(FixLineLimit):
-            self.db.file_fix_lines(1, self.day, [line] * 9, source="link")
+            self.db.file_fix_lines(1, self.day, [
+                {"kind": "add_out", "event_time": datetime(2026, 10, 26, 18, minute)} for minute in range(9)
+            ], source="link")
         lines = self.db.fix_request(1)["lines"]
         result = self.db.decide_fix_lines(1, [
             {"line_id": lines[0]["id"], "status": "approved"},
@@ -5201,6 +5212,70 @@ class FixReportTest(unittest.TestCase):
         self.assertNotIn(self.token, record.getMessage())
         self.assertIn("/fix/[redacted]?sent=1", record.getMessage())
 
+    def test_a_crash_on_the_link_logs_no_token(self) -> None:
+        # Flask's own "Exception on <path>" line, logged when nothing re-raises.
+        self.app.testing = False
+        with patch.object(self.database, "file_fix_lines", side_effect=RuntimeError("boom")), \
+                self.assertLogs("essl_hub.web", level="ERROR") as captured:
+            response = self._missed_in("13:40")
+        self.assertEqual(response.status_code, 500)
+        messages = [record.getMessage() for record in captured.records]
+        self.assertTrue(any("/fix/[redacted]" in message for message in messages), messages)
+        self.assertFalse(any(self.token in message for message in messages))
+
+    # --- Robustness ---------------------------------------------------------
+
+    def test_a_failed_notification_still_lands_on_sent(self) -> None:
+        with patch.object(self.database, "enqueue_mail", side_effect=RuntimeError("smtp down")), \
+                self.assertLogs("essl_hub.routes.fixes", level="ERROR"):
+            response = self._missed_in("13:40")
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], f"/fix/{self.token}?sent=1")
+        [request] = self._requests()
+        self.assertEqual(request["status"], "pending")
+        self.assertEqual(len(self.database.fix_request(request["id"])["lines"]), 1)
+
+    def test_sending_the_same_form_twice_files_one_line(self) -> None:
+        for _ in range(2):
+            self.assertEqual(self._missed_in("13:40", flip="a-out").status_code, 302)
+        [request] = self._requests()
+        lines = self.database.fix_request(request["id"])["lines"]
+        self.assertEqual([(l["kind"], l["target_fingerprint"]) for l in lines],
+                         [("add_in", None), ("flip", "a-out")])
+        self.assertEqual(len(self.database.outbox), 2)  # HR and manager, once
+
+    def test_the_twenty_first_post_to_one_link_in_an_hour_is_refused(self) -> None:
+        for n in range(20):
+            response = self.client.post(f"/fix/{self.token}", data={"action": "send"},
+                                        environ_base={"REMOTE_ADDR": f"10.0.1.{n}"})
+            self.assertEqual(response.status_code, 400)
+        response = self.client.post(f"/fix/{self.token}", data={"action": "send"},
+                                    environ_base={"REMOTE_ADDR": "10.0.2.1"})
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.headers["Retry-After"], "60")
+        other = self._link(self.bob, self.DAY)
+        response = self.client.post(f"/fix/{other}", data={"action": "send"},
+                                    environ_base={"REMOTE_ADDR": "10.0.2.2"})
+        self.assertEqual(response.status_code, 400)
+
+    def test_sliding_window_frees_hits_once_they_age_out(self) -> None:
+        from essl_hub.routes import fixes as fixes_module
+
+        clock = [1000.0]
+        window = fixes_module._SlidingWindow(2, 60)
+        with patch.object(fixes_module._clock, "monotonic", side_effect=lambda: clock[0]):
+            self.assertTrue(window.allow("k"))
+            clock[0] += 30
+            self.assertTrue(window.allow("k"))
+            self.assertFalse(window.allow("k"))
+            self.assertTrue(window.allow("other"))
+            clock[0] += 30  # the first hit is now exactly 60 s old
+            self.assertTrue(window.allow("k"))
+            self.assertFalse(window.allow("k"))
+            clock[0] += 61
+            self.assertTrue(window.allow("k"))
+            self.assertTrue(window.allow("k"))
+
 
 class FixReviewTest(unittest.TestCase):
     """U8: the HR review page, confirm-then-apply, and the sign-in deep link."""
@@ -5550,3 +5625,53 @@ class FixReviewTest(unittest.TestCase):
                 verify = self.client.post("/signin/verify", data={"code": self.captured["code"], "next": target})
                 self.assertEqual(verify.status_code, 302)
                 self.assertEqual(verify.headers["Location"], "/team")
+
+    def test_wrong_code_keeps_next_and_the_right_code_then_lands_on_it(self) -> None:
+        path = f"/fixes/review/{self._file()}"
+        self.client.post("/signin", data={"email": self.hari["email"], "next": path})
+        code = self.captured["code"]
+        wrong = "0" * len(code) if code != "0" * len(code) else "1" * len(code)
+        page = self.client.post("/signin/verify", data={"code": wrong, "next": path})
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("That code is not correct", page.text)
+        self.assertIn(f'name="next" value="{path}"', page.text)
+        verify = self.client.post("/signin/verify", data={"code": code, "next": path})
+        self.assertEqual(verify.status_code, 302)
+        self.assertEqual(verify.headers["Location"], path)
+
+    def test_signed_in_visit_to_signin_with_next_goes_there(self) -> None:
+        self._sign_in(self.hari)
+        response = self.client.get("/signin", query_string={"next": "/fixes/review"})
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], "/fixes/review")
+
+    def test_signed_out_post_redirects_to_plain_signin(self) -> None:
+        request_id = self._file()
+        response = self.client.post(f"/fixes/review/{request_id}/confirm",
+                                    data=self._approve_all(request_id))
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], "/signin")
+        self.assertEqual(self.database.fix_request(request_id)["status"], "pending")
+
+    def test_deep_link_keeps_its_query_string(self) -> None:
+        response = self.client.get("/day", query_string={"date": "2026-10-20"})
+        self.assertEqual(response.status_code, 302)
+        signin_url = response.headers["Location"]
+        self.assertIn("next=", signin_url)
+        target = "/day?date=2026-10-20"
+        self.assertIn(f'name="next" value="{target}"', self.client.get(signin_url).text)
+        self.client.post("/signin", data={"email": self.hari["email"], "next": target})
+        verify = self.client.post("/signin/verify", data={"code": self.captured["code"], "next": target})
+        self.assertEqual(verify.headers["Location"], target)
+
+    def test_a_failed_decision_email_still_saves_and_redirects(self) -> None:
+        request_id = self._file()
+        self._sign_in(self.hari)
+        form = self._approve_all(request_id)
+        with patch.object(self.database, "enqueue_mail", side_effect=RuntimeError("smtp down")), \
+                self.assertLogs("essl_hub.routes.fixes", level="ERROR"):
+            response = self._post(request_id, form, "/confirm")
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.headers["Location"].endswith("/fixes/review"))
+        self.assertEqual(self.database.fix_request(request_id)["status"], "approved")
+        self.assertIn("Saved. 1 line approved, 0 rejected.", self._flash())

@@ -289,6 +289,36 @@ class AlertsServiceTest(unittest.TestCase):
         self.assertEqual({tuple(m["to"]) for m in self.sent}, {("p102@example.com",)})
         self.assertEqual(len(self.sent), 2)
 
+    def test_pending_approved_and_rejected_requests_suppress_live_and_morning(self) -> None:
+        day = (("09:00", "entry"), ("11:00", "exit"), ("13:00", "exit"))  # orphan OUT at 13:00
+        hr = self.employee("900", name="Hema HR")
+        self.database.set_employee_role(hr, "hr")
+        # An added IN at 10:00 leaves the day broken, so only the request suppresses.
+        line = {"kind": "add_in", "event_time": at(TODAY, "10:00")}
+        requested = {}
+        for uid, outcome in (("101", "pending"), ("102", "approved"), ("103", "rejected")):
+            employee_id = self.person(uid, today=day)
+            request_id = self.database.file_fix_lines(
+                employee_id, TODAY, [line], source="link")["request_id"]
+            if outcome != "pending":
+                [filed] = self.database.fix_request(request_id)["lines"]
+                self.database.decide_fix_lines(
+                    request_id, [{"line_id": filed["id"], "status": outcome}], actor_id=hr,
+                    note="Checked the door log")
+            self.assertEqual(self.database.fix_request(request_id)["status"], outcome)
+            requested[uid] = employee_id
+        control = self.person("104", today=day)
+        for uid in ("105", "106", "107", "108"):  # clean days by evening, so the breaker stays shut
+            self.person(uid, today=CLEAN_DAY[:3])
+        self.live_mode()
+        self.tick()
+        self.assertEqual([a["employee_id"] for a in self.alerts(kind="live")], [control])
+        for uid in ("105", "106", "107", "108"):
+            self.punches(uid, TODAY, [CLEAN_DAY[3]])
+        self.tick(at(TODAY + timedelta(days=1), "09:05"))
+        self.assertEqual([a["employee_id"] for a in self.alerts(kind="morning")], [control])
+        self.assertEqual({tuple(m["to"]) for m in self.sent}, {("p104@example.com",)})
+
     # --- stale data ------------------------------------------------------------
 
     def test_stale_status_skips_detection_but_drains_outbox(self) -> None:
@@ -313,6 +343,24 @@ class AlertsServiceTest(unittest.TestCase):
         self.status(age_minutes=1)
         self.tick(fresh=False)
         self.assertEqual(len(self.alerts()), 1)
+
+    def test_unreachable_device_skips_detection_until_it_reconnects(self) -> None:
+        self.person("101")
+        self.database.record_poll(X990, status="error", error="timed out")
+        self.database.enqueue_mail(["hr@example.com"], "Fix request from Ravi", "text")
+        self.tick()  # fresh status file, collector alive, spool empty
+        self.assertEqual(self.alerts(), [])
+        self.assertEqual([m["subject"] for m in self.sent], ["Fix request from Ravi"])
+        self.assertIn(X990, " ".join(self.messages(logging.INFO, "live check skipped")))
+        self.tick(at(TODAY + timedelta(days=1), "09:05"))
+        self.assertEqual(self.alerts(), [])
+        self.assertIn(X990, " ".join(self.messages(logging.INFO, "morning check skipped")))
+        # A retired device in error never blocks the checks.
+        self.database.record_poll(X990, status="connected")
+        self.database.record_poll(C3, status="error", error="timed out")
+        self.database.set_device_retired(C3, True)
+        self.tick(at(TODAY, "14:50"))
+        self.assertEqual(len(self.alerts(kind="live")), 1)
 
     def test_spooled_punches_skip_detection(self) -> None:
         self.person("101")
@@ -438,11 +486,13 @@ class AlertsServiceTest(unittest.TestCase):
         self.assertEqual((row["status"], row["attempts"]), ("pending", 1))
         self.tick(self.now + timedelta(minutes=1))  # not due yet (5 min backoff)
         self.assertEqual(self.outbox()[0]["attempts"], 1)
-        self.tick(self.now + timedelta(minutes=5))
-        self.assertEqual(self.outbox()[0]["attempts"], 2)
-        self.tick(self.now + timedelta(minutes=10))
+        for attempts, wait in enumerate((5, 10, 20, 40, 60, 60), start=2):
+            self.tick(self.now + timedelta(minutes=wait))
+            [row] = self.outbox()
+            self.assertEqual((row["status"], row["attempts"]), ("pending", attempts))
+        self.tick(self.now + timedelta(minutes=60))
         [row] = self.outbox()
-        self.assertEqual((row["status"], row["attempts"]), ("failed", 3))
+        self.assertEqual((row["status"], row["attempts"]), ("failed", 8))
         self.assertIsNone(row["text_body"])
         self.assertIn("Resend 500", row["last_error"])
         self.send_error = None
@@ -466,6 +516,41 @@ class AlertsServiceTest(unittest.TestCase):
         self.assertEqual(self.service.drain_outbox(), (1, 1))
         self.assertEqual(calls, ["first", "second"])
         self.assertEqual([r["status"] for r in self.outbox()], ["pending", "sent"])
+
+    def test_three_failures_in_a_row_end_the_drain_and_leave_the_rest_due(self) -> None:
+        for n in range(5):
+            self.database.enqueue_mail([f"{n}@example.com"], f"mail {n}", "text")
+        self.send_error = RuntimeError("Resend down")
+        self.assertEqual(self.service.drain_outbox(), (0, 3))
+        rows = self.outbox()
+        self.assertEqual([r["attempts"] for r in rows], [1, 1, 1, 0, 0])
+        self.assertEqual({r["status"] for r in rows}, {"pending"})
+        self.assertEqual(len(self.messages(needle="in a row")), 1)
+        # A success resets the run: fail, send, fail, fail, send.
+        self.send_error = None
+        outcomes = iter([RuntimeError("x"), None, RuntimeError("y"), RuntimeError("z"), None])
+
+        def flaky(subject, recipients, text, html_body=None, *, reply_to=None):
+            error = next(outcomes)
+            if error is not None:
+                raise error
+
+        self.service._send = flaky
+        self.now += timedelta(minutes=5)
+        self.assertEqual(self.service.drain_outbox(), (2, 3))
+
+    def test_drain_stops_at_its_time_budget_and_resumes_next_tick(self) -> None:
+        for n in range(3):
+            self.database.enqueue_mail([f"{n}@example.com"], f"mail {n}", "text")
+        ticks = iter([0.0, 1.0, alerts_main.OUTBOX_TIME_BUDGET])
+        self.service.monotonic = lambda: next(ticks, 1000.0)
+        self.assertEqual(self.service.drain_outbox(), (1, 0))
+        self.assertEqual([r["status"] for r in self.outbox()], ["sent", "pending", "pending"])
+        self.assertEqual(self.outbox()[1]["attempts"], 0)
+        self.assertEqual(len(self.messages(needle="stopped after")), 1)
+        self.service.monotonic = lambda: 0.0
+        self.assertEqual(self.service.drain_outbox(), (2, 0))
+        self.assertEqual([m["subject"] for m in self.sent], ["mail 0", "mail 1", "mail 2"])
 
     def test_mode_off_still_drains_outbox(self) -> None:
         self.person("101")

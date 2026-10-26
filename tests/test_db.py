@@ -1199,6 +1199,10 @@ class DatabaseTest(unittest.TestCase):
             ).fetchone()
         self.assertEqual(row["value"], str(db_module.SCHEMA_VERSION))
         self.assertIsNotNone(kept)  # no re-migration: settings said v3 already
+        # The public reader takes the settings value while the pragma says 0.
+        with self.database.transaction() as connection:
+            connection.execute("PRAGMA user_version=0")
+        self.assertEqual(self.database.schema_version(), db_module.SCHEMA_VERSION)
 
     def test_v2_to_v3_drops_backups_and_rerun_is_noop(self) -> None:
         with self.database.transaction() as connection:
@@ -1480,17 +1484,24 @@ class MissedPunchSchemaTest(unittest.TestCase):
             self.assertEqual(row["recipients"], ["Asha@x.com"])
             self.assertEqual(self.database.mark_mail_failed(row["id"], "boom"), "pending")
             self.assertEqual(self.database.due_mail(), [])
-        with mock.patch.object(db_module, "_now", return_value=start + timedelta(minutes=5)):
-            self.assertEqual(len(self.database.due_mail()), 1)
-            self.assertEqual(self.database.mark_mail_failed(row["id"], "boom"), "pending")
-        with mock.patch.object(db_module, "_now", return_value=start + timedelta(minutes=14)):
+        # Seven retries over about four hours, the wait doubling up to an hour.
+        when = start
+        for wait in (5, 10, 20, 40, 60, 60):
+            with mock.patch.object(db_module, "_now", return_value=when + timedelta(minutes=wait - 1)):
+                self.assertEqual(self.database.due_mail(), [])
+            when += timedelta(minutes=wait)
+            with mock.patch.object(db_module, "_now", return_value=when):
+                self.assertEqual(len(self.database.due_mail()), 1)
+                self.assertEqual(self.database.mark_mail_failed(row["id"], "boom"), "pending")
+        with mock.patch.object(db_module, "_now", return_value=when + timedelta(minutes=59)):
             self.assertEqual(self.database.due_mail(), [])
-        with mock.patch.object(db_module, "_now", return_value=start + timedelta(minutes=15)):
+        with mock.patch.object(db_module, "_now", return_value=when + timedelta(minutes=60)):
+            self.assertEqual(len(self.database.due_mail()), 1)
             self.assertEqual(self.database.mark_mail_failed(row["id"], "x" * 900), "failed")
             self.assertEqual(self.database.due_mail(), [])
         with self.database.connect() as connection:
             stored = connection.execute("SELECT * FROM mail_outbox").fetchone()
-        self.assertEqual((stored["status"], stored["attempts"]), ("failed", 3))
+        self.assertEqual((stored["status"], stored["attempts"]), ("failed", 8))
         self.assertIsNone(stored["text_body"])
         self.assertIsNone(stored["html_body"])
         self.assertEqual(len(stored["last_error"]), 500)
@@ -1576,6 +1587,33 @@ class MissedPunchSchemaTest(unittest.TestCase):
                 connection.execute(
                     "INSERT INTO fix_requests (employee_id, work_day, status, source, created_at) "
                     "VALUES (?, ?, 'pending', 'link', ?)", (self.asha, DAY, db_module._now()))
+
+    def test_double_submitted_lines_are_not_added_twice(self) -> None:
+        flip = {"kind": "flip", "target_fingerprint": "fp-1",
+                "event_time": datetime(2026, 10, 26, 13, 0), "direction": "exit"}
+        first = self._file(self._add_in(note="Forgot"), flip)
+        again = self._file(self._add_in(note="Forgot"), flip)
+        self.assertEqual(again, {"request_id": first["request_id"], "first_lines": False})
+        self.assertEqual(len(self.database.fix_request(first["request_id"])["lines"]), 2)
+        self.assertEqual([e["kind"] for e in self.database.fix_request_events(first["request_id"])],
+                         ["filed"])
+        # A partly new submission adds only the new line; the note does not
+        # make a line different.
+        self._file(self._add_in(note="other words"), self._add_in(18, 0))
+        lines = self.database.fix_request(first["request_id"])["lines"]
+        self.assertEqual([l["event_time"].strftime("%H:%M") for l in lines if l["kind"] == "add_in"],
+                         ["13:40", "18:00"])
+        # A full request still takes a resend of its own lines without FixLineLimit.
+        full = self._file(*[self._add_in(9, minute) for minute in range(7)])
+        self.assertEqual(len(self.database.fix_request(full["request_id"])["lines"]), 10)
+        self.assertFalse(self._file(self._add_in(9, 0))["first_lines"])
+
+    def test_reopened_request_takes_a_fresh_created_at(self) -> None:
+        with mock.patch.object(db_module, "_now", return_value=datetime(2026, 10, 26, 18, 0)):
+            closed = self.database.close_fix_day(self.asha, DAY, "closed_left", source="link")
+        with mock.patch.object(db_module, "_now", return_value=datetime(2026, 10, 29, 9, 30)):
+            self._file(self._add_in())
+        self.assertEqual(self.database.fix_request(closed)["created_at"], datetime(2026, 10, 29, 9, 30))
 
     def test_eleventh_line_is_refused_and_nothing_is_written(self) -> None:
         with self.assertRaises(db_module.FixLineLimit):

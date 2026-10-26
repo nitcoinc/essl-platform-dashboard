@@ -81,7 +81,7 @@
     </tr>
     {% endfor %}
   {% endcall %}
-  <p class="footnote">"Would send" is what shadow mode logged without emailing. "Held" means the outage guard stopped a burst of alerts at once.</p>
+  <p class="footnote">"Would send" is what shadow mode logged without emailing. "Not emailed" is a live alert for someone with no email address. "Held" means the outage guard stopped a burst of alerts at once.</p>
   {% elif alerts.rebuilt_at %}
   <p class="muted">No alerts in the last {{ alerts.count_days }} days.</p>
   {% else %}

@@ -694,9 +694,12 @@ STATUS_BREAKER = "breaker"
 STATUS_SENT = "sent"
 STATUS_FAILED = "failed"
 ALERT_STATUSES = frozenset({STATUS_RECORDED, STATUS_QUEUED, STATUS_BREAKER, STATUS_SENT, STATUS_FAILED})
-# Up to 3 attempts per email; retries wait base x 2^(attempts - 1) (KTD8).
-MAIL_MAX_ATTEMPTS = 3
+# Up to 8 attempts per email; retries wait base x 2^(attempts - 1), capped at
+# MAIL_RETRY_MAX (5, 10, 20, 40, 60, 60, 60 min), so a mail outage of about
+# four hours still delivers (KTD8).
+MAIL_MAX_ATTEMPTS = 8
 MAIL_RETRY_BASE = timedelta(minutes=5)
+MAIL_RETRY_MAX = timedelta(minutes=60)
 # Retention, enforced by the alerts service's weekly job.
 BASELINE_SNAPSHOTS_KEPT = 4
 ALERT_RETENTION_DAYS = 90
@@ -814,6 +817,11 @@ class Database:
                     _logger.exception("ROLLBACK failed")
                 raise
             connection.commit()
+
+    def schema_version(self) -> int:
+        """The database's schema version (see _schema_version)."""
+        with self.connect() as connection:
+            return _schema_version(connection)
 
     def migrate_schema(self) -> None:
         """Bring the schema to SCHEMA_VERSION; no seeding (KTD8). Every step is
@@ -1978,6 +1986,15 @@ class Database:
             return None
         return min(values)
 
+    def unreachable_devices(self) -> list[str]:
+        """Active devices whose last poll failed (status 'error'); the
+        collector writes it on the first failure, unlike last_success."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT id FROM devices WHERE retired_at IS NULL AND status = 'error' ORDER BY id"
+            ).fetchall()
+        return [row["id"] for row in rows]
+
     def checkins_since(self, *, since: datetime | None, limit: int) -> list[dict]:
         sql = (
             f"SELECT p.id, p.device_id, {_MAIN_ID_SQL} AS device_user_id, "
@@ -2211,7 +2228,7 @@ class Database:
             connection.execute(
                 "UPDATE mail_outbox SET attempts = ?, last_error = ?, next_attempt_at = ? "
                 "WHERE id = ?",
-                (attempts, error, now + MAIL_RETRY_BASE * 2 ** (attempts - 1), mail_id),
+                (attempts, error, now + mail_retry_delay(attempts), mail_id),
             )
             return "pending"
 
@@ -2281,10 +2298,12 @@ class Database:
     ) -> dict[str, object]:
         """File an employee's fix lines for one day in one transaction (KTD5):
         they join the pending request, reopen a closed one, or start a new
-        request linked to the last decided one. Raises FixLineLimit past
-        FIX_MAX_LINES and ValueError for a malformed line. Returns request_id
-        and first_lines, True when the request had no lines before, so the
-        caller notifies the manager and HR once (U7)."""
+        request linked to the last decided one. A line the request already
+        holds (same kind, swipe, time and direction: a double-submitted form)
+        is skipped, and nothing is written when every line is. Raises
+        FixLineLimit past FIX_MAX_LINES and ValueError for a malformed line.
+        Returns request_id and first_lines, True when the request had no lines
+        before, so the caller notifies the manager and HR once (U7)."""
         if source not in FIX_SOURCES:
             raise ValueError(f"unknown fix request source: {source}")
         prepared = [_fix_line_values(line) for line in lines]
@@ -2295,16 +2314,23 @@ class Database:
             latest = _latest_fix_request(connection, employee_id, work_day)
             if latest is not None and latest["status"] in FIX_CLOSED_STATUSES | {"pending"}:
                 request_id = latest["id"]
-                existing = connection.execute(
-                    "SELECT COUNT(*) AS n FROM fix_request_lines WHERE request_id = ?",
+                rows = connection.execute(
+                    "SELECT kind, target_fingerprint, event_time, direction "
+                    "FROM fix_request_lines WHERE request_id = ?",
                     (request_id,),
-                ).fetchone()["n"]
+                ).fetchall()
+                existing = len(rows)
+                held = {_fix_line_key(row) for row in rows}
+                prepared = [values for values in prepared if _fix_line_key(values) not in held]
+                if not prepared:
+                    return {"request_id": request_id, "first_lines": False}
                 event = "lines_added"
                 if latest["status"] != "pending":
+                    # A reopened request is a new report: it queues from now.
                     connection.execute(
                         "UPDATE fix_requests SET status = 'pending', source = ?, punch_set_hash = ?, "
-                        "decided_at = NULL, decided_by = NULL WHERE id = ?",
-                        (source, punch_set_hash, request_id),
+                        "decided_at = NULL, decided_by = NULL, created_at = ? WHERE id = ?",
+                        (source, punch_set_hash, now, request_id),
                     )
                     _insert_fix_event(
                         connection, request_id, None, employee_id, "reopened",
@@ -2654,6 +2680,11 @@ def _manager_chain(connection: _Connection, employee_id: int) -> list[int]:
     return [row["id"] for row in rows]
 
 
+def mail_retry_delay(attempts: int) -> timedelta:
+    """The wait after ``attempts`` failed sends (KTD8)."""
+    return min(MAIL_RETRY_BASE * 2 ** (attempts - 1), MAIL_RETRY_MAX)
+
+
 def reports_message(count: int) -> str:
     people = "person reports" if count == 1 else "people report"
     return f"{count} {people} to them. Give them another manager first."
@@ -2754,6 +2785,19 @@ def _fix_line_values(line: dict) -> tuple[object, ...]:
     if target is None:
         raise ValueError(f"{kind} needs a target swipe")
     return (kind, target, event_time, direction if kind == "flip" else None, note)
+
+
+def _fix_line_key(line: dict | tuple) -> tuple[object, ...]:
+    """(kind, target_fingerprint, event_time, direction): what makes two
+    lines of one request the same ask. Takes a stored row or the tuple
+    _fix_line_values returns."""
+    if isinstance(line, dict):
+        line = (line["kind"], line["target_fingerprint"], line["event_time"], line["direction"])
+    kind, target, event_time, direction = line[:4]
+    if isinstance(event_time, datetime):
+        # As stored: whole seconds (_adapt_datetime).
+        event_time = event_time.replace(microsecond=0)
+    return (kind, target, event_time, direction)
 
 
 def _correction_values(

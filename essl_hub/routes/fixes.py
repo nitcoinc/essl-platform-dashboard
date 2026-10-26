@@ -39,6 +39,7 @@ from ..hours import (
     apply_corrections,
     compute_day,
     counted_punches,
+    reportable,
     work_day,
     work_day_window,
 )
@@ -61,9 +62,6 @@ bp = Blueprint("fixes", __name__)
 
 _logger = logging.getLogger(__name__)
 
-# A work day can be reported while it is one of the last REPORT_DAYS work
-# days, today included: the same span a report link lives (KTD7).
-REPORT_DAYS = 7
 ADD_ROWS = 3  # blank "Add a missed swipe" rows on a fresh form
 
 IP_POSTS_PER_MINUTE = 10
@@ -79,6 +77,9 @@ _CORRECTION_TONES = {
     CORRECTION_IGNORED: "neutral",
 }
 _DIRECTION_LABELS = {"entry": "In", "exit": "Out"}
+# Form and email values ("in"/"out") to stored directions, and back.
+_TO_DIRECTION = {"in": "entry", "out": "exit"}
+_FROM_DIRECTION = {value: key for key, value in _TO_DIRECTION.items()}
 _EMAIL_KINDS = {
     "add_in": alert_mail.MISSED_IN,
     "add_out": alert_mail.MISSED_OUT,
@@ -208,16 +209,11 @@ def _swipes(rows: list[dict], day: date) -> list[dict]:
     return swipes
 
 
-def reportable(day: date, today: date) -> bool:
-    """True while ``day`` is one of the last REPORT_DAYS work days."""
-    return 0 <= (today - day).days < REPORT_DAYS
-
-
 def _line_view(line: dict, times: dict) -> dict:
     """One filed line as text plus a status chip."""
     at = line.get("hr_event_time") or line.get("event_time") or times.get(line.get("target_fingerprint"))
     stored = line.get("hr_direction") or line.get("direction")
-    direction = {"entry": "in", "exit": "out"}.get(stored)
+    direction = _FROM_DIRECTION.get(stored)
     kind = line["kind"]
     if kind in FIX_ADD_KINDS and stored in ("entry", "exit"):
         # HR may turn a missed IN into a missed OUT before approving.
@@ -301,7 +297,7 @@ def _validate(form: dict, action: str, rows: list[dict], day: date, day_start_ho
         at, row["error"] = _check_missed_time(row["time"], day, day_start_hour, now)
         if not row["time"]:
             continue  # the direction is checked once there is a time
-        if row["dir"] not in ("in", "out"):
+        if row["dir"] not in _TO_DIRECTION:
             row["dir_error"] = "Choose In or Out."
         if row["error"] or row["dir_error"]:
             continue
@@ -462,7 +458,10 @@ def _submit(employee: dict, day: date, *, source: str, token: str | None, done_u
                           f"report already has {have}. Add the most important ones, or tell HR in the note.")
         return _render(employee, day, token=token, form=form, errors=errors, status=400)
     if result["first_lines"]:
-        _notify_new_request(employee, day, result["request_id"], form["note"].strip(), rows)
+        try:
+            _notify_new_request(employee, day, result["request_id"], form["note"].strip(), rows)
+        except Exception:  # noqa: BLE001 - the request is saved; a lost email must not 500 it
+            _logger.exception("Fix request %s saved but its notification failed", result["request_id"])
     return redirect(done_url)
 
 
@@ -555,8 +554,6 @@ def report_submit(day: str) -> Response:
 # --- HR review (U8, R12-R14) ----------------------------------------------------
 
 _REVIEW_ROLES = access.FIX_REVIEW_ROLES
-_TO_DIRECTION = {"in": "entry", "out": "exit"}
-_FROM_DIRECTION = {"entry": "in", "exit": "out"}
 _TARGET_KINDS = ("flip", "ignore")
 
 
@@ -921,7 +918,10 @@ def review_confirm(request_id: int) -> Response:
         errors = {"form": common._sentence(str(exc))}
         return _render_review(filed, person, day, values=values, errors=errors, note=note, status=400)
     if result["decided"] and result["status"] in FIX_DECIDED_STATUSES:
-        _notify_decision(filed, person, day, result["status"], note)
+        try:
+            _notify_decision(filed, person, day, result["status"], note)
+        except Exception:  # noqa: BLE001 - the decision is saved; a lost email must not 500 it
+            _logger.exception("Fix request %s decided but its decision email failed", request_id)
     return _redirect_with_flash("fixes.review_list", **_saved_message(decisions, result))
 
 

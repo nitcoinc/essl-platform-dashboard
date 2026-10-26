@@ -10,6 +10,7 @@ from . import access, auth, config, turnstile
 from .config import DEVICES
 from .db import SETUP_COMMANDS, BusyError, Database, DatabaseMissing, OfflineError
 from .routes import BLUEPRINTS
+from .routes import fixes as fixes_routes
 from .routes import people as people_routes
 from .routes.common import SESSION_COOKIE, _htmx_partial, _theme, current_sync_health
 
@@ -158,6 +159,12 @@ def create_app(database: Database | None = None) -> Flask:
         session = auth.resolve_session(database, token)
         g.employee = session["employee"] if session else None
         g.csrf_token = session["csrf_token"] if session else None
+
+    # KTD7: Flask logs an unhandled error as "Exception on <path>", so a
+    # crash on /fix/<token> would print the token; the access-log filter
+    # (routes.fixes) redacts it here too. Added once per logger.
+    if not any(isinstance(f, fixes_routes._RedactReportTokens) for f in app.logger.filters):
+        app.logger.addFilter(fixes_routes._RedactReportTokens())
 
     for blueprint in BLUEPRINTS:
         app.register_blueprint(blueprint)
