@@ -52,9 +52,10 @@ One Docker Compose stack on an office Linux host with routes to `192.168.1.201` 
 ## Break rules
 
 - Every In and Out swipe is a real record and always counts. A swipe with no direction first fills a missing alternation (Out, swipe, Out: the swipe is In; In, swipe, In: it is Out) and is marked "inferred".
-- Otherwise a direction-less swipe within 60 seconds of the previous counted swipe (any device), or a same-direction re-swipe within 60 seconds, is a duplicate: stored and shown "not counted", never paired.
+- Otherwise a direction-less swipe, or a same-direction re-swipe, sooner than its own device's quick-swipe window after the previous counted swipe is a duplicate: stored and shown "not counted" with the swipe it repeats and the gap, never paired. The window is set per device (0–300 s, 0 counts every swipe, default 60); a change re-scores every past day.
 - A gap between two paired stretches is a **break** only when it is a clean out-then-in. A gap holding an unpaired swipe is **unclear**: totalled separately, never counted as break, so gross = effective + breaks + unclear.
-- The C3 records event 20 ("Too Short Punch Interval") when a swipe comes too soon after the previous one at the same door; the door does not open, but the person was there. The collector stores it as attendance with the note "interval too short". Recommend setting the C3 door **Punch Interval** to 1 second or less so real swipes are not denied.
+- The C3 records event 20 ("Too Short Punch Interval") when a swipe comes too soon after the previous one at the same door; the door does not open, but the person was there. The collector stores it as attendance with the note "interval too short". Recommend setting the C3 door **Punch Interval** to 1 second or less so real swipes are not denied; admins can change it from the Devices page.
+- Interlock and anti-passback denials count only when a C3's "Wait for door close" is unchecked, from that moment on, flagged "door denied" and kept out of Frappe.
 
 ## Evidence on Hand
 
