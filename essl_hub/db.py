@@ -871,21 +871,23 @@ class Database:
         self,
         device_id: str,
         *,
-        params: dict[str, int],
-        read_at: datetime,
+        params: dict[str, int] | None,
+        read_at: datetime | None,
         result: dict | None = None,
         previous: dict[str, int] | None = None,
         previous_for: datetime | None = None,
     ) -> None:
         """Collector side: store a door read and, for a request, its per-key
         result. ``previous`` is kept once per request (KTD9): a second call for
-        the same ``previous_for`` leaves the first snapshot. Never touches the
-        policy columns (the web owns them)."""
+        the same ``previous_for`` leaves the first snapshot. ``params`` None
+        (an expired request, nothing read) keeps the last read. Never touches
+        the policy columns (the web owns them)."""
         with self.transaction() as connection:
-            connection.execute(
-                "UPDATE devices SET door_params = ?, door_params_read_at = ? WHERE id = ?",
-                (dict(params), read_at, device_id),
-            )
+            if params is not None:
+                connection.execute(
+                    "UPDATE devices SET door_params = ?, door_params_read_at = ? WHERE id = ?",
+                    (dict(params), read_at, device_id),
+                )
             if result is not None:
                 connection.execute(
                     "UPDATE devices SET door_params_result = ? WHERE id = ?",

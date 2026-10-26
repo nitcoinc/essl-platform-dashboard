@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 
@@ -18,6 +18,10 @@ class DeviceConfig:
     # KTD5: set while "Wait for door close" is unchecked; C3 door-denied
     # swipes (24/25) at or after it are captured. None = drop them.
     door_denied_since: datetime | None = None
+    # KTD6: the pending door-parameter request and its guard timestamp, as
+    # read at the start of the cycle. A dict, so kept out of the hash.
+    door_request: dict | None = field(default=None, hash=False)
+    door_requested_at: datetime | None = None
 
 # Seed-only: inserted into the devices table when missing, never overwritten.
 # The database is authoritative; admins add and retire devices there.

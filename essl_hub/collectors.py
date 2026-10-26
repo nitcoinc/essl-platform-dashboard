@@ -2,15 +2,24 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import struct
 import time
 import zlib
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable
 
 from .config import DeviceConfig, numeric_comm_password, password_for
+from .door_params import (
+    READ_BATCH,
+    DoorParamError,
+    lock_count_of,
+    parse_params,
+    read_keys,
+    validate_request,
+)
 from .hashing import sha256_hex
 
 
@@ -432,6 +441,206 @@ def collect_c3(device: DeviceConfig) -> CollectionResult:
             panel.disconnect()
         except Exception:
             pass
+
+
+# --- C3 door parameters (U4) -------------------------------------------------
+# KTD7: SetDeviceParam is the 0x03 command set_device_datetime already sends
+# (consts.Command.DATETIME), one Key=Value per call, trusted only on GETPARAM
+# read-back. A 0xC9 reply surfaces from the library as
+# ConnectionError("Error <n> received in reply: ..."); anything else is a
+# lost connection. The result JSON is documented in essl_hub.door_params.
+C3_CMD_SETPARAM = 0x03
+DOOR_REQUEST_TTL = timedelta(minutes=15)
+_C3_REPLY_ERROR = re.compile(r"^Error (-?\d+) received in reply")
+C3_ERROR_TEXT = {-14: "communication password rejected", -13: "command not available"}
+
+
+@dataclass
+class DoorParamsOutcome:
+    """What one door step did. ``params``/``read_at`` are the latest read
+    (None when the panel was not contacted); ``result`` answers the request
+    (None for a plain history-time read); ``previous`` is the pre-write read,
+    set only when a SETPARAM was attempted (KTD9)."""
+
+    params: dict[str, int] | None = None
+    read_at: datetime | None = None
+    result: dict[str, Any] | None = None
+    previous: dict[str, int] | None = None
+
+
+DoorStep = Callable[..., DoorParamsOutcome]
+
+
+def door_request_expired(requested_at: datetime | None, now: datetime) -> bool:
+    """KTD6: the admin confirmed against values that may since have changed."""
+    return requested_at is not None and now - requested_at > DOOR_REQUEST_TTL
+
+
+def read_c3_door_params(panel: Any) -> dict[str, int]:
+    """LockCount first (it sets how many doors to ask about), then the
+    door keys in GETPARAM batches of at most READ_BATCH."""
+    lock_count = lock_count_of(parse_params(panel.get_device_param(["LockCount"])))
+    if lock_count is None:
+        raise ConnectionError("controller did not report a usable LockCount")
+    keys = read_keys(lock_count)
+    params: dict[str, int] = {}
+    for start in range(0, len(keys), READ_BATCH):
+        params.update(parse_params(panel.get_device_param(keys[start : start + READ_BATCH])))
+    params["LockCount"] = lock_count
+    return params
+
+
+def c3_door_step(
+    device: DeviceConfig,
+    request: dict[str, Any] | None,
+    requested_at: datetime | None,
+    *,
+    now: datetime,
+) -> DoorParamsOutcome:
+    """Read the door parameters and apply ``request`` (KTD6, KTD7, KTD9).
+
+    ``request`` None is a plain read alongside a history read; ``{}`` is
+    "Read from device". Raises ConnectionError when the panel cannot be
+    reached or read before any write, which leaves the request pending (and
+    subject to expiry). Once a SETPARAM was attempted it always returns a
+    result and never re-sends."""
+    if request is None or requested_at is None:
+        request, requested_at = None, None
+    elif door_request_expired(requested_at, now):
+        return DoorParamsOutcome(result=_door_result(
+            "expired", requested_at, now,
+            {
+                str(key): _door_key("not_attempted", None, value, message="expired, not applied")
+                for key, value in request.items()
+            },
+            message="Expired, not applied: requested more than 15 minutes before the collector reached it",
+        ))
+
+    from c3 import C3
+
+    password = password_for(device)
+    panel = C3(device.ip, port=device.port)
+    try:
+        try:
+            if not panel.connect(password):
+                raise ConnectionError("controller rejected the PullSDK connection")
+            current = read_c3_door_params(panel)
+        except Exception as exc:
+            raise ConnectionError(_scrub(_friendly_error(exc), password)) from None
+        if request is None:
+            return DoorParamsOutcome(params=current, read_at=now)
+        try:
+            wanted = validate_request(request, lock_count_of(current))
+        except DoorParamError as exc:
+            return DoorParamsOutcome(
+                params=current, read_at=now,
+                result=_door_result("failed", requested_at, now, {}, message=str(exc)),
+            )
+        if not wanted:
+            return DoorParamsOutcome(
+                params=current, read_at=now, result=_door_result("read", requested_at, now, {}),
+            )
+
+        params = dict(current)
+        keys: dict[str, dict[str, Any]] = {}
+        attempted = lost = False
+        for key, value in wanted.items():
+            old = current.get(key)
+            if lost:
+                keys[key] = _door_key("not_attempted", old, value, message="not sent; connection lost")
+                continue
+            if old == value:
+                keys[key] = _door_key("unchanged", old, value, now=old)
+                continue
+            attempted = True
+            keys[key], lost = _write_door_key(panel, key, value, old)
+            if keys[key]["now"] is not None:
+                params[key] = keys[key]["now"]
+        ok = all(entry["outcome"] in ("applied", "unchanged") for entry in keys.values())
+        return DoorParamsOutcome(
+            params=params,
+            read_at=now,
+            result=_door_result(
+                "applied" if ok else "failed", requested_at, now, keys,
+                message="connection lost; the remaining keys were not sent" if lost else "",
+            ),
+            previous=dict(current) if attempted else None,
+        )
+    finally:
+        try:
+            panel.disconnect()
+        except Exception:
+            pass
+
+
+def _write_door_key(panel: Any, key: str, value: int, old: int | None) -> tuple[dict[str, Any], bool]:
+    """One SETPARAM then its read-back. Returns the key's entry and whether
+    the connection was lost. ``key`` and ``value`` come from validate_request,
+    so the frame text is a whitelisted name and a formatted int (KTD8)."""
+    try:
+        panel._send_receive(C3_CMD_SETPARAM, panel._kv_to_message({key: int(value)}))
+    except Exception as exc:
+        code = _c3_error_code(exc)
+        if code is not None:
+            return _door_key("failed", old, value, message=_c3_error_text(code)), False
+        if _never_sent(exc):
+            return _door_key("not_attempted", old, value, message="not sent; connection lost"), True
+        return _door_key("failed", old, value, message="connection lost; value not confirmed"), True
+    try:
+        back = parse_params(panel.get_device_param([key])).get(key)
+    except Exception as exc:
+        code = _c3_error_code(exc)
+        if code is not None:
+            return _door_key("failed", old, value, message=f"read-back refused: {_c3_error_text(code)}"), False
+        return _door_key("failed", old, value, message="connection lost before read-back; value not confirmed"), True
+    if back is None:
+        return _door_key("failed", old, value, message="panel did not report the value after the write"), False
+    if back != value:
+        return _door_key("failed", old, value, now=back, message=f"panel kept {back}"), False
+    return _door_key("applied", old, value, now=back), False
+
+
+def _door_key(
+    outcome: str, old: int | None, new: Any, *, now: int | None = None, message: str = ""
+) -> dict[str, Any]:
+    return {"outcome": outcome, "old": old, "new": new, "now": now, "message": message}
+
+
+def _door_result(
+    state: str, requested_at: datetime, finished_at: datetime, keys: dict, *, message: str = ""
+) -> dict[str, Any]:
+    return {
+        "state": state,
+        "requested_at": _format_datetime(requested_at),
+        "finished_at": _format_datetime(finished_at),
+        "message": message,
+        "keys": keys,
+    }
+
+
+def _c3_error_code(exc: BaseException) -> int | None:
+    """The panel's error code from a 0xC9 reply, None for anything else."""
+    if not isinstance(exc, ConnectionError):
+        return None
+    match = _C3_REPLY_ERROR.match(str(exc))
+    return int(match.group(1)) if match else None
+
+
+def _c3_error_text(code: int) -> str:
+    return C3_ERROR_TEXT.get(code, f"panel error {code}")
+
+
+def _never_sent(exc: BaseException) -> bool:
+    """The library wraps a failed socket send (BrokenPipeError) as
+    "Unexpected connection end"; then the frame never left this host."""
+    return isinstance(exc, BrokenPipeError) or isinstance(exc.__cause__, BrokenPipeError)
+
+
+def _scrub(message: str, password: str | None) -> str:
+    """Error text is stored and shown; it never carries the comm password."""
+    if password:
+        message = message.replace(password, "***")
+    return message
 
 
 def _normalized_event(
