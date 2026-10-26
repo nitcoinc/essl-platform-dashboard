@@ -15,6 +15,7 @@ import libsql
 
 from .config import C3_PROTOCOL, DeviceConfig, TIMEZONE_NAME, db_path
 from .hashing import sha256_hex
+from .hours import apply_corrections
 
 _TZ = ZoneInfo(TIMEZONE_NAME)
 _logger = logging.getLogger(__name__)
@@ -1315,20 +1316,12 @@ class Database:
         self, device_user_ids: str | Iterable[str], start: datetime, end: datetime
     ) -> list[dict[str, object]]:
         """One person's punches; pass every ID (``device_ids_of``) so punches
-        under extra IDs count too."""
+        under extra IDs count too. Approved fixes are merged in (KTD4,
+        ``hours.apply_corrections``); ignored rows come back marked, so the
+        raw list still shows them."""
         ids = [device_user_ids] if isinstance(device_user_ids, str) else sorted(set(device_user_ids))
         with self.connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT event_timestamp, trusted_direction, raw_direction_byte, raw_state, device_id
-                FROM punches
-                WHERE device_user_id IN (SELECT value FROM json_each(?))
-                  AND event_timestamp >= ? AND event_timestamp < ?
-                ORDER BY event_timestamp ASC
-                """,
-                (json.dumps(ids), start, end),
-            ).fetchall()
-        return list(rows)
+            return _overlaid_punches(connection, ids, start, end)
 
     def first_punch_at(self, device_user_ids: Iterable[str]) -> datetime | None:
         """Earliest punch across one person's IDs (``device_ids_of``); None
@@ -1352,22 +1345,15 @@ class Database:
         self, device_user_ids: Iterable[str], start: datetime, end: datetime
     ) -> list[dict[str, object]]:
         """All punches for a set of people over a range in one query, so Team
-        and exports cost the same whatever the people x days product (U9)."""
+        and exports cost the same whatever the people x days product (U9).
+        Approved fixes are merged in as for ``punches_for_employee_range``;
+        an added punch carries its owner's main ID."""
         ids = sorted(set(device_user_ids))
         if not ids:
             return []
         with self.connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT device_user_id, event_timestamp, trusted_direction, site, device_id
-                FROM punches
-                WHERE device_user_id IN (SELECT value FROM json_each(?))
-                  AND event_timestamp >= ? AND event_timestamp < ?
-                ORDER BY device_user_id, event_timestamp ASC
-                """,
-                (json.dumps(ids), start, end),
-            ).fetchall()
-        return list(rows)
+            rows = _overlaid_punches(connection, ids, start, end)
+        return sorted(rows, key=lambda r: (r["device_user_id"], r["event_timestamp"]))
 
     def upsert_employee(self, *, device_user_id: str, name: str, email: str) -> str:
         email = email.strip().lower()
@@ -2519,19 +2505,8 @@ class Database:
         whose work day is near it. A fingerprint row whose punch is not in the
         caller's rows has no effect, so the one-day margin only widens the
         read. Oldest first, so a later set_direction wins."""
-        ids = sorted(set(employee_ids))
-        if not ids:
-            return []
         with self.connect() as connection:
-            rows = connection.execute(
-                "SELECT * FROM punch_corrections "
-                "WHERE employee_id IN (SELECT value FROM json_each(?)) AND ("
-                "(kind = 'add' AND event_timestamp >= ? AND event_timestamp < ?) "
-                "OR (kind <> 'add' AND work_day >= ? AND work_day <= ?)) "
-                "ORDER BY id",
-                (json.dumps(ids), start, end, start.date() - timedelta(days=1), end.date()),
-            ).fetchall()
-        return list(rows)
+            return _corrections_for(connection, employee_ids, start, end)
 
     def fix_request_days(
         self, employee_ids: Iterable[int], start: date, end: date
@@ -2553,6 +2528,61 @@ class Database:
         for row in rows:
             days.setdefault((row["employee_id"], row["work_day"]), []).append(row["status"])
         return days
+
+
+def _corrections_for(
+    connection: _Connection, employee_ids: Iterable[int], start: datetime, end: datetime
+) -> list[dict[str, object]]:
+    """Database.corrections_for on a borrowed connection."""
+    ids = sorted(set(employee_ids))
+    if not ids:
+        return []
+    return connection.execute(
+        "SELECT * FROM punch_corrections "
+        "WHERE employee_id IN (SELECT value FROM json_each(?)) AND ("
+        "(kind = 'add' AND event_timestamp >= ? AND event_timestamp < ?) "
+        "OR (kind <> 'add' AND work_day >= ? AND work_day <= ?)) "
+        "ORDER BY id",
+        (json.dumps(ids), start, end, start.date() - timedelta(days=1), end.date()),
+    ).fetchall()
+
+
+def _overlaid_punches(
+    connection: _Connection, ids: list[str], start: datetime, end: datetime
+) -> list[dict[str, object]]:
+    """Punches under these device user IDs in [start, end), with approved
+    fixes merged (KTD4). Owners resolve like ``_attach_device_ids`` and
+    ``_MAIN_ID_SQL``: a main ID is its employee's, an extra ID its owner's;
+    corrections are keyed by employee, so an owner's added punches come back
+    even on a day with no device punch."""
+    rows = connection.execute(
+        """
+        SELECT device_user_id, fingerprint, event_timestamp, trusted_direction,
+            raw_direction_byte, raw_state, site, device_id
+        FROM punches
+        WHERE device_user_id IN (SELECT value FROM json_each(?))
+          AND event_timestamp >= ? AND event_timestamp < ?
+        ORDER BY event_timestamp ASC
+        """,
+        (json.dumps(ids), start, end),
+    ).fetchall()
+    owners = connection.execute(
+        """
+        SELECT e.device_user_id AS held_id, e.id AS employee_id, e.device_user_id AS main_id
+        FROM employees e WHERE e.device_user_id IN (SELECT value FROM json_each(?))
+        UNION ALL
+        SELECT x.device_user_id, e.id, e.device_user_id
+        FROM employee_device_ids x JOIN employees e ON e.id = x.employee_id
+        WHERE x.device_user_id IN (SELECT value FROM json_each(?))
+        """,
+        (json.dumps(ids), json.dumps(ids)),
+    ).fetchall()
+    owner_of = {str(o["held_id"]): o["employee_id"] for o in owners}
+    main_ids = {o["employee_id"]: str(o["main_id"]) for o in owners}
+    for row in rows:
+        row["employee_id"] = owner_of.get(str(row["device_user_id"]))
+    corrections = _corrections_for(connection, main_ids, start, end)
+    return apply_corrections(rows, corrections, main_ids)
 
 
 def _manager_chain(connection: _Connection, employee_id: int) -> list[int]:

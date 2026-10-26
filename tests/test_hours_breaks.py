@@ -8,7 +8,9 @@ import unittest
 from datetime import datetime, timedelta
 
 from essl_hub import day_story
-from essl_hub.hours import Collapsed, Punch, Segment, compute_day
+from essl_hub.hours import (
+    Collapsed, Punch, Segment, apply_corrections, compute_day, counted_punches,
+)
 
 
 def _t(h: int, m: int = 0, s: int = 0, day: int = 10) -> datetime:
@@ -280,6 +282,85 @@ class PerDeviceWindowTest(unittest.TestCase):
         # The first entry is superseded by the second and shown unpaired.
         self.assertEqual(r.segments, (Segment(_t(9, 0, 30), _t(18)),))
         self.assertEqual(r.unpaired, ((_t(9), "entry"),))
+
+
+class CorrectionOverlayTest(unittest.TestCase):
+    """U2/KTD4: approved fixes merge into punch rows before compute_day."""
+
+    WINDOWS = {"x990": 60, "c3": 0}
+    MAIN_IDS = {1: "7"}
+
+    @staticmethod
+    def _rows(*swipes, device="x990", owner=1):
+        return [{"fingerprint": f"fp-{i}", "employee_id": owner, "device_user_id": "7", "device_id": device,
+                 "event_timestamp": t, "trusted_direction": d, "raw_state": None}
+                for i, (t, d) in enumerate(swipes)]
+
+    @staticmethod
+    def _fix(kind, cid=1, fingerprint=None, at=None, direction=None, owner=1):
+        return {"id": cid, "employee_id": owner, "kind": kind, "fingerprint": fingerprint,
+                "event_timestamp": at, "direction": direction}
+
+    def _score(self, rows, corrections=()):
+        merged = apply_corrections(rows, list(corrections), self.MAIN_IDS)
+        return compute_day(counted_punches(merged, self.WINDOWS), target_minutes=480)
+
+    def test_added_in_turns_x990_long_break_into_two_stretches(self) -> None:
+        rows = self._rows((_t(9), None), (_t(13), None), (_t(18), None))
+        before = self._score(rows)
+        self.assertEqual(before.segments, (Segment(_t(9), _t(13)), Segment(_t(18), None)))
+        self.assertEqual(before.anomalies, ("No exit after 18:00",))
+        after = self._score(rows, [self._fix("add", at=_t(13, 40), direction="entry")])
+        self.assertEqual(after.segments, (Segment(_t(9), _t(13)), Segment(_t(13, 40), _t(18))))
+        self.assertEqual((after.status, after.anomalies, after.break_seconds), ("met", (), 2400))
+
+    def test_added_row_carries_the_owners_main_id_and_no_device(self) -> None:
+        [added] = apply_corrections([], [self._fix("add", cid=5, at=_t(13, 40), direction="entry")],
+                                    self.MAIN_IDS)
+        self.assertEqual(
+            {k: added[k] for k in ("device_user_id", "employee_id", "fingerprint", "device_id", "site",
+                                   "trusted_direction", "correction")},
+            {"device_user_id": "7", "employee_id": 1, "fingerprint": "correction:5", "device_id": None,
+             "site": None, "trusted_direction": "entry", "correction": "added"})
+        # An owner outside the read (no main ID known) adds nothing.
+        self.assertEqual(apply_corrections([], [self._fix("add", owner=2, at=_t(9), direction="entry")],
+                                           self.MAIN_IDS), [])
+
+    def test_set_direction_makes_a_wrong_c3_exit_an_entry(self) -> None:
+        rows = self._rows((_t(9), "entry"), (_t(13), "exit"), (_t(13, 40), "exit"), (_t(18), "exit"),
+                          device="c3")
+        self.assertEqual(self._score(rows).segments, (Segment(_t(9), _t(13)),))
+        fixed = self._score(rows, [self._fix("set_direction", fingerprint="fp-2", direction="entry")])
+        self.assertEqual(fixed.segments, (Segment(_t(9), _t(13)), Segment(_t(13, 40), _t(18))))
+        self.assertEqual(fixed.anomalies, ())
+
+    def test_ignored_duplicate_leaves_hours_but_stays_in_the_rows(self) -> None:
+        rows = self._rows((_t(9), "entry"), (_t(9, 5), "entry"), (_t(18), "exit"), device="c3")
+        self.assertEqual(self._score(rows).anomalies, ("No exit after 09:00",))
+        merged = apply_corrections(rows, [self._fix("ignore", fingerprint="fp-0")], self.MAIN_IDS)
+        self.assertEqual([r["correction"] for r in merged], ["ignored", None, None])
+        result = compute_day(counted_punches(merged, self.WINDOWS), target_minutes=480)
+        self.assertEqual((result.segments, result.anomalies), ((Segment(_t(9, 5), _t(18)),), ()))
+
+    def test_added_punch_30s_after_same_direction_punch_is_not_collapsed(self) -> None:
+        rows = self._rows((_t(9), "entry"), (_t(13), "exit"), device="x990")
+        result = self._score(rows, [self._fix("add", at=_t(13, 0, 30), direction="exit")])
+        self.assertEqual(result.collapsed, ())
+        self.assertEqual(result.unpaired, ((_t(13, 0, 30), "exit"),))
+        # The same swipe from the device itself would collapse into the 13:00 Out.
+        real = self._score(self._rows((_t(9), "entry"), (_t(13), "exit"), (_t(13, 0, 30), "exit")))
+        self.assertEqual(len(real.collapsed), 1)
+
+    def test_dangling_or_foreign_fingerprint_is_inert(self) -> None:
+        rows = self._rows((_t(9), "entry"), (_t(18), "exit"), device="c3")
+        corrections = [self._fix("ignore", fingerprint="fp-gone"),
+                       self._fix("set_direction", cid=2, fingerprint="fp-gone", direction="exit"),
+                       # The punch's ID now belongs to someone else: their fix does not follow it.
+                       self._fix("ignore", cid=3, fingerprint="fp-0", owner=2)]
+        merged = apply_corrections(rows, corrections, self.MAIN_IDS)
+        self.assertEqual([(r["trusted_direction"], r["correction"]) for r in merged],
+                         [("entry", None), ("exit", None)])
+        self.assertEqual(rows[0].get("correction", "untouched"), "untouched")
 
 
 if __name__ == "__main__":

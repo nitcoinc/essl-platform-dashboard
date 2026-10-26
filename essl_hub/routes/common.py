@@ -15,7 +15,7 @@ from werkzeug.local import LocalProxy
 from .. import config, roster
 from ..config import TIMEZONE_NAME
 from ..db import Database, device_ids_of
-from ..hours import DEFAULT_DAY_START_HOUR, DayResult, compute_day, punch_from_row, work_day, work_day_window
+from ..hours import DEFAULT_DAY_START_HOUR, DayResult, compute_day, counted_punches, work_day, work_day_window
 
 
 _TZ = ZoneInfo(TIMEZONE_NAME)
@@ -276,7 +276,7 @@ def _day_for_employee(
         windows = database.device_windows()
     start, end = work_day_window(day, day_start_hour)
     rows = database.punches_for_employee_range(device_ids_of(employee), start, end)
-    punches = [punch_from_row(row, windows) for row in rows]
+    punches = counted_punches(rows, windows)
     now = now or _now_naive()
     is_today = day == work_day(now, day_start_hour)
     now = now if is_today else None

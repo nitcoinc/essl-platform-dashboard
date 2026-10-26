@@ -100,5 +100,30 @@ class CheckinsApiTest(unittest.TestCase):
             self.assertEqual(touch.call_count, 2)
 
 
+    # U2 / KTD4: approved fixes change hours, never the check-in feed.
+
+    def test_fixes_change_hours_but_never_the_checkin_feed(self):
+        from datetime import date, datetime
+
+        before = self.get().get_json()
+        for uid, name in (("101", "Asha"), ("900", "Hari")):
+            self.database.upsert_employee(device_user_id=uid, name=name, email=f"{name.lower()}@x.com")
+        asha = self.database.employee_by_device_user_id("101")["id"]
+        hari = self.database.employee_by_device_user_id("900")["id"]
+        request_id = self.database.file_fix_lines(asha, date(2026, 3, 2), [
+            {"kind": "ignore", "target_fingerprint": "a"},
+            {"kind": "flip", "target_fingerprint": "b", "direction": "entry"},
+            {"kind": "add_out", "event_time": datetime(2026, 3, 2, 19, 0)},
+        ], source="session")["request_id"]
+        self.database.decide_fix_lines(request_id, [
+            {"line_id": line["id"], "status": "approved"}
+            for line in self.database.fix_request(request_id)["lines"]], actor_id=hari)
+        self.assertEqual(self.get().get_json(), before)
+        hours = self.client.get("/api/v1/hours?from=2026-03-02&to=2026-03-02",
+                                headers={"Authorization": f"Bearer {KEY}"}).get_json()
+        (row,) = [r for r in hours["results"] if r["device_user_id"] == "101"]
+        # 09:00 ignored, 18:00 now an In, HR's 19:00 Out: one hour.
+        self.assertEqual((row["effective_minutes"], row["status"]), (60, "short"))
+
 if __name__ == "__main__":
     unittest.main()

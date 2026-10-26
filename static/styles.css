@@ -516,6 +516,7 @@ input[type="file"]::file-selector-button {
 .bar-mark.is-start .bar-mark-label { transform: none; }
 .bar-mark.is-end { margin-left: -1px; }
 .bar-mark.is-end .bar-mark-label { left: auto; right: 0; transform: none; }
+.fix-flags { display: flex; flex-wrap: wrap; gap: var(--s2); margin: 0 0 var(--s3); }
 .raw-punches { margin-top: var(--s4); }
 .raw-punches-title { margin: 0; font-size: var(--text-14); font-weight: 600; color: var(--text-secondary); }
 .punch-list { list-style: none; margin: var(--s2) 0 0; padding: 0; max-width: 460px; }

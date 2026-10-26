@@ -1782,6 +1782,86 @@ class MissedPunchSchemaTest(unittest.TestCase):
         self.assertEqual([p["name"] for p in self.database.active_admins()], ["Adam"])
         self.assertEqual(self.database.active_admins()[0]["device_ids"], ["104"])
 
+    # --- correction overlay (U2) ------------------------------------------------
+
+    def _overlay_day(self) -> None:
+        """Asha (main 101, extra NP0101) on a C3: In 09:00, Out 13:00, a wrong
+        Out 13:40 under her extra ID, a duplicate Out 18:00:20, Out 18:00."""
+        with self.database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO devices (id, site, model, ip, port, protocol) "
+                "VALUES ('c3', 'Gachibowli', 'C3-400', '10.0.0.2', 4370, 'c3-pullsdk')")
+        self.database.add_extra_device_id(self.asha, "NP0101")
+        swipes = (("fp-in", "101", (9, 0, 0), "entry"), ("fp-out", "101", (13, 0, 0), "exit"),
+                  ("fp-wrong", "NP0101", (13, 40, 0), "exit"), ("fp-last", "101", (18, 0, 0), "exit"),
+                  ("fp-dup", "101", (18, 0, 20), "exit"))
+        self.database.insert_punches([{
+            "fingerprint": fp, "device_id": "c3", "site": "Gachibowli", "device_user_id": uid,
+            "event_timestamp": datetime(2026, 10, 26, *hms), "trusted_direction": direction,
+            "raw_state": "event 0",
+        } for fp, uid, hms, direction in swipes])
+
+    def _approve(self, *lines) -> None:
+        request_id = self._file(*lines)["request_id"]
+        self.database.decide_fix_lines(
+            request_id, [{"line_id": l["id"], "status": "approved"}
+                         for l in self.database.fix_request(request_id)["lines"]],
+            actor_id=self.hari)
+
+    def test_overlay_merges_into_both_read_paths_and_punches_stay_raw(self) -> None:
+        self._overlay_day()
+        start, end = datetime(2026, 10, 26, 6), datetime(2026, 10, 27, 6)
+        self._approve({"kind": "flip", "target_fingerprint": "fp-wrong", "direction": "entry"},
+                      {"kind": "ignore", "target_fingerprint": "fp-dup"},
+                      {"kind": "add_in", "event_time": datetime(2026, 10, 26, 19, 0)},
+                      {"kind": "ignore", "target_fingerprint": "fp-gone"})
+        one = self.database.punches_for_employee_range(["101", "NP0101"], start, end)
+        many = self.database.punches_for_device_users_range(["101", "NP0101", "999"], start, end)
+        self.assertEqual(
+            [(r["fingerprint"], r["device_user_id"], r["trusted_direction"], r["correction"]) for r in one],
+            [("fp-in", "101", "entry", None), ("fp-out", "101", "exit", None),
+             ("fp-wrong", "NP0101", "entry", "direction_fixed"), ("fp-last", "101", "exit", None),
+             ("fp-dup", "101", "exit", "ignored"), ("correction:3", "101", "entry", "added")])
+        self.assertEqual(one[0]["raw_state"], "event 0")
+        self.assertEqual({r["employee_id"] for r in one}, {self.asha})
+        added = one[-1]
+        self.assertEqual((added["device_id"], added["site"], added["raw_state"]), (None, None, None))
+        # The many-person path holds the same rows, by device user ID then time.
+        self.assertEqual(sorted(r["fingerprint"] for r in many), sorted(r["fingerprint"] for r in one))
+        self.assertEqual([r["device_user_id"] for r in many], ["101"] * 5 + ["NP0101"])
+        with self.database.connect() as connection:
+            stored = connection.execute(
+                "SELECT fingerprint, trusted_direction FROM punches ORDER BY event_timestamp").fetchall()
+        self.assertEqual([(r["fingerprint"], r["trusted_direction"]) for r in stored], [
+            ("fp-in", "entry"), ("fp-out", "exit"), ("fp-wrong", "exit"), ("fp-last", "exit"),
+            ("fp-dup", "exit")])
+        # Another person's read never sees Asha's fixes.
+        self.assertEqual(self.database.punches_for_employee_range("102", start, end), [])
+
+    def test_added_punch_reads_back_on_a_day_without_device_punches(self) -> None:
+        self._approve({"kind": "add_in", "event_time": datetime(2026, 10, 26, 9, 0)})
+        rows = self.database.punches_for_employee_range(
+            "101", datetime(2026, 10, 26, 6), datetime(2026, 10, 27, 6))
+        self.assertEqual([(r["device_user_id"], r["correction"]) for r in rows], [("101", "added")])
+        # Outside the window it does not.
+        self.assertEqual(self.database.punches_for_employee_range(
+            "101", datetime(2026, 10, 27, 6), datetime(2026, 10, 28, 6)), [])
+
+    def test_frappe_checkins_and_id_issues_read_raw_punches_only(self) -> None:
+        self._overlay_day()
+        self._approve({"kind": "flip", "target_fingerprint": "fp-wrong", "direction": "entry"},
+                      {"kind": "ignore", "target_fingerprint": "fp-dup"},
+                      {"kind": "add_in", "event_time": datetime(2026, 10, 26, 13, 40, 30)})
+        pending = self.database.frappe_pending_punches(since=None, limit=50)
+        checkins = self.database.checkins_since(since=None, limit=50)
+        for rows in (pending, checkins):
+            self.assertEqual(len(rows), 5)
+            self.assertNotIn(datetime(2026, 10, 26, 13, 40, 30), [r["event_timestamp"] for r in rows])
+            # Raw directions: the flipped punch still goes out as an exit.
+            self.assertEqual(rows[2]["trusted_direction"], "exit")
+        self.assertEqual({r["device_user_id"]: r["punch_count"] for r in self.database.device_id_summary()},
+                         {"101": 4, "NP0101": 1})
+
 
 class SharedLocalFileTest(unittest.TestCase):
     """Local-first U1 / KTD5, KTD6: two processes share one WAL file."""

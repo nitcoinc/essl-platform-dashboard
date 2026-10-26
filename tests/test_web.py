@@ -36,6 +36,7 @@ sys.path.insert(0, str(ROOT))
 from essl_hub import roster
 from essl_hub.config import DEVICES
 from essl_hub.db import OfflineError
+from essl_hub.hours import apply_corrections
 from essl_hub.web import create_app
 
 
@@ -273,24 +274,34 @@ class FakeDatabase:
             inserted += 1
         return inserted
 
-    def punches_for_employee_range(self, device_user_ids, start: datetime, end: datetime):
-        wanted = {device_user_ids} if isinstance(device_user_ids, str) else set(device_user_ids)
+    def _overlaid_punches(self, wanted, start: datetime, end: datetime) -> list[dict]:
+        """Database._overlaid_punches: owners via main and extra IDs, then the
+        same pure merge of approved fixes (KTD4)."""
+        owner_of = {e["device_user_id"]: e["id"] for e in self.employees_by_id.values()}
+        owner_of.update(self.extra_ids)
+        main_ids = {owner_of[uid]: self.employees_by_id[owner_of[uid]]["device_user_id"]
+                    for uid in wanted if uid in owner_of}
         rows = [
-            p
-            for p in self.punches
-            if p.get("device_user_id") in wanted and start <= p["event_timestamp"] < end
-        ]
-        rows.sort(key=lambda p: p["event_timestamp"])
-        return [
             {
+                "device_user_id": p.get("device_user_id"),
+                "employee_id": owner_of.get(p.get("device_user_id")),
+                "fingerprint": p.get("fingerprint"),
                 "event_timestamp": p["event_timestamp"],
                 "trusted_direction": p.get("trusted_direction"),
                 "raw_direction_byte": p.get("raw_direction_byte"),
                 "raw_state": p.get("raw_state", ""),
+                "site": p.get("site"),
                 "device_id": p.get("device_id"),
             }
-            for p in rows
+            for p in self.punches
+            if p.get("device_user_id") in wanted and start <= p["event_timestamp"] < end
         ]
+        rows.sort(key=lambda p: p["event_timestamp"])
+        return apply_corrections(rows, self.corrections_for(main_ids, start, end), main_ids)
+
+    def punches_for_employee_range(self, device_user_ids, start: datetime, end: datetime):
+        wanted = {device_user_ids} if isinstance(device_user_ids, str) else set(device_user_ids)
+        return self._overlaid_punches(wanted, start, end)
 
     def first_punch_at(self, device_user_ids):
         wanted = set(device_user_ids)
@@ -298,22 +309,8 @@ class FakeDatabase:
         return min(stamps) if stamps else None
 
     def punches_for_device_users_range(self, device_user_ids, start: datetime, end: datetime):
-        wanted = set(device_user_ids)
-        rows = [
-            p for p in self.punches
-            if p.get("device_user_id") in wanted and start <= p["event_timestamp"] < end
-        ]
-        rows.sort(key=lambda p: (p["device_user_id"], p["event_timestamp"]))
-        return [
-            {
-                "device_user_id": p["device_user_id"],
-                "event_timestamp": p["event_timestamp"],
-                "trusted_direction": p.get("trusted_direction"),
-                "site": p.get("site"),
-                "device_id": p.get("device_id"),
-            }
-            for p in rows
-        ]
+        rows = self._overlaid_punches(set(device_user_ids), start, end)
+        return sorted(rows, key=lambda p: (p["device_user_id"], p["event_timestamp"]))
 
     def unmapped_device_user_ids(self):
         mapped = {e["device_user_id"] for e in self.employees_by_id.values()} | set(self.extra_ids)
@@ -1936,6 +1933,99 @@ class HistoryPagingTest(_QuickViewBase):
         self.assertIn(f'data-qv-day="/quick/{rid}?date=2026-07-30&amp;strip_end=2026-08-03&amp;from=people"', page)
         self.assertIn(f'data-qv-date="/quick/{rid}?from=people"', page)
         self.assertIn('min="2026-06-01" max="2026-09-09"', page)
+
+
+class CorrectionOverlayWebTest(_QuickViewBase):
+    """U2/KTD4: approved fixes change hours on every screen; raw punches,
+    Frappe and /api/checkins never see them."""
+
+    DAY = datetime(2026, 9, 9)
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Pin the clock after the day so Team and People show it as today, closed.
+        common, me = _fixed_now(self.DAY + timedelta(hours=20))
+        common.start()
+        me.start()
+        self.addCleanup(common.stop)
+        self.addCleanup(me.stop)
+        self.hema = self._person("1", "Hema HR", "hr")
+        at = lambda h, m=0: self.DAY + timedelta(hours=h, minutes=m)  # noqa: E731
+        # 09:05 is a stray In; 13:40 was recorded Out but was an In.
+        self.database.insert_punches([
+            _punch_row("ov-in", at(9), "entry"), _punch_row("ov-stray", at(9, 5), "entry"),
+            _punch_row("ov-out", at(13), "exit"), _punch_row("ov-wrong", at(13, 40), "exit"),
+            _punch_row("ov-last", at(17), "exit"),
+        ])
+        self.lines = [
+            {"kind": "ignore", "target_fingerprint": "ov-stray"},
+            {"kind": "flip", "target_fingerprint": "ov-wrong", "direction": "entry"},
+            {"kind": "add_in", "event_time": at(17, 30)},
+            {"kind": "add_out", "event_time": at(18, 30)},
+        ]
+
+    def _decide(self, status: str) -> None:
+        request_id = self.database.file_fix_lines(
+            self.ravi["id"], self.DAY.date(), self.lines, source="session")["request_id"]
+        self.database.decide_fix_lines(request_id, [
+            {"line_id": l["id"], "status": status} for l in self.database.fix_request(request_id)["lines"]
+        ], actor_id=self.hema["id"], note="Checked" if status == "rejected" else None)
+
+    def _screens(self) -> dict:
+        import csv as csv_module
+
+        from essl_hub import export
+        self._sign_in(self.hema)
+        day = self.DAY.date().isoformat()
+        csv_text = self.client.get(f"/export.csv?from={day}&to={day}").text
+        row = next(r for r in csv_module.reader(io.StringIO(csv_text.lstrip("\ufeff"))) if "Ravi Kumar" in r)
+        team = self.client.get("/team").text
+        team_row = team[team.index("Ravi Kumar"):]
+        return {
+            "day": self.client.get(f"/day?employee={self.ravi['id']}").text,
+            "quick": self._quick(self.ravi["id"]).text,
+            "team": team_row[:team_row.index("</tr>")],
+            "people": self.client.get("/people").text,
+            "csv": row[export.DAILY_HEADER.index("Effective")],
+        }
+
+    def test_raw_day_reads_short_with_review(self) -> None:
+        screens = self._screens()
+        self.assertIn("3h 55m", screens["team"])
+        self.assertEqual(screens["csv"], "3:55")
+        self.assertNotIn("added by HR", screens["day"])
+
+    def test_approved_fixes_show_the_same_corrected_hours_everywhere(self) -> None:
+        self._decide("approved")
+        screens = self._screens()
+        # 09:00-13:00, 13:40-17:00, 17:30-18:30 = 8h 20m.
+        self.assertIn("8h 20m", screens["team"])
+        self.assertEqual(screens["csv"], "8:20")
+        for name in ("day", "quick"):
+            page = screens[name]
+            self.assertIn("8h 20m", page)
+            self.assertIn('<h3 class="raw-punches-title">All punches (7)</h3>', page)
+            self.assertIn('<span class="chip chip-neutral">ignored</span>', page)
+            self.assertIn('<span class="chip chip-info">direction fixed</span>', page)
+            self.assertEqual(page.count('<span class="chip chip-info">added by HR</span>'), 2)
+            self.assertIn("2 punches added by HR, 1 punch ignored", page)
+            self.assertNotIn("Fix pending", page)
+        self.assertIn('status-chip status-met">Met</span>', screens["people"])
+        # The device rows are untouched.
+        self.assertEqual([p.get("trusted_direction") for p in self.database.punches],
+                         ["entry", "entry", "exit", "exit", "exit"])
+
+    def test_day_chip_says_pending_then_rejected_and_hours_stay_raw(self) -> None:
+        self.database.file_fix_lines(self.ravi["id"], self.DAY.date(), self.lines[:1], source="session")
+        self.assertIn('<span class="chip chip-info">Fix pending</span>', self._screens()["day"])
+        request_id = self.database.pending_fix_request(self.ravi["id"], self.DAY.date())["id"]
+        line = self.database.fix_request(request_id)["lines"][0]["id"]
+        self.database.decide_fix_lines(request_id, [{"line_id": line, "status": "rejected"}],
+                                       actor_id=self.hema["id"], note="Badge log agrees")
+        screens = self._screens()
+        self.assertIn('<span class="chip chip-warn">Fix rejected</span>', screens["day"])
+        self.assertEqual(screens["csv"], "3:55")
+        self.assertNotIn(">ignored</span>", screens["day"])
 
 
 class QuickViewDrawerTest(_QuickViewBase):

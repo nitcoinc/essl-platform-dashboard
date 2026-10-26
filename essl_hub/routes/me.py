@@ -93,6 +93,7 @@ def _day_context(subject: dict, day, today, request_now, target_minutes: int, da
         breaks=day_story.break_view(
             result, now,
             database.punches_for_employee_range(device_ids_of(subject), *work_day_window(day, day_start_hour)),
+            database.fix_request_days([subject["id"]], day, day).get((subject["id"], day), ()),
         ),
         ring_percent=day_story.ring_percent(result, target_minutes),
         finish_at=reached if result.status == "open" else None,
