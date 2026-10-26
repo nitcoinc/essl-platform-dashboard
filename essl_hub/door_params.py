@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import timedelta
 
 # Connection and identity parameters, plus the per-door verify mode. Never
 # written from the dashboard (R12); rejected by name so the error is explicit.
@@ -44,6 +45,8 @@ NEVER_WRITABLE = frozenset(
 _VERIFY_TYPE = re.compile(r"^Door\d+VerifyType$")
 
 MAX_LOCK_COUNT = 4
+# KTD6: a request the collector has not reached by then expires unsent.
+DOOR_REQUEST_TTL = timedelta(minutes=15)
 # GETPARAM keys per call. A four-door read is 28 keys, so it fits in one.
 READ_BATCH = 30
 
@@ -121,7 +124,7 @@ class DoorParamError(ValueError):
 def param_for(key: str) -> tuple[DoorParam, int | None] | None:
     """The whitelist entry for ``key`` and its door number (None for the
     panel-wide keys), or None when ``key`` is not writable."""
-    match = _DOOR_KEY.match(key)
+    match = _DOOR_KEY.fullmatch(key)
     if match:
         return _BY_NAME[match.group(2)], int(match.group(1))
     param = _BY_NAME.get(key)
@@ -159,7 +162,7 @@ def parse_params(raw: dict) -> dict[str, int]:
     parsed: dict[str, int] = {}
     for key, value in raw.items():
         text = str(value).strip()
-        if _INTEGER.match(text):
+        if _INTEGER.fullmatch(text):
             parsed[str(key)] = int(text)
     return parsed
 
@@ -186,7 +189,7 @@ def validate_request(request: object, lock_count: int | None) -> dict[str, int]:
     for key, value in request.items():
         if not isinstance(key, str):
             raise DoorParamError("door parameter names must be text")
-        if key in NEVER_WRITABLE or _VERIFY_TYPE.match(key):
+        if key in NEVER_WRITABLE or _VERIFY_TYPE.fullmatch(key):
             raise DoorParamError(f"{key} is never written from the dashboard")
         found = param_for(key)
         if found is None:

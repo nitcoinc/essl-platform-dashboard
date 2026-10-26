@@ -27,7 +27,8 @@ class ValidateRequestTest(unittest.TestCase):
             validate_request({"Door5Intertime": 0}, 4)
         with self.assertRaisesRegex(DoorParamError, "2 door"):
             validate_request({"Door3Drivertime": 5}, 2)
-        for key in ("Door1Foo", "LockCount", "DateTime", "Door1Intertime,ComPwd"):
+        for key in ("Door1Foo", "LockCount", "DateTime", "Door1Intertime,ComPwd", "Door1Intertime\n",
+                    "Door1VerifyType\n"):
             with self.assertRaises(DoorParamError):
                 validate_request({key: 0}, 4)
 

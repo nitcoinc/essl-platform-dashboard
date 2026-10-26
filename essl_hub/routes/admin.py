@@ -10,9 +10,9 @@ from datetime import timedelta
 from flask import Blueprint, Response, abort, g, redirect, render_template, request, url_for
 
 from .. import access, config, hashing
-from ..collectors import DOOR_REQUEST_TTL
 from ..db import DUPLICATE_WINDOW_MAX
 from ..door_params import (
+    DOOR_REQUEST_TTL,
     PANEL_WIDE,
     PER_DOOR,
     DoorParamError,

@@ -13,6 +13,7 @@ from typing import Any, Callable
 
 from .config import DeviceConfig, numeric_comm_password, password_for
 from .door_params import (
+    DOOR_REQUEST_TTL,
     READ_BATCH,
     DoorParamError,
     lock_count_of,
@@ -450,7 +451,6 @@ def collect_c3(device: DeviceConfig) -> CollectionResult:
 # ConnectionError("Error <n> received in reply: ..."); anything else is a
 # lost connection. The result JSON is documented in essl_hub.door_params.
 C3_CMD_SETPARAM = 0x03
-DOOR_REQUEST_TTL = timedelta(minutes=15)
 _C3_REPLY_ERROR = re.compile(r"^Error (-?\d+) received in reply")
 C3_ERROR_TEXT = {-14: "communication password rejected", -13: "command not available"}
 

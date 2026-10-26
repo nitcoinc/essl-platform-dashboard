@@ -900,6 +900,16 @@ class Database:
                     (dict(previous), previous_for, device_id, previous_for),
                 )
 
+    def door_request_at(self, device_id: str) -> datetime | None:
+        """The pending door request's ``requested_at``, read fresh so the
+        collector never sends a request dismissed or replaced since its device
+        list was read."""
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT door_params_requested_at FROM devices WHERE id = ?", (device_id,)
+            ).fetchone()
+        return row["door_params_requested_at"] if row else None
+
     def clear_door_request(self, device_id: str, requested_at: datetime) -> bool:
         """Clear the request only if it is still the one filed at
         ``requested_at`` (KTD6), so a newer web request survives."""

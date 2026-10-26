@@ -14,6 +14,7 @@ from essl_hub.collector_main import (
 )
 from essl_hub.collectors import CollectionResult
 from essl_hub.config import DEVICES
+from essl_hub.db import OfflineError
 from essl_hub.spool import Spool
 
 
@@ -66,6 +67,10 @@ class FakeDatabase:
         self.door_records.append({"device_id": device_id, "params": params, "read_at": read_at,
                                   "result": result, "previous": previous,
                                   "previous_for": previous_for})
+
+    def door_request_at(self, device_id):
+        row = next((r for r in self.connection_info if r["id"] == device_id), {})
+        return collector_main._as_datetime(row.get("door_params_requested_at"))
 
     def clear_door_request(self, device_id, requested_at) -> bool:
         self.door_clears.append((device_id, requested_at))
@@ -772,10 +777,39 @@ class DoorStepDatabaseTest(unittest.TestCase):
         self.database.file_door_request(self.c3_id, {"Door1Intertime": 2}, requested_at=self.T2)
         self._door_once(device)
         row = self.database.device_by_id(self.c3_id)
+        # The superseded T1 request never reaches the door; T2 stays pending.
         self.assertEqual(row["door_params_request"], {"Door1Intertime": 2})
         self.assertEqual(row["door_params_requested_at"], self.T2)
+        self.assertIsNone(row["door_params_result"])
+        self.assertEqual([f for p in self.panel.instances for f in p.sent], [])
+
+    def test_a_request_dismissed_after_the_device_list_was_read_is_never_sent(self) -> None:
+        self.database.file_door_request(self.c3_id, {"Door1Intertime": 0}, requested_at=self.T1)
+        device = self._device()
+        self.database.dismiss_door_request(self.c3_id)
+        self._door_once(device)
+        self.assertEqual([f for p in self.panel.instances for f in p.sent], [])
+        self.assertIsNone(self.database.device_by_id(self.c3_id)["door_params_result"])
+
+    def test_a_failed_result_write_is_retried_not_resent_or_expired(self) -> None:
+        from essl_hub import collectors
+
+        self.database.file_door_request(self.c3_id, {"Door1Intertime": 0}, requested_at=self.T1)
+        device = self._device()
+        state = collector_main.PollState()
+        with patch.object(self.database, "record_door_params", side_effect=OfflineError("busy")):
+            with patch("c3.C3", self.panel), self.assertRaises(OfflineError):
+                collector_main.door_once(self.database, device, door_step=collectors.c3_door_step,
+                                         state=state, now=self.NOW)
+        later = self.T1 + timedelta(minutes=30)
+        with patch("c3.C3", self.panel):
+            collector_main.door_once(self.database, device, door_step=collectors.c3_door_step,
+                                     state=state, now=later)
+        sent = [f for p in self.panel.instances for f in p.sent]
+        self.assertEqual(sent, [(0x03, b"Door1Intertime=0")])
+        row = self.database.device_by_id(self.c3_id)
         self.assertEqual(row["door_params_result"]["state"], "applied")
-        self.assertEqual(row["door_params_result"]["requested_at"], "2026-10-26 10:00:00")
+        self.assertIsNone(row["door_params_request"])
 
     def test_a_drop_clears_the_request_and_keeps_both_originals(self) -> None:
         self.panel.behaviour = {"Door2Intertime": "drop"}

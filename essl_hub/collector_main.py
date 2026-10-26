@@ -15,7 +15,6 @@ from .collectors import (
     DoorStep,
     c3_door_step,
     collect,
-    door_request_expired,
 )
 from .config import (
     DEVICES,
@@ -115,6 +114,13 @@ class _Written:
 
 
 @dataclasses.dataclass
+class _DoorAnswer:
+    requested_at: datetime
+    outcome: object
+    recorded: bool = False
+
+
+@dataclasses.dataclass
 class PollState:
     """In-memory collector state (KTD11).
 
@@ -128,9 +134,9 @@ class PollState:
     connection_versions: dict[str, object] = dataclasses.field(default_factory=dict)
     ready: bool = False
     last_poll: str | None = None
-    # requested_at of the last door request answered per device, so a stale
-    # device list (failed refresh) never re-sends it.
-    door_handled: dict[str, object] = dataclasses.field(default_factory=dict)
+    # (requested_at, outcome) of the last door request answered per device:
+    # it is never sent again, and a failed result write is retried from here.
+    door_handled: dict[str, _DoorAnswer] = dataclasses.field(default_factory=dict)
 
 
 def _has_unseen(database: Database, events) -> bool:
@@ -245,23 +251,33 @@ def door_once(
 
     A door_step error (panel unreachable before any write) leaves the request
     pending. A result is recorded, then the request is cleared only if the web
-    has not replaced it meanwhile (KTD6)."""
+    has not replaced it meanwhile (KTD6). A request answered once is never
+    sent again: if recording its result failed, the saved outcome is
+    recorded on the next cycle instead (never re-sent, never "expired")."""
     now = now or _ist_now()
     request = device.door_request
     requested_at = device.door_requested_at
     if request is None or requested_at is None:
         request = requested_at = None
-    elif (
-        state is not None
-        and state.door_handled.get(device.id) == requested_at
-        and not door_request_expired(requested_at, now)
-    ):
+    elif database.door_request_at(device.id) != requested_at:
+        # The device list is read at cycle start; the admin has since
+        # dismissed or replaced this request, so it must not reach the door.
         request = requested_at = None
-    if request is None and not history_read:
-        return
-    outcome = door_step(device, request, requested_at, now=now)
-    if requested_at is not None and outcome.result is not None and state is not None:
-        state.door_handled[device.id] = requested_at
+    answer = state.door_handled.get(device.id) if state is not None else None
+    if answer is None or answer.requested_at != requested_at:
+        answer = None
+    elif answer.recorded:
+        # Answered and stored; only the clear is not visible yet.
+        request = requested_at = answer = None
+    if answer is not None:
+        # Answered, but recording it failed: store that outcome, never re-send.
+        outcome = answer.outcome
+    else:
+        if request is None and not history_read:
+            return
+        outcome = door_step(device, request, requested_at, now=now)
+        if requested_at is not None and outcome.result is not None and state is not None:
+            answer = state.door_handled[device.id] = _DoorAnswer(requested_at, outcome)
     if outcome.params is None and outcome.result is None:
         return
     database.record_door_params(
@@ -275,6 +291,8 @@ def door_once(
     if requested_at is not None and outcome.result is not None:
         if not database.clear_door_request(device.id, requested_at):
             _logger.info("door request for %s was replaced meanwhile; the newer one stays", device.id)
+        if answer is not None:
+            answer.recorded = True
     if outcome.result is not None:
         _logger.info("door request for %s: %s", device.id, outcome.result.get("state"))
 
