@@ -1989,7 +1989,7 @@ class HistoryPagingTest(_QuickViewBase):
         self._sign_in(self._person("1", "Hema HR", "hr"))
         for page in (self.client.get(f"/day?employee={self.ravi['id']}").text, self._quick(self.ravi["id"]).text):
             chips = self._chips(page)
-            self.assertIn('aria-label="Wednesday 09 September, Today"', chips[-1])
+            self.assertIn('aria-label="Wednesday 09 September, Today, no punches"', chips[-1])
             self.assertIn('aria-current="date"', chips[-1])
             self.assertNotIn('data-qv-page="later"', page)
             self.assertNotIn('aria-label="Later week,', page)
@@ -2000,11 +2000,11 @@ class HistoryPagingTest(_QuickViewBase):
         self._sign_in(self._person("1", "Hema HR", "hr"))
         rid = self.ravi["id"]
         page = self.client.get(f"/day?employee={rid}&date=2026-09-05&strip_end=2026-12-01").text
-        self.assertIn('aria-label="Wednesday 09 September, Today"', self._chips(page)[-1])
+        self.assertIn('aria-label="Wednesday 09 September, Today, no punches"', self._chips(page)[-1])
         self.assertFalse(any("strip_end=" in c for c in self._chips(page)))
         drawer = self._quick(rid, "?date=2026-09-05&strip_end=2026-12-01")
         self.assertEqual(drawer.status_code, 200)
-        self.assertIn('aria-label="Wednesday 09 September, Today"', self._chips(drawer.text)[-1])
+        self.assertIn('aria-label="Wednesday 09 September, Today, no punches"', self._chips(drawer.text)[-1])
         # A malformed strip_end on /day falls back like a malformed date.
         self.assertEqual(self.client.get(f"/day?employee={rid}&strip_end=nope").status_code, 200)
 
@@ -5483,6 +5483,24 @@ class DeviceHealthWebTest(unittest.TestCase):
         self.assertIn("<span>Uppal X990 unreachable since 25 Oct</span>", page)
         self.assertIn('aria-label="Devices, 1 device unreachable"', self._devices_entry(page))
 
+    def test_backup_table_cells_carry_data_labels(self) -> None:
+        # U7: on a phone the stacked rows label every value.
+        import json
+
+        with open(os.environ["ESSL_BACKUP_STATUS_PATH"], "w", encoding="utf-8") as handle:
+            json.dump({"r2_configured": False, "entries": [
+                {"status": "ok", "started": "2026-10-26 17:00:00", "finished": "2026-10-26 17:00:05",
+                 "key": "exports/run-1.db.gz", "size": 2048},
+            ]}, handle)
+        page = self.client.get("/health").text
+        row = re.search(r"<tr>\s*<td[^>]*>2026-10-26 17:00:00.*?</tr>", page, re.S).group(0)
+        cells = re.findall(r"<td([^>]*)>", row)
+        self.assertEqual(len(cells), 5)
+        self.assertEqual(
+            [re.search(r'data-label="([^"]+)"', c).group(1) for c in cells],
+            ["Started (IST)", "Finished (IST)", "Result", "Size", "Detail"],
+        )
+
     def test_id_issue_notice_is_at_the_top_of_devices(self) -> None:
         from essl_hub.routes.people import forget_issue_count
 
@@ -6375,3 +6393,129 @@ class FixReviewTest(unittest.TestCase):
         self.assertTrue(response.headers["Location"].endswith("/fixes/review"))
         self.assertEqual(self.database.fix_request(request_id)["status"], "approved")
         self.assertIn("Saved. 1 line approved, 0 rejected.", self._flash())
+
+
+class CopyAndPhoneLayoutTest(unittest.TestCase):
+    """U6 (chips and copy) and U7 (phone layouts). Today is Wednesday
+    2026-10-28, mid-morning; Asha reports to Meera."""
+
+    NOW = datetime(2026, 10, 28, 12, 0)
+
+    def setUp(self) -> None:
+        self.app, self.database = _make_app()
+        self.client = self.app.test_client()
+        from essl_hub import mail as mail_module
+
+        self.captured = {}
+        original = mail_module.send_login_code
+        mail_module.send_login_code = lambda e, c: self.captured.update(code=c)
+        self.addCleanup(lambda: setattr(mail_module, "send_login_code", original))
+        for patcher in _fixed_now(self.NOW):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.asha = self._person("118", "Asha Rao")
+        self.boss = self._person("200", "Meera Boss", "manager")
+        self.hari = self._person("300", "Hari HR", "hr")
+        self.database.set_employee_manager(self.asha["id"], self.boss["id"])
+
+    def _person(self, uid: str, name: str, role: str = "employee") -> dict:
+        email = f"{name.split()[0].lower()}@example.com"
+        self.database.upsert_employee(device_user_id=uid, name=name, email=email)
+        person = self.database.employee_by_email(email)
+        self.database.set_employee_role(person["id"], role)
+        return person
+
+    def _sign_in(self, person: dict) -> None:
+        self.client.post("/signout")
+        self.client.post("/signin", data={"email": person["email"]})
+        self.client.post("/signin/verify", data={"code": self.captured["code"]})
+
+    def _flag(self, day: datetime) -> None:
+        """A day with an entry that has no exit after it: needs review."""
+        tag = day.date().isoformat()
+        self.database.insert_punches([
+            _punch_row(f"{tag}-1", day + timedelta(hours=9), "entry"),
+            _punch_row(f"{tag}-2", day + timedelta(hours=14, minutes=33), "entry"),
+            _punch_row(f"{tag}-3", day + timedelta(hours=18), "exit"),
+        ])
+
+    @staticmethod
+    def _notice(page: str) -> str:
+        return re.search(r'<div class="notice review-notice">.*?</div>', page, re.S).group(0)
+
+    # --- U6 -----------------------------------------------------------------
+
+    def test_needs_review_chip_is_a_warn_chip_not_the_review_flag(self) -> None:
+        self._flag(datetime(2026, 10, 28))
+        self._sign_in(self.hari)
+        for path in ("/people", "/team"):
+            with self.subTest(path=path):
+                page = self.client.get(path).text
+                self.assertIn('<span class="chip chip-warn" title="No exit after 09:00">Needs review', page)
+                self.assertNotIn("review-flag", page)
+
+    def test_target_reached_line_says_they_to_others_and_you_to_the_person(self) -> None:
+        self.database.insert_punches([_punch_row("live-in", datetime(2026, 10, 28, 9), "entry")])
+        self._sign_in(self.asha)
+        own = self.client.get("/day").text
+        self.assertIn("</strong> if you stay in.", own)
+        self._sign_in(self.hari)
+        other = self.client.get(f"/day?employee={self.asha['id']}").text
+        self.assertIn("</strong> if they stay in.", other)
+        self.assertNotIn("if you stay in", other)
+
+    def test_own_recent_flagged_day_points_to_report_a_problem(self) -> None:
+        self._flag(datetime(2026, 10, 26))
+        self._sign_in(self.asha)
+        page = self.client.get("/day?date=2026-10-26").text
+        notice = self._notice(page)
+        self.assertIn('Use <a href="/day/2026-10-26/report">Report a problem</a> to tell HR what happened.', notice)
+        self.assertNotIn("Ask HR", page)
+        self.assertNotIn("too old", page)
+
+    def test_own_ten_day_old_flagged_day_says_too_old_to_report(self) -> None:
+        self._flag(datetime(2026, 10, 18))
+        self._sign_in(self.asha)
+        page = self.client.get("/day?date=2026-10-18").text
+        self.assertIn("This day is too old to report here — ask HR.", self._notice(page))
+        self.assertNotIn("/day/2026-10-18/report", page)
+
+    def test_manager_view_of_a_flagged_day_keeps_the_hr_line(self) -> None:
+        self._flag(datetime(2026, 10, 26))
+        self._sign_in(self.boss)
+        page = self.client.get(f"/day?employee={self.asha['id']}&date=2026-10-26").text
+        notice = self._notice(page)
+        self.assertIn("Ask HR to record an explanation.", notice)
+        self.assertNotIn("Report a problem", notice)
+
+    # --- U7 -----------------------------------------------------------------
+
+    def test_week_marks_future_days_only(self) -> None:
+        self._sign_in(self.asha)
+        page = self.client.get("/week").text
+        rows = re.findall(r"<tr(?: class=\"([^\"]*)\")?>\s*<td data-label=\"Day\" class=\"week-day\">(.*?)</td>", page, re.S)
+        self.assertEqual(len(rows), 5)
+        classes = {re.search(r"\w{3} \d\d \w{3}", cell).group(0): cls for cls, cell in rows}
+        self.assertEqual(classes, {
+            "Mon 26 Oct": "", "Tue 27 Oct": "", "Wed 28 Oct": "is-today",
+            "Thu 29 Oct": "is-future", "Fri 30 Oct": "is-future",
+        })
+        self.assertIn('Thu 29 Oct<span class="week-future-note"> · not yet</span>', page)
+        self.assertNotIn('href="/day?date=2026-10-29"', page)
+
+    def test_day_strip_chips_carry_full_status_label_and_a_glyph(self) -> None:
+        self.database.insert_punches([_punch_row("strip-1", datetime(2026, 10, 27, 9), "entry")])
+        self._sign_in(self.asha)
+        page = self.client.get("/day").text
+        chips = re.findall(r'<a class="day-chip.*?</a>', page, re.S)
+        self.assertEqual(len(chips), 7)
+        for chip in chips:
+            self.assertRegex(chip, r'aria-label="\w+day \d\d \w+, (Punched|No punches|Today, (punched|no punches))"')
+            self.assertRegex(chip, r'<span class="day-chip-dot" aria-hidden="true"><svg class="icon day-chip-glyph"')
+            self.assertIn('<span class="day-chip-word">', chip)
+        tuesday = next(c for c in chips if "Tuesday 27 October" in c)
+        self.assertIn('aria-label="Tuesday 27 October, Punched"', tuesday)
+        self.assertIn('href="#i-check"', tuesday)
+        today = chips[-1]
+        self.assertIn('aria-label="Wednesday 28 October, Today, no punches"', today)
+        self.assertIn('href="#i-minus"', today)

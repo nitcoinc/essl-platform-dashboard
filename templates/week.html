@@ -55,8 +55,11 @@
       <tbody>
         {% for row in days %}
         {% set r = row.result %}
-        <tr class="{{ 'is-today' if row.date == today }}">
-          <td data-label="Day">{% if r is not none %}<a class="day-link" href="{{ url_for('me.day_view', employee=emp, date=row.date.isoformat()) }}">{{ row.date.strftime('%a %d %b') }}</a>{% else %}<span class="muted">{{ row.date.strftime('%a %d %b') }}</span>{% endif %}</td>
+        {#- U7: a day still ahead is is-future; under 768px it folds to one
+            plain line, and each card's date is its heading, not a "Day" row. -#}
+        {% set row_class = ('is-today' if row.date == today else '') ~ ('is-future' if r is none else '') %}
+        <tr{% if row_class %} class="{{ row_class }}"{% endif %}>
+          <td data-label="Day" class="week-day">{% if r is not none %}<a class="day-link" href="{{ url_for('me.day_view', employee=emp, date=row.date.isoformat()) }}">{{ row.date.strftime('%a %d %b') }}</a>{% else %}<span class="muted">{{ row.date.strftime('%a %d %b') }}<span class="week-future-note"> · not yet</span></span>{% endif %}</td>
           {% if r is none %}
           <td data-label="First entry" class="num"><span class="muted">-</span></td>
           <td data-label="Last exit" class="num"><span class="muted">-</span></td>

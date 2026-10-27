@@ -100,6 +100,10 @@ def _day_context(subject: dict, day, today, request_now, target_minutes: int, da
         last_synced=last_synced,
         stale_sync=stale_sync,
         previous_entry=previous_entry,
+        # U7: only on your own day, and only while it can still be reported;
+        # the needs-review notice (U6) points here, so /day, its poll and the
+        # drawer all agree.
+        can_report=subject["id"] == g.employee["id"] and reportable(day, today),
         request_now=request_now,
         server_epoch_ms=int(request_now.replace(tzinfo=_TZ).timestamp() * 1000),
         target_minutes=target_minutes,
@@ -252,8 +256,6 @@ def day_view():
         prev_date=day - timedelta(days=1),
         next_date=day + timedelta(days=1),
         strip=strip,
-        # U7: only on your own day, and only while it can still be reported.
-        can_report=subject["id"] == g.employee["id"] and reportable(day, today),
     )
     template = "_day_live.html" if partial else "day.html"
     return _vary_htmx(make_response(render_template(template, **context)))
