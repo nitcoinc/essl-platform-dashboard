@@ -5,13 +5,17 @@
 <header class="topbar">
   <div>
     <h1>People</h1>
-    <p>Hours only count when the ID on the door device matches a person in the Directory. Fix mismatches here.</p>
+    <p>Hours only count when the ID on the door device matches a person in the Directory. Fix mismatches here. Punches of old or test cards can be archived; see <a href="{{ url_for('people.punch_archives_view') }}">Archived punches</a>.</p>
   </div>
 </header>
 {% include "_people_tabs.html" %}
 
 {% if flash.linked %}
 <div class="notice notice-ok" role="status">{{ ui.icon('check') }}<p><strong>Linked {{ flash.linked }} to {{ flash.who }}.</strong> {% if flash.punches %}{{ flash.punches }} past {{ 'punch' if flash.punches == 1 else 'punches' }} now count for them.{% endif %}</p></div>
+{% endif %}
+{% if flash.archived %}
+{% set n = flash.punches %}
+<div class="notice notice-ok" role="status">{{ ui.icon('check') }}<p><strong>Archived {{ n }} {{ 'punch' if n == 1 else 'punches' }} from ID {{ flash.archived }}.</strong> They are hidden everywhere until restored from <a href="{{ url_for('people.punch_archives_view') }}">Archived punches</a>.</p></div>
 {% endif %}
 {% if flash.error %}
 <div class="notice notice-bad" role="alert">{{ ui.icon('circle-alert') }}<p>{{ flash.error }}</p></div>
@@ -24,6 +28,9 @@
   <p><strong>{{ n }} {{ 'punch' if n == 1 else 'punches' }}</strong> will start counting for {{ confirm.employee.name }}.
     {% if confirm.mode == 'extra' %}{{ confirm.device_user_id }} is added as another device ID; their main ID {{ confirm.employee.device_user_id }} stays.
     {%- else %}Their main device ID changes from {{ confirm.employee.device_user_id }} to {{ confirm.device_user_id }}.{% endif %}</p>
+  {% if confirm.archived %}{% set h = confirm.archived.hidden %}
+  <p class="issue-archived-note"><strong>{{ h }} {{ 'punch' if h == 1 else 'punches' }} of this ID are archived and stay hidden.</strong> They will not count unless you restore the archive on <a href="{{ url_for('people.punch_archives_view') }}">Archived punches</a>.</p>
+  {% endif %}
   <form method="post" action="{{ url_for('people.id_issues_link') }}" class="issue-confirm-actions">
     <input type="hidden" name="csrf" value="{{ csrf_token }}">
     <input type="hidden" name="device_user_id" value="{{ confirm.device_user_id }}">
@@ -31,6 +38,47 @@
     {{ ui.button(('Add ' if confirm.mode == 'extra' else 'Link ') ~ confirm.device_user_id, 'primary', type='submit') }}
     {{ ui.button('Cancel', 'tertiary', href=url_for('people.id_issues_view')) }}
   </form>
+</section>
+{% endif %}
+
+{% if archive %}
+{% set n = archive.count or 0 %}
+<section class="issue-confirm" aria-labelledby="archive-heading">
+  <h2 id="archive-heading">Archive punches of {{ archive.device_user_id }}?</h2>
+  <p>Archived punches are hidden from hours, Team, exports, the API and this list, and not sent to Frappe from now on. Punches already pulled or sent stay where they are. Nothing is deleted: restore them any time from <a href="{{ url_for('people.punch_archives_view') }}">Archived punches</a>.</p>
+  <form method="get" action="{{ url_for('people.id_issues_view') }}" class="archive-range">
+    <input type="hidden" name="archive" value="{{ archive.device_user_id }}">
+    <div class="field">
+      <label for="archive-from">From <span class="muted">(optional)</span></label>
+      <input id="archive-from" name="from" type="date" value="{{ archive.from_date }}" max="{{ today.isoformat() }}">
+    </div>
+    <div class="field">
+      <label for="archive-to">To <span class="muted">(optional, inclusive)</span></label>
+      <input id="archive-to" name="to" type="date" value="{{ archive.to_date }}" max="{{ today.isoformat() }}">
+    </div>
+    {{ ui.button('Update count', 'secondary', type='submit', size='sm') }}
+  </form>
+  {% if archive.error %}
+  {{ ui.inline_error(archive.error, 'archive-error') }}
+  <div class="issue-confirm-actions">{{ ui.button('Cancel', 'tertiary', href=url_for('people.id_issues_view')) }}</div>
+  {% else %}
+  <p class="archive-count" aria-live="polite">
+    {%- if n %}<strong>{{ n }} {{ 'punch' if n == 1 else 'punches' }}</strong> from {{ archive.first.day }} {{ archive.first.strftime('%b') }} to {{ archive.last.day }} {{ archive.last.strftime('%b') }} will be hidden.
+    {%- else %}<strong>No punches in this range.</strong>{% endif %}
+    Range: {% if archive.from_ts %}from {{ archive.from_ts.day }} {{ archive.from_ts.strftime('%b %Y, %H:%M') }}{% else %}from the first punch{% endif %}
+    up to {{ archive.to_ts.day }} {{ archive.to_ts.strftime('%b %Y, %H:%M') }}.</p>
+  <form method="post" action="{{ url_for('people.id_issues_archive') }}">
+    <input type="hidden" name="csrf" value="{{ csrf_token }}">
+    <input type="hidden" name="device_user_id" value="{{ archive.device_user_id }}">
+    <input type="hidden" name="from_ts" value="{{ archive.from_ts.strftime(timestamp_format) if archive.from_ts else '' }}">
+    <input type="hidden" name="to_ts" value="{{ archive.to_ts.strftime(timestamp_format) }}">
+    {{ ui.field('reason', 'Reason (optional)', '', hint='For example: test card, or a temporary card handed back.', attrs='maxlength="200" autocomplete="off"') }}
+    <div class="issue-confirm-actions">
+      {{ ui.button(('Archive ' ~ n ~ (' punch' if n == 1 else ' punches')) if n else 'Archive', 'primary', type='submit', attrs='' if n else 'disabled') }}
+      {{ ui.button('Cancel', 'tertiary', href=url_for('people.id_issues_view')) }}
+    </div>
+  </form>
+  {% endif %}
 </section>
 {% endif %}
 
@@ -116,6 +164,12 @@
       {% elif fix.action == 'same' %}{{ dismiss_form(issue.key, fix.label, 'primary') }}
       {% else %}<span class="muted">{{ issue.detail }}</span>{% endif %}
     </div>
+    {% if can_archive_punches and issue.kind in archivable_kinds %}
+    <form method="get" action="{{ url_for('people.id_issues_view') }}" class="issue-archive">
+      <input type="hidden" name="archive" value="{{ issue.device_user_id }}">
+      {{ ui.button('Archive punches', 'tertiary', type='submit', size='sm', aria_label='Archive punches of ' ~ issue.device_user_id) }}
+    </form>
+    {% endif %}
     {% if fix.action != 'none' %}
     <details class="issue-more">
       <summary>Other ways to fix</summary>
@@ -150,6 +204,8 @@
 <p class="footnote">Last checked <time datetime="{{ checked_at.isoformat(timespec='seconds') }}">{{ checked_at.strftime('%d %b %Y, %H:%M:%S') }}</time>.</p>
 {% endcall %}
 {% endif %}
+
+<p class="footnote"><a href="{{ url_for('people.punch_archives_view') }}">Archived punches</a> lists every archive{% if can_archive_punches %}, with Restore{% endif %}.</p>
 
 {% if dismissed_count %}
 <form method="post" action="{{ url_for('people.id_issues_dismiss') }}" class="issue-restore">

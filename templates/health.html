@@ -17,12 +17,15 @@
       <h2 id="signal-{{ signal.key }}">{{ signal.name }}</h2>
       {{ ui.chip(signal.summary, chip_tone[signal.tone]) }}
     </div>
+    {#- The devices signal has no times; its chip names the devices. -#}
+    {% if signal.times or signal.error %}
     <dl class="health-times">
       {% for label, value in signal.times %}
       <dt>{{ label }}</dt><dd>{{ value }}</dd>
       {% endfor %}
       {% if signal.error %}<dt>Last error</dt><dd>{{ signal.error }}</dd>{% endif %}
     </dl>
+    {% endif %}
   </section>
   {% endfor %}
 </div>
@@ -33,11 +36,11 @@
   {% call ui.table([('Started (IST)', 'left'), ('Finished (IST)', 'left'), ('Result', 'left'), ('Size', 'num'), ('Detail', 'left')], caption='Last 14 backup cycles') %}
     {% for entry in exports %}
     <tr>
-      <td>{{ entry.started or '-' }}</td>
-      <td>{{ entry.finished or '-' }}</td>
-      <td>{% if entry.status == 'ok' %}{{ ui.chip('Unchanged' if entry.skipped else 'OK', 'ok') }}{% elif entry.status == 'blocked' %}{{ ui.chip('Blocked', 'bad') }}{% elif entry.status == 'not_set_up' %}{{ ui.chip('Not set up', 'bad') }}{% else %}{{ ui.chip('Failed', 'bad') }}{% endif %}</td>
-      <td class="num">{% if entry.size %}{{ '%.1f'|format(entry.size / 1048576) }} MB{% else %}-{% endif %}</td>
-      <td>{{ entry.error or entry.key or '-' }}</td>
+      <td data-label="Started (IST)">{{ entry.started or '-' }}</td>
+      <td data-label="Finished (IST)">{{ entry.finished or '-' }}</td>
+      <td data-label="Result">{% if entry.status == 'ok' %}{{ ui.chip('Unchanged' if entry.skipped else 'OK', 'ok') }}{% elif entry.status == 'blocked' %}{{ ui.chip('Blocked', 'bad') }}{% elif entry.status == 'not_set_up' %}{{ ui.chip('Not set up', 'bad') }}{% else %}{{ ui.chip('Failed', 'bad') }}{% endif %}</td>
+      <td data-label="Size" class="num">{% if entry.size %}{{ '%.1f'|format(entry.size / 1048576) }} MB{% else %}-{% endif %}</td>
+      <td data-label="Detail">{{ entry.error or entry.key or '-' }}</td>
     </tr>
     {% endfor %}
   {% endcall %}

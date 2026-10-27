@@ -50,6 +50,8 @@ One Docker Compose stack on an office Linux host with routes to `192.168.1.201` 
 - Linking an unknown ID from ID issues adds it as an extra ID when the person's main ID already has punches; otherwise it replaces the main ID.
 - **Archive** is for people who have left. An archived person leaves every working view, is signed out and cannot sign in; their punches, past hours and IDs are kept, exports and the hours API still include them for ranges where they punched, and their IDs never show as unknown. Archiving is refused for the last admin or anyone who still has reports. A roster import never edits or silently restores an archived person. Restore brings them back unchanged.
 
+- **Archived punches** hide the punches of unknown or shared device IDs (old, visitor or test cards) behind an admin-only rule: a device ID plus an optional date range, capped at the moment of archiving. Like fixes, it is applied when reading; no punch is edited or deleted, and Restore brings them back everywhere. HR sees the list read-only. IDs that belong to a person cannot be archived.
+
 ## Break rules
 
 - Every In and Out swipe is a real record and always counts. A swipe with no direction first fills a missing alternation (Out, swipe, Out: the swipe is In; In, swipe, In: it is Out) and is marked "inferred".

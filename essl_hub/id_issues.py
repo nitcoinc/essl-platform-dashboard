@@ -96,6 +96,19 @@ def names_match(a: str, b: str) -> bool:
     return bool(_words(a)) and bool(_words(b)) and names_agree(a, b)
 
 
+# Issues whose punches an admin may archive (KTD4): IDs nobody holds, and
+# shared cards. A mapped ID ("name") would silently change someone's hours.
+ARCHIVABLE_KINDS = ("unknown", "shared")
+
+
+def archivable(issues: list[Issue], device_user_id: str) -> Issue | None:
+    """The unknown or shared issue for this ID, or None when its punches may
+    not be archived (mapped, or nothing left to archive)."""
+    return next(
+        (i for i in issues if i.kind in ARCHIVABLE_KINDS and i.device_user_id == device_user_id), None
+    )
+
+
 def actionable(issues: list[Issue]) -> int:
     return sum(1 for i in issues if i.severity != "info")
 

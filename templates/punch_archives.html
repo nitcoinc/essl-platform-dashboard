@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% import "_ui.html" as ui %}
+{% block title %}Archived punches - People - eSSL Attendance Hub{% endblock %}
+{% block content %}
+{% macro when(at) -%}
+{{ at.day }} {{ at.strftime('%b %Y, %H:%M') }}
+{%- endmacro %}
+{% macro span(a) -%}
+{% if a.from_ts %}{{ when(a.from_ts) }}{% else %}First punch{% endif %} to {{ when(a.to_ts) }}
+{%- endmacro %}
+<header class="topbar">
+  <div>
+    <a class="back-link" href="{{ url_for('people.id_issues_view') }}">{{ ui.icon('arrow-left') }}<span>ID issues</span></a>
+    <h1>Archived punches</h1>
+    <p>Punches of old, temporary or test cards, hidden from hours, Team, exports, the API and ID issues, and not sent to Frappe from now on. Punches already pulled or sent stay where they are. Nothing is deleted{% if can_restore %}; restore an archive and its punches show again everywhere{% endif %}.</p>
+  </div>
+</header>
+{% include "_people_tabs.html" %}
+
+{% if flash.restored %}
+{% set n = flash.punches %}
+<div class="notice notice-ok" role="status">{{ ui.icon('check') }}<p><strong>Restored {{ n }} {{ 'punch' if n == 1 else 'punches' }} of ID {{ flash.restored }}.</strong> They show again everywhere.{% if flash.still %} {{ flash.still }} {{ 'stays' if flash.still == 1 else 'stay' }} hidden by another archive.{% endif %}</p></div>
+{% endif %}
+{% if flash.already %}
+<div class="notice" role="status">{{ ui.icon('check') }}<p>That archive of ID {{ flash.already }} was already restored.</p></div>
+{% endif %}
+
+{% if confirm %}
+{% set n = confirm.hidden_count %}
+<section class="issue-confirm" aria-labelledby="restore-heading">
+  <h2 id="restore-heading">Restore the archive of {{ confirm.device_user_id }}?</h2>
+  <p><strong>{{ n }} {{ 'punch' if n == 1 else 'punches' }}</strong> ({{ span(confirm) }}) show again in hours, Team, exports, the API, Frappe and ID issues, unless another archive still covers them.</p>
+  <form method="post" action="{{ url_for('people.punch_archive_restore', archive_id=confirm.id) }}" class="issue-confirm-actions">
+    <input type="hidden" name="csrf" value="{{ csrf_token }}">
+    {{ ui.button('Restore', 'primary', type='submit') }}
+    {{ ui.button('Cancel', 'tertiary', href=url_for('people.punch_archives_view')) }}
+  </form>
+</section>
+{% endif %}
+
+{% if active or restored %}
+<section class="admin-section" aria-labelledby="active-heading">
+  <h2 id="active-heading">Active</h2>
+  {% if active %}
+  <div class="table-scroll">
+    <table class="table hours-table archive-table">
+      <caption class="visually-hidden">Active punch archives, with range, reason, who archived them and the punches hidden</caption>
+      <thead><tr>
+        <th scope="col">Device ID</th><th scope="col">Range</th><th scope="col">Reason</th>
+        <th scope="col">Archived</th><th scope="col" class="num">Hidden</th>
+        {% if can_restore %}<th scope="col"><span class="visually-hidden">Actions</span></th>{% endif %}
+      </tr></thead>
+      <tbody>
+        {% for a in active %}
+        <tr>
+          <td data-label="Device ID"><strong>{{ a.device_user_id }}</strong></td>
+          <td data-label="Range">{{ span(a) }}</td>
+          <td data-label="Reason">{{ a.reason or '-' }}</td>
+          <td data-label="Archived">{{ when(a.created_at) }}<br><span class="muted">{{ a.created_by_name or 'Unknown' }}</span></td>
+          <td class="num" data-label="Hidden">{{ a.hidden_count }}</td>
+          {% if can_restore %}
+          <td>{{ ui.button('Restore', 'secondary', href=url_for('people.punch_archives_view', restore=a.id), size='sm', aria_label='Restore the archive of ' ~ a.device_user_id) }}</td>
+          {% endif %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="muted">None. Every archive has been restored.</p>
+  {% endif %}
+</section>
+
+{% if restored %}
+<section class="admin-section archive-restored" aria-labelledby="restored-heading">
+  <h2 id="restored-heading">Restored</h2>
+  <div class="table-scroll">
+    <table class="table hours-table archive-table">
+      <caption class="visually-hidden">Restored punch archives, kept as a record</caption>
+      <thead><tr>
+        <th scope="col">Device ID</th><th scope="col">Range</th><th scope="col">Reason</th>
+        <th scope="col">Archived</th><th scope="col">Restored</th>
+      </tr></thead>
+      <tbody>
+        {% for a in restored %}
+        <tr>
+          <td data-label="Device ID">{{ a.device_user_id }}</td>
+          <td data-label="Range">{{ span(a) }}</td>
+          <td data-label="Reason">{{ a.reason or '-' }}</td>
+          <td data-label="Archived">{{ when(a.created_at) }}<br><span class="muted">{{ a.created_by_name or 'Unknown' }}</span></td>
+          <td data-label="Restored">{{ when(a.restored_at) }}<br><span class="muted">{{ a.restored_by_name or 'Unknown' }}</span></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+{% else %}
+{{ ui.empty_state('No archived punches', 'An admin can archive the punches of an unknown device ID or a shared card from ID issues.', 'inbox') }}
+{% endif %}
+{% endblock %}

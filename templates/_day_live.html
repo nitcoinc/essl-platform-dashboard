@@ -47,7 +47,7 @@
       {% if live %}
       {% set open_seg = result.segments[-1] %}
       <p class="live-line">Inside since <span class="num">{{ open_seg.start.strftime('%H:%M:%S') }}</span>. This stretch <span class="num" aria-hidden="true" data-tick="{{ stretch_seconds }}" data-timer-seconds="{{ stretch_seconds }}">{{ ui.clock(stretch_seconds) }}</span><span class="visually-hidden">{{ ui.hours(stretch_seconds // 60)|striptags }}</span>.</p>
-      {% if finish_at and eff_s < target_s %}<p class="finish-line">{{ ui.icon('clock') }}<span>Target reached at <strong class="num">{{ finish_at.strftime('%H:%M') }}</strong> if you stay in.</span></p>{% endif %}
+      {% if finish_at and eff_s < target_s %}<p class="finish-line">{{ ui.icon('clock') }}<span>Target reached at <strong class="num">{{ finish_at.strftime('%H:%M') }}</strong> if {{ 'they' if other else 'you' }} stay in.</span></p>{% endif %}
       {% endif %}
       {% if is_today and stale_sync %}<p class="sync-note">Doors last synced <span class="num">{{ last_synced.strftime('%H:%M') }}</span></p>{% endif %}
       {% if is_today %}<p class="sync-line" data-sync-line hidden></p>{% endif %}
@@ -72,10 +72,19 @@
 </section>
 {% endif %}
 
+{#- U6: what to do next. Your own day points to Report a problem while the
+    day can still be reported; an older one goes to HR; someone else's day
+    keeps the line for the manager or HR reading it. -#}
+{% macro next_step() -%}
+{% if other %}Ask HR to record an explanation.
+{%- elif can_report|default(false) %}Use <a href="{{ url_for('fixes.report_view', day=day.isoformat()) }}">Report a problem</a> to tell HR what happened.
+{%- else %}This day is too old to report here — ask HR.
+{%- endif %}
+{%- endmacro %}
 {% if result.anomalies %}
-<div class="notice review-notice">{{ ui.icon('circle-alert') }}<p><strong>Needs review.</strong> {{ result.anomalies|join('; ') }}. {% if result.status == 'incomplete' %}Nothing paired, so this day counts zero.{% else %}Only the paired time counts.{% endif %} Ask HR to record an explanation.</p></div>
+<div class="notice review-notice">{{ ui.icon('circle-alert') }}<p><strong>Needs review.</strong> {{ result.anomalies|join('; ') }}. {% if result.status == 'incomplete' %}Nothing paired, so this day counts zero.{% else %}Only the paired time counts.{% endif %} {{ next_step() }}</p></div>
 {% elif result.status == 'incomplete' %}
-<div class="notice">{{ ui.icon('circle-alert') }}<p>A punch on this day has no matching entry or exit, so it counts zero effective hours. Ask HR to record an explanation.</p></div>
+<div class="notice">{{ ui.icon('circle-alert') }}<p>A punch on this day has no matching entry or exit, so it counts zero effective hours. {{ next_step() }}</p></div>
 {% endif %}
 
 {% if breaks.punches %}

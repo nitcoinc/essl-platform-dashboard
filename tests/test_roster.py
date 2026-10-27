@@ -22,6 +22,11 @@ class FakeDatabase:
     def __init__(self) -> None:
         self.employees: dict[str, dict[str, str]] = {}
         self.calls: list[tuple[str, str, str]] = []
+        self.archived_ids: dict[str, int] = {}
+
+    def active_archive_for(self, device_user_id: str):
+        hidden = self.archived_ids.get(device_user_id)
+        return {"archives": 1, "hidden": hidden} if hidden else None
 
     def upsert_employee(self, *, device_user_id: str, name: str, email: str) -> str:
         self.calls.append((device_user_id, name, email))
@@ -49,6 +54,23 @@ VALID_CSV = (
 
 
 class ApplyRosterTest(unittest.TestCase):
+    def test_an_unmapped_id_with_archived_punches_is_rejected_until_restored(self) -> None:
+        database = FakeDatabase()
+        database.archived_ids["118"] = 7
+        outcomes = apply_roster(database, VALID_CSV)
+        self.assertEqual([o.result for o in outcomes].count("added"), 2)
+        rejected = [o for o in outcomes if o.result == "rejected"]
+        self.assertEqual([o.device_user_id for o in rejected], ["118"])
+        self.assertIn("7 archived punches", rejected[0].reason)
+        self.assertNotIn("118", database.employees)
+
+    def test_an_id_a_person_already_holds_is_not_blocked_by_its_archive(self) -> None:
+        database = FakeDatabase()
+        apply_roster(database, VALID_CSV)
+        database.archived_ids["118"] = 7
+        outcomes = apply_roster(database, VALID_CSV)
+        self.assertTrue(all(o.result == "updated" for o in outcomes))
+
     def test_valid_file_creates_one_employee_per_row(self) -> None:
         database = FakeDatabase()
         outcomes = apply_roster(database, VALID_CSV)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 import threading
 import unittest
@@ -109,6 +110,7 @@ class DatabaseTest(unittest.TestCase):
                 "employee_device_ids",
                 "device_changes",
                 *V8_TABLES,
+                "punch_archives",
             },
         )
 
@@ -271,6 +273,22 @@ class DatabaseTest(unittest.TestCase):
         self.assertEqual(
             [row["id"] for row in self.database.device_connection_info()], ["uppal-x990"]
         )
+
+    def test_retired_at_reads_back_as_a_datetime(self) -> None:
+        self.database.set_device_retired("uppal-x990", True)
+        retired = {row["id"]: row["retired_at"] for row in self.database.devices()}
+        self.assertIsInstance(retired["uppal-x990"], datetime)
+        self.assertIsNone(retired["gachibowli-c3-400"])
+
+    def test_every_timestamp_column_in_the_schema_is_registered(self) -> None:
+        # libsql gives no declared types, so a TIMESTAMP column missing from
+        # TIMESTAMP_COLUMNS reads back as text (retired_at once crashed /devices).
+        statements = [*db_module.SCHEMA_STATEMENTS,
+                      *(s for step in db_module.MIGRATIONS.values() for s in step)]
+        declared = {name for statement in statements
+                    for name in re.findall(r"(\w+)\s+TIMESTAMP\b", statement)}
+        self.assertIn("retired_at", declared)
+        self.assertEqual(declared - db_module.TIMESTAMP_COLUMNS, set())
 
     def test_seed_keeps_edited_site_model_ip_and_retirement(self) -> None:
         with self.database.transaction() as connection:
@@ -1402,7 +1420,7 @@ class MissedPunchSchemaTest(unittest.TestCase):
             fingerprints = [r["fingerprint"] for r in connection.execute(
                 "SELECT fingerprint FROM punches").fetchall()]
         self.assertTrue(set(V8_TABLES) <= names)
-        self.assertEqual(version, 8)
+        self.assertEqual(version, db_module.SCHEMA_VERSION)
         self.assertEqual(fingerprints, ["fp-v7"])
         self.assertEqual(old.setting("daily_target_minutes"), "450")
         self.assertEqual(old.device_windows(), {"uppal-x990": 60})
@@ -1921,6 +1939,260 @@ class MissedPunchSchemaTest(unittest.TestCase):
         self.assertIn("raw_direction_byte", wrong)
         self.assertEqual(self.database.raw_punches_for_device_users_range(
             [], datetime(2026, 10, 26, 6), datetime(2026, 10, 27, 6)), [])
+
+
+ARCHIVE_NOW = datetime(2026, 10, 20, 12, 0, 0)
+
+
+class PunchArchiveTest(unittest.TestCase):
+    """Schema v9: archive rules hide punches at read time (KTD1-KTD3)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.database = db_module.Database(os.path.join(self._tmp.name, "essl.db"))
+        self.addCleanup(self.database.close)
+        self.device = DeviceConfig(
+            id="uppal-x990", site="Uppal", model="X990", ip="10.0.0.1", port=4370,
+            protocol="zk-attendance", password_env="ESSL_X990_PASSWORD",
+        )
+        self.database.initialize((self.device,))
+        clock = mock.patch.object(db_module, "_now", lambda: ARCHIVE_NOW)
+        clock.start()
+        self.addCleanup(clock.stop)
+        self.database.upsert_employee(device_user_id="118", name="Ravi", email="ravi@x.com")
+        self.admin = self.database.employee_by_device_user_id("118")["id"]
+        self.junk = [self._punch(f"j{day}", "9999", datetime(2026, 10, day, 9, 0)) for day in (1, 5, 10)]
+        self.real = [self._punch("r1", "118", datetime(2026, 10, 5, 9, 30))]
+        self._poll(self.junk + self.real)
+
+    def _punch(self, fingerprint: str, uid: str, at: datetime, **extra) -> dict:
+        return {"fingerprint": fingerprint, "device_id": "uppal-x990", "site": "Uppal",
+                "device_user_id": uid, "employee_name": "Temp card", "event_timestamp": at, **extra}
+
+    def _poll(self, punches) -> int:
+        return self.database.record_poll("uppal-x990", punches=punches, status="connected",
+                                         transport="tcp", records_seen=len(punches))
+
+    def _visible(self) -> dict[str, object]:
+        """What every filtered read shows for ID 9999."""
+        start, end = datetime(2026, 9, 1), datetime(2026, 11, 1)
+        db = self.database
+        return {
+            "range": [p["fingerprint"] for p in db.punches_for_device_users_range(["9999", "118"], start, end)
+                      if p["device_user_id"] == "9999"],
+            "employee_range": [p["fingerprint"] for p in db.punches_for_employee_range("9999", start, end)],
+            "raw_range": [p["fingerprint"] for p in db.raw_punches_for_device_users_range(["9999"], start, end)],
+            "summary": next((r["punch_count"] for r in db.device_id_summary() if r["device_user_id"] == "9999"), 0),
+            "unmapped": next((r["punch_count"] for r in db.unmapped_device_user_ids() if r["device_user_id"] == "9999"), 0),
+            "first": db.first_punch_at(["9999"]),
+            "checkins": sum(1 for r in db.checkins_since(since=None, limit=100) if r["device_user_id"] == "9999"),
+            "frappe": sum(1 for r in db.frappe_pending_punches(since=None, limit=100) if r["device_user_id"] == "9999"),
+        }
+
+    def _archive(self, **kwargs) -> int:
+        kwargs.setdefault("from_ts", None)
+        kwargs.setdefault("to_ts", None)
+        return self.database.archive_punches("9999", actor_id=self.admin, **kwargs)
+
+    def test_v8_to_v9_creates_the_table_keeps_data_and_reruns_safely(self) -> None:
+        path = os.path.join(self._tmp.name, "v8.db")
+        old = db_module.Database(path)
+        self.addCleanup(old.close)
+        with mock.patch.object(db_module, "SCHEMA_VERSION", 8), \
+                mock.patch.dict(db_module.MIGRATIONS, {}, clear=False):
+            db_module.MIGRATIONS.pop(9)
+            old.initialize((self.device,))
+            old.insert_punches([self._punch("fp-v8", "7", datetime(2026, 10, 20, 9, 0))])
+        with old.connect() as connection:
+            names = {r["name"] for r in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        self.assertNotIn("punch_archives", names)
+        old.migrate_schema()
+        with old.transaction() as connection:  # simulate a re-run of step 9
+            connection.execute("UPDATE settings SET value='8' WHERE key='schema_version'")
+            connection.execute("PRAGMA user_version=8")
+        old.migrate_schema()
+        old.migrate_schema()
+        self.assertEqual(old.schema_version(), 9)
+        self.assertEqual(old.punch_archives(), [])
+        self.assertEqual([p["fingerprint"] for p in old.punches_for_employee_range(
+            "7", datetime(2026, 10, 20), datetime(2026, 10, 21))], ["fp-v8"])
+
+    def test_archive_without_range_hides_the_id_from_every_filtered_read(self) -> None:
+        before = self._visible()
+        self.assertEqual(before["summary"], 3)
+        self.assertEqual(before["first"], datetime(2026, 10, 1, 9, 0))
+        stored = {d["id"]: d["stored_punches"] for d in self.database.devices()}
+        self._archive(reason="Test card")
+        self.assertEqual(self._visible(), {
+            "range": [], "employee_range": [], "raw_range": [], "summary": 0, "unmapped": 0,
+            "first": None, "checkins": 0, "frappe": 0,
+        })
+        # The mapped ID and the raw device reads are untouched.
+        self.assertEqual(
+            [p["fingerprint"] for p in self.database.punches_for_employee_range(
+                "118", datetime(2026, 10, 1), datetime(2026, 11, 1))], ["r1"])
+        self.assertEqual({d["id"]: d["stored_punches"] for d in self.database.devices()}, stored)
+        self.assertEqual(self.database.unseen_punches(self.junk), [])
+        with self.database.connect() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) AS n FROM punches").fetchone()["n"], 4)
+
+    def test_collector_repoll_after_an_archive_inserts_nothing(self) -> None:
+        self._archive()
+        self.assertEqual(self._poll(self.junk + self.real), 0)
+        self.assertEqual(self.database.devices()[0]["stored_punches"], 4)
+        self.assertEqual(self._visible()["summary"], 0)
+
+    def test_range_hides_only_punches_inside_it(self) -> None:
+        self._archive(from_ts=datetime(2026, 10, 4, 6, 0), to_ts=datetime(2026, 10, 6, 6, 0))
+        visible = self._visible()
+        self.assertEqual(visible["range"], ["j1", "j10"])
+        self.assertEqual((visible["summary"], visible["checkins"], visible["frappe"]), (2, 2, 2))
+
+    def test_default_end_is_the_archive_time_so_later_swipes_stay_visible(self) -> None:
+        rule = self.database.punch_archive(self._archive())
+        self.assertEqual(rule["to_ts"], ARCHIVE_NOW)
+        self.assertIsNone(rule["from_ts"])
+        self._poll([self._punch("j-later", "9999", ARCHIVE_NOW + timedelta(minutes=1)),
+                    self._punch("j-same", "9999", ARCHIVE_NOW)])
+        self.assertEqual(self._visible()["range"], ["j-same", "j-later"])
+
+    def test_end_in_the_future_is_clamped_and_reversed_range_is_refused(self) -> None:
+        rule = self.database.punch_archive(self._archive(to_ts=ARCHIVE_NOW + timedelta(days=3)))
+        self.assertEqual(rule["to_ts"], ARCHIVE_NOW)
+        with self.assertRaises(db_module.RuleViolation):
+            self._archive(from_ts=datetime(2026, 10, 6), to_ts=datetime(2026, 10, 4))
+        with self.assertRaises(db_module.RuleViolation):
+            self._archive(from_ts=ARCHIVE_NOW + timedelta(days=1))
+        self.assertEqual(len(self.database.punch_archives()), 1)
+
+    def test_preview_counts_visible_punches_in_the_resolved_range(self) -> None:
+        preview = self.database.archive_preview("9999", datetime(2026, 10, 4), None)
+        self.assertEqual(
+            (preview["count"], preview["first"], preview["last"], preview["to_ts"]),
+            (2, datetime(2026, 10, 5, 9, 0), datetime(2026, 10, 10, 9, 0), ARCHIVE_NOW),
+        )
+        self._archive(from_ts=datetime(2026, 10, 9), to_ts=None)
+        # Already hidden punches are not counted twice.
+        self.assertEqual(self.database.archive_preview("9999", None, None)["count"], 2)
+        self.assertEqual(self.database.archive_preview("9999", datetime(2026, 10, 11), None)["count"], 0)
+
+    def test_restore_brings_every_punch_back_and_twice_is_refused(self) -> None:
+        before = self._visible()
+        archive_id = self._archive()
+        self.assertTrue(self.database.restore_punch_archive(archive_id, actor_id=self.admin))
+        self.assertEqual(self._visible(), before)
+        self.assertFalse(self.database.restore_punch_archive(archive_id, actor_id=self.admin))
+        self.assertFalse(self.database.restore_punch_archive(999, actor_id=self.admin))
+        rule = self.database.punch_archive(archive_id)
+        self.assertEqual((rule["restored_at"], rule["restored_by_name"]), (ARCHIVE_NOW, "Ravi"))
+
+    def test_frappe_log_is_untouched_and_restore_requeues_unsent_punches(self) -> None:
+        sent = next(p for p in self.database.frappe_pending_punches(since=None, limit=10)
+                    if p["device_user_id"] == "9999")
+        self.database.record_frappe_sync(sent["id"], status="synced", checkin_name="CK-1")
+        archive_id = self._archive()
+        with self.database.connect() as connection:
+            log = connection.execute("SELECT punch_id, status FROM frappe_sync_log").fetchall()
+        self.assertEqual([(r["punch_id"], r["status"]) for r in log], [(sent["id"], "synced")])
+        self.assertEqual(self._visible()["frappe"], 0)
+        self.database.restore_punch_archive(archive_id, actor_id=self.admin)
+        pending = [p["id"] for p in self.database.frappe_pending_punches(since=None, limit=10)
+                   if p["device_user_id"] == "9999"]
+        self.assertEqual(len(pending), 2)
+        self.assertNotIn(sent["id"], pending)
+
+    def test_held_c3_guess_leaves_the_shift_watermark_when_archived(self) -> None:
+        self._poll([self._punch("j-held", "9999", ARCHIVE_NOW - timedelta(hours=1), raw_direction_byte=15,
+                                raw={"source": "realtime_fallback"})])
+        self.assertEqual(self.database.frappe_oldest_held_punch(), ARCHIVE_NOW - timedelta(hours=1))
+        self._archive()
+        self.assertIsNone(self.database.frappe_oldest_held_punch())
+
+    def test_overlapping_rules_hide_until_both_are_restored(self) -> None:
+        first = self._archive()
+        second = self._archive(from_ts=datetime(2026, 10, 4), to_ts=datetime(2026, 10, 6))
+        self.database.restore_punch_archive(first, actor_id=self.admin)
+        self.assertEqual(self._visible()["range"], ["j1", "j10"])
+        self.database.restore_punch_archive(second, actor_id=self.admin)
+        self.assertEqual(self._visible()["range"], ["j1", "j5", "j10"])
+
+    def test_archived_people_reads_skip_archived_punches(self) -> None:
+        self.database.upsert_employee(device_user_id="9999", name="Left", email="left@x.com")
+        left = self.database.employee_by_device_user_id("9999")["id"]
+        self.database.archive_employee(left)
+        start, end = datetime(2026, 10, 1), datetime(2026, 11, 1)
+        self.assertEqual([e["id"] for e in self.database.archived_employees_with_punches(start, end)], [left])
+        self.assertEqual(self.database.archived_employees()[0]["last_punch"], datetime(2026, 10, 10, 9, 0))
+        self._archive()
+        self.assertEqual(self.database.archived_employees_with_punches(start, end), [])
+        self.assertIsNone(self.database.archived_employees()[0]["last_punch"])
+
+    def test_archive_list_names_actors_and_counts_active_rules_only(self) -> None:
+        restored = self._archive(from_ts=datetime(2026, 10, 4), to_ts=datetime(2026, 10, 6), reason=" old ")
+        self.database.restore_punch_archive(restored, actor_id=self.admin)
+        active = self._archive(reason="Test card")
+        rows = self.database.punch_archives()
+        self.assertEqual([r["id"] for r in rows], [active, restored])
+        self.assertEqual((rows[0]["hidden_count"], rows[0]["created_by_name"], rows[0]["reason"]),
+                         (3, "Ravi", "Test card"))
+        self.assertEqual((rows[1]["hidden_count"], rows[1]["reason"]), (None, "old"))
+        self.assertEqual([r["id"] for r in self.database.punch_archives(include_restored=False)], [active])
+        self.assertEqual(self.database.active_archive_for("9999"), {"archives": 1, "hidden": 3})
+        self.assertIsNone(self.database.active_archive_for("118"))
+
+    def test_a_rule_includes_its_from_and_excludes_its_to(self) -> None:
+        self._archive(from_ts=datetime(2026, 10, 5, 9, 0), to_ts=datetime(2026, 10, 10, 9, 0))
+        self.assertEqual(self._visible()["summary"], 2)
+        (rule,) = self.database.punch_archives()
+        self.assertEqual(rule["hidden_count"], 1)
+
+    def test_submitting_the_same_range_twice_writes_one_rule(self) -> None:
+        first = self._archive(from_ts=datetime(2026, 10, 4), to_ts=datetime(2026, 10, 12))
+        again = self._archive(from_ts=datetime(2026, 10, 4), to_ts=datetime(2026, 10, 12))
+        whole = self._archive()
+        self.assertEqual(first, again)
+        self.assertNotEqual(first, whole)
+        self.assertEqual(self._archive(), whole)
+        self.assertEqual(len(self.database.punch_archives()), 2)
+        self.database.restore_punch_archive(first)
+        self.assertNotEqual(self._archive(from_ts=datetime(2026, 10, 4), to_ts=datetime(2026, 10, 12)), first)
+
+    def test_the_active_filter_probes_the_archive_index(self) -> None:
+        from essl_hub.db_archives import _ACTIVE_PUNCH_SQL
+
+        with self.database.connect() as connection:
+            plan = " ".join(
+                row["detail"] for row in connection.execute(
+                    f"EXPLAIN QUERY PLAN SELECT 1 FROM punches p WHERE {_ACTIVE_PUNCH_SQL}"
+                ).fetchall()
+            )
+        self.assertIn("idx_punch_archives_user", plan)
+
+
+class UnreachableDeviceDetailsTest(unittest.TestCase):
+    """The health signal and the Devices badge read this query (KTD8)."""
+
+    def test_only_active_devices_with_a_failed_poll_are_named_in_site_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database = db_module.Database(os.path.join(tmp, "essl.db"))
+            self.addCleanup(database.close)
+            devices = tuple(
+                DeviceConfig(id=f"{site.lower()}-{model.lower()}", site=site, model=model, ip="10.0.0.1",
+                             port=4370, protocol="zk-attendance", password_env="ESSL_X990_PASSWORD")
+                for site, model in (("Uppal", "X990"), ("Gachibowli", "C3"), ("Hitech", "K40"))
+            )
+            database.initialize(devices)
+            for device in devices:
+                database.record_poll(device.id, status="error", error="timed out")
+            database.set_device_retired("hitech-k40", True)
+            details = database.unreachable_device_details()
+            self.assertEqual([d["id"] for d in details], ["gachibowli-c3", "uppal-x990"])
+            self.assertEqual([d["name"] for d in details], ["Gachibowli C3", "Uppal X990"])
+            self.assertIsNone(details[0]["last_success"])
+            database.record_poll("uppal-x990", status="connected", transport="tcp")
+            self.assertEqual([d["id"] for d in database.unreachable_device_details()], ["gachibowli-c3"])
 
 
 class SharedLocalFileTest(unittest.TestCase):

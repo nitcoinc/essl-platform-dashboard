@@ -252,6 +252,11 @@
   </div>
 </header>
 
+{#- At the top, not below every card: admin only, like the page. -#}
+{% if issue_count %}
+<div class="notice notice-lead">{{ ui.icon('circle-alert') }}<p><strong>{{ issue_count }} device ID {{ 'issue' if issue_count == 1 else 'issues' }} to check.</strong> <a href="{{ url_for('people.id_issues_view') }}">Review ID issues</a></p></div>
+{% endif %}
+
 {% set active = devices|rejectattr("retired")|list %}
 {% set retired_rows = devices|selectattr("retired")|list %}
 {% if retired %}<p class="device-note" role="status">{{ ui.icon('check') }}<span>Device retired. It is no longer polled; its punches stay on every day view.</span></p>{% endif %}
@@ -315,7 +320,4 @@
   });
 </script>
 
-{% if issue_count %}
-<div class="notice">{{ ui.icon('circle-alert') }}<p><strong>{{ issue_count }} device ID {{ 'issue' if issue_count == 1 else 'issues' }} to check.</strong> <a href="{{ url_for('people.id_issues_view') }}">Review ID issues</a></p></div>
-{% endif %}
 {% endblock %}

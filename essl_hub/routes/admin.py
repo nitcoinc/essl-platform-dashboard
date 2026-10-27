@@ -294,7 +294,6 @@ def _render_devices(status: int = 200, **overrides):
     context = {
         "employee": g.employee,
         "devices": _device_rows(),
-        "unmapped": database.unmapped_device_user_ids(),
         "issue_count": issue_count(),
         "can_edit": g.employee["role"] == "admin" and bool(g.csrf_token),
         "csrf_token": g.csrf_token,

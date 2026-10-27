@@ -125,5 +125,17 @@ class CheckinsApiTest(unittest.TestCase):
         # 09:00 ignored, 18:00 now an In, HR's 19:00 Out: one hour.
         self.assertEqual((row["effective_minutes"], row["status"]), (60, "short"))
 
+    # Punch archive (v9, KTD5): archived punches leave the feed until restored.
+
+    def test_archived_punches_leave_the_feed_until_restored(self):
+        from datetime import datetime
+
+        archive_id = self.database.archive_punches(
+            "102", from_ts=None, to_ts=datetime(2026, 3, 3), reason="test card")
+        users = [r["employee_field_value"] for r in self.get().get_json()["results"]]
+        self.assertEqual(users, ["101", "101", "103"])
+        self.database.restore_punch_archive(archive_id)
+        self.assertEqual(self.get().get_json()["count"], 4)
+
 if __name__ == "__main__":
     unittest.main()

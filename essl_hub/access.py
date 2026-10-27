@@ -111,3 +111,15 @@ def fix_approvers(requester_id: int, database) -> list[dict]:
     if approvers:
         return approvers
     return [p for p in database.active_admins() if p["id"] != requester_id]
+
+
+# --- Punch archives (v9, KTD4) --------------------------------------------------
+
+# Archiving hides punches everywhere, so it stays with the role that runs the
+# system; HR and admins (EDITOR_ROLES) read the archive list.
+PUNCH_ARCHIVE_ROLES = ("admin",)
+
+
+def can_archive_punches(actor: dict | None) -> bool:
+    """Archive and restore ID-issue punches (admins only)."""
+    return actor is not None and actor["role"] in PUNCH_ARCHIVE_ROLES

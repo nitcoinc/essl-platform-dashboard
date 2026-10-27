@@ -122,7 +122,7 @@ No Python is needed on the host: the installer and the device test run inside th
 3. [Cloudflare setup](#cloudflare-setup)
 4. [Install on the Linux host](#install-on-the-linux-host)
 5. [First administrator](#first-administrator)
-6. [Fixing ID issues](#fixing-id-issues)
+6. [Fixing ID issues](#fixing-id-issues) (including archiving old or test card punches)
    - [Archiving people](#archiving-people)
    - [Breaks and duplicate swipes](#breaks-and-duplicate-swipes)
 7. [Fix the Uppal address](#fix-the-uppal-address)
@@ -167,7 +167,7 @@ Everything is one `docker-compose.yml` on one x86_64 host that can reach both de
 | `collector` | Polls the devices every `ESSL_COLLECTOR_INTERVAL_SECONDS` and writes punches to `essl.db`. Polls even when the internet is down. A punch write that fails (database busy or not set up) goes to the local spool and is replayed in order later. |
 | `web` | Flask + gunicorn (`-w 1 --threads 4`). The screens and the read-only HRMS API. Owns the schema. Published on host loopback only (`127.0.0.1:ESSL_WEB_PORT`, default 8080). |
 | `backup` | Every `ESSL_BACKUP_MINUTES` (15) takes a snapshot with SQLite's backup API, deletes sessions, login codes, report links and queued emails, runs `VACUUM` and `integrity_check`, gzips it and uploads it to R2. Also the admin CLI (`python -m essl_hub.backup <command>`, see [Backups](#backups)). The only service with R2 credentials. |
-| `alerts` | Rebuilds each person's baseline weekly, runs the daytime check every 5 minutes and the next-morning check from the morning email hour, and sends every queued email (alerts, fix requests, decisions); the web only queues. Waits for schema v8 and never creates or migrates `essl.db`. Needs the mail variables and `ESSL_PUBLIC_URL`. See [Missed-punch alerts](#missed-punch-alerts-and-fix-requests). |
+| `alerts` | Rebuilds each person's baseline weekly, runs the daytime check every 5 minutes and the next-morning check from the morning email hour, and sends every queued email (alerts, fix requests, decisions); the web only queues. Waits for schema v9 and never creates or migrates `essl.db`. Needs the mail variables and `ESSL_PUBLIC_URL`. See [Missed-punch alerts](#missed-punch-alerts-and-fix-requests). |
 | `cloudflared` | *Optional* bundled Cloudflare Tunnel (compose profile `tunnel`). Skip it when the host already runs cloudflared. |
 
 All four app services mount the same data folder at `/data`, so `essl.db`, its `-wal` and `-shm`, the collector spool and the status files (`collector-status.json`, `backup-status.json`) sit side by side. Web, collector and alerts **never create** `essl.db`: until an admin runs `init`, `restore` or `import-turso`, the web app shows a "Database not set up" page with the three commands and the collector spools and waits. All containers run as UID/GID 10001.
@@ -338,6 +338,31 @@ Nothing is stored about an issue: the list is rebuilt from the Directory and the
 
 **Device IDs.** Each person has one main device ID and any number of extra IDs (People → *name* → Other device IDs, or edit the main ID inline on the Directory row). Punches under any of them count. An ID belongs to one person only. Typed IDs are trimmed and upper-cased, and an all-zero ID (`0`, `NP0000`) is refused because devices use 0 for "no user".
 
+### Archiving punches of old or test cards
+
+Temporary, visitor and test cards leave **Not in Directory** issues whose punches count for nobody. An admin can hide them instead of linking them:
+
+1. **Archive punches** on the issue card (admins only; HR does not see it).
+2. Optionally pick a **from** and **to** date and a reason.
+3. The preview shows exactly how many punches will be hidden and the resolved range, then **Confirm**.
+
+**Rules:**
+- No to date means "up to now".
+- An explicit to date includes that whole work day.
+- Swipes made after you archive always stay visible, so a card handed to a new person is never hidden.
+- Only **Not in Directory** and **Shared card** issues can be archived. An ID that belongs to someone is refused; use a fix request instead.
+
+Archiving never edits or deletes a punch. It stores a rule, and every read hides the punches it covers: hours, Team, People, exports, `/api/v1/hours`, `/api/v1/checkins`, Frappe pending sync, alerts and baselines, the history pager, ID issues and the unknown-ID notices. The collector still sees every row, so the devices' resent history is never inserted again. The device card's *Punches stored* still counts them. Archiving is not retroactive for consumers: punches already sent to Frappe stay there, and an API client whose `since` cursor is past an archived or restored range does not see those punches change, so re-pull with an earlier `since` after a restore. A device ID with an active archive cannot be given to a person by CSV import or the inline Device ID edit; use the person's page, which asks first, or restore the archive.
+
+**People → ID issues → Archived punches** lists every archive: who, when, range, reason and how many punches it hides now. HR can see it; admins can **Restore**, which brings the punches back everywhere at once.
+
+**Frappe and checkins after restore:**
+- Punches already sent to Frappe stay there.
+- Restored punches with no sync record are pushed on the next sync.
+- Clients pulling `/api/v1/checkins` that already paged past a restored time will not see it again.
+
+If you later link an archived ID to a person, the link and person forms warn that its archived punches stay hidden until restored.
+
 ### Archiving people
 
 For someone who has left, open their person page and use **Archive person** at the bottom. They leave Employees, Team and the Directory, are signed out and cannot sign in. Punches, past hours and device IDs are kept; exports and the hours API still include them for ranges where they punched. Archiving is refused for the last admin and for anyone who still has reports (reassign them first). **People → Archive** lists archived people with **Restore**. A roster import rejects rows that match an archived person; restore them first.
@@ -419,12 +444,13 @@ Then fix the Uppal row if it was migrated as `.42`.
 
 ### Sync-health indicator
 
-Admins see an indicator top right on every page. It links to **System health** (`/health`, admin only, 404 for everyone else) and shows the worst of two signals, each read from the data folder:
+Admins see an indicator top right on every page. It links to **System health** (`/health`, admin only, 404 for everyone else) and shows the worst of its signals, each read from the data folder:
 
 | Signal | Green | Amber | Red |
 | --- | --- | --- | --- |
 | Collector | polled within 10 min, spool empty | punches spooled | no poll for 10 min, a dead-lettered punch, or the oldest spooled punch older than 60 min |
 | Backups | last backup within 2 intervals (30 min) | within 6 intervals (90 min) | older, none yet, 3 failed cycles in a row, or blocked by a different database |
+| Devices | every active device answered its last poll | - | an active device failed its last poll (named, with the date it last connected); the Devices nav entry shows the same count |
 
 With no R2 configured, Backups shows a neutral **Off** chip that never colours the indicator. The page also lists the last 14 backup cycles and the recovery commands.
 

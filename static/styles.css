@@ -368,7 +368,10 @@ input[type="file"]::file-selector-button {
 .field, .auth-field, .device-edit-field { display: flex; flex-direction: column; gap: 6px; }
 .field label, .auth-field label, .device-edit-field label { font-size: var(--text-13); font-weight: 500; color: var(--text); }
 .field-hint { font-size: var(--text-12); color: var(--text-secondary); }
-.field input, .auth-field input, .device-edit-field input { width: 100%; }
+/* Text-like inputs only: a checkbox or radio inside a field keeps its 16px box. */
+.field input:not([type="checkbox"]):not([type="radio"]),
+.auth-field input:not([type="checkbox"]):not([type="radio"]),
+.device-edit-field input:not([type="checkbox"]):not([type="radio"]) { width: 100%; }
 
 .search-field { position: relative; display: flex; align-items: center; }
 .search-field svg { position: absolute; left: 10px; color: var(--text-tertiary); pointer-events: none; }
@@ -387,6 +390,8 @@ input[type="file"]::file-selector-button {
   font-size: var(--text-13); color: var(--text-secondary);
 }
 .notice strong { color: var(--text); }
+/* A notice leading the page, right under the header (Team, Devices). */
+.notice-lead { margin-top: 0; margin-bottom: var(--s5); }
 
 /* ---------- Chips ---------- */
 .chip, .status-chip {
@@ -531,6 +536,17 @@ input[type="file"]::file-selector-button {
 
 /* Charts: SVG from essl_hub/charts.py, colors from chart tokens */
 .week-table { margin-top: var(--s3); }
+.week-future-note { display: none; }
+/* U7: on a phone each day card is headed by its date (no repeated "Day" label),
+   and a day still ahead folds to one plain line: "Wed 29 Oct · not yet". */
+@media (max-width: 767.98px) {
+  .week-table td.week-day, .week-table td.week-day .day-link { justify-content: flex-start; font-weight: 600; }
+  .week-table td.week-day::before { display: none; }
+  .week-table tr.is-future { padding: 0; background: transparent; border-style: dashed; }
+  .week-table tr.is-future td:not(.week-day) { display: none; }
+  .week-table tr.is-future td.week-day { font-weight: 400; }
+  .week-future-note { display: inline; }
+}
 .chart-frame { padding: var(--s4) var(--s4) var(--s2); background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius-lg); }
 .chart { display: block; overflow: visible; font-family: var(--font); font-variant-numeric: tabular-nums; }
 .wk-today { fill: var(--chart-today); }
@@ -573,8 +589,9 @@ input[type="file"]::file-selector-button {
 .health-recovery { max-width: 70ch; margin-top: var(--s6); font-size: var(--text-14); color: var(--text-secondary); }
 .health-recovery ol { padding-left: var(--s5); }
 .admin-section { padding: var(--s8) 0; border-top: 1px solid var(--border); }
-.topbar + .admin-section { border-top: 0; padding-top: 0; }
+.topbar + .admin-section, .subtabs + .admin-section { border-top: 0; padding-top: 0; }
 .admin-section > h2 { margin-bottom: var(--s1); }
+.admin-section > h3 { margin: var(--s6) 0 var(--s2); }
 .section-intro { margin-bottom: var(--s4); max-width: 70ch; font-size: var(--text-14); color: var(--text-secondary); }
 .device-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr)); gap: var(--s4); margin-bottom: var(--s8); }
 .device { display: flex; flex-direction: column; gap: var(--s4); padding: var(--s5); background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius-lg); }
@@ -709,8 +726,11 @@ input[type="file"]::file-selector-button {
   .ring-center .figure-value { font-size: 28px; letter-spacing: -0.03em; }
   .in-out-value { font-size: 22px; }
   .day-facts-quiet { justify-content: center; }
+  /* Centred with left: 50%, so its width is capped at half the viewport and
+     the wrapping .topbar-actions broke it into rows; one row at its own width. */
   .day-pager { position: fixed; left: 50%; bottom: calc(var(--s4) + env(safe-area-inset-bottom, 0px)); transform: translateX(-50%); z-index: 15;
-    padding: var(--s2); background: var(--surface); border: 1px solid var(--border-strong); border-radius: 999px; box-shadow: 0 6px 24px rgba(23, 23, 28, 0.16); }
+    flex-wrap: nowrap; width: max-content;
+    padding: var(--s2); background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius-lg); box-shadow: 0 6px 24px rgba(23, 23, 28, 0.16); }
   .main-content:has(.day-pager) { padding-bottom: 96px; }
   .device { padding: var(--s4); }
 }
@@ -767,6 +787,7 @@ input[type="file"]::file-selector-button {
 .person-form { display: flex; flex-direction: column; gap: var(--s5); max-width: 440px; }
 .person-form select { width: 100%; }
 .person-extra-ids { margin-top: var(--s8); gap: var(--s3); }
+.person-archive { margin-top: var(--s8); }
 .person-extra-ids h2 { font-size: var(--text-16); }
 .extra-id-list { list-style: none; margin: 0; padding: 0; border: 1px solid var(--border-strong); border-radius: var(--radius-lg); background: var(--surface); }
 .extra-id-list li { display: flex; align-items: center; justify-content: space-between; gap: var(--s3); min-height: 44px; padding: var(--s1) var(--s2) var(--s1) var(--s4); font-weight: 500; }
@@ -801,6 +822,9 @@ input[type="file"]::file-selector-button {
 @media (max-width: 767.98px) {
   .team-table { table-layout: auto; min-width: 0; }
   .team-table colgroup { display: none; }
+  /* U7: the email is desktop-only on phone cards (search still matches it);
+     the export checkbox stays, the only way to pick people on a phone. */
+  .people-table .person-email, .team-table .person-email { display: none; }
 }
 .select-cell { width: 40px; }
 .export-panel { margin-top: var(--s10); padding-top: var(--s6); border-top: 1px solid var(--border); scroll-margin-top: var(--s6); }
@@ -863,6 +887,13 @@ input[type="file"]::file-selector-button {
 .issue-guide h2 { margin: 0 0 var(--s2); font-size: var(--text-14); font-weight: 600; }
 .issue-guide ul { margin: 0; padding: 0; list-style: none; display: grid; gap: var(--s2); font-size: var(--text-13); color: var(--text-secondary); }
 .issue-guide .footnote { margin: var(--s3) 0 0; }
+/* Punch archive (v9): the range form on the confirm step and the list page. */
+.archive-range { display: flex; flex-wrap: wrap; gap: var(--s3); align-items: flex-end; margin-bottom: var(--s3); }
+.archive-range .field { flex: 0 1 180px; }
+.issue-confirm .field { margin-bottom: var(--s3); max-width: 420px; }
+.issue-confirm .archive-range .field { margin-bottom: 0; }
+.archive-restored { color: var(--text-secondary); }
+.archive-restored .table td { color: var(--text-secondary); }
 .issue-link-form { display: flex; gap: var(--s2); width: 100%; max-width: 420px; }
 .issue-link-form input { min-width: 0; flex: 1; }
 @media (max-width: 767px) {
@@ -948,7 +979,9 @@ input[type="file"]::file-selector-button {
 
 /* ---------- Day strip (U8, U6): 7 work days, paged a week at a time ---------- */
 /* Arrows and seven chips share one row, down to 375px; the picker sits below. */
-.day-strip { display: flex; align-items: stretch; gap: var(--s2); margin-bottom: var(--s4); min-width: 0; }
+/* The strip is its own size container: the chips drop their status word for a
+   glyph whenever the strip is narrow, at 375px and in the 460px drawer alike. */
+.day-strip { display: flex; align-items: stretch; gap: var(--s2); margin-bottom: var(--s4); min-width: 0; container-type: inline-size; }
 .day-strip-list { display: flex; flex: 1 1 auto; gap: var(--s2); min-width: 0; margin: 0; padding: 0 0 var(--s1); list-style: none; overflow-x: auto; overscroll-behavior-x: contain; }
 .day-strip-page { flex: 0 0 44px; width: 44px; height: auto; min-height: 44px; margin-bottom: var(--s1); padding: 0; }
 .day-strip-page:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
@@ -966,10 +999,23 @@ input[type="file"]::file-selector-button {
 .day-chip:hover { border-color: var(--border-strong); color: var(--text); }
 .day-chip:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 .day-chip-num { font-size: var(--text-14); font-weight: 600; color: var(--text); }
-.day-chip-status { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; }
-.day-chip-dot { width: 6px; height: 6px; border-radius: 50%; border: 1px solid currentColor; }
+.day-chip-status { display: inline-flex; align-items: center; gap: 4px; font-size: var(--text-12); }
+.day-chip-dot { display: inline-grid; place-items: center; box-sizing: border-box; width: 6px; height: 6px; border-radius: 50%; border: 1px solid currentColor; }
+.day-chip-glyph { display: none; }
 .day-chip.is-punched .day-chip-dot { background: var(--accent); border-color: var(--accent); }
 .day-chip.is-today .day-chip-dot { background: var(--accent); border-color: var(--accent); }
+/* U7: too narrow for "Today" / "None" beside the dot. The word goes, the day
+   label stays, and the dot grows to carry a check (punched) or a dash (no
+   punches), so the status never rests on colour alone. The link's aria-label
+   still names the full status. */
+@container (max-width: 520px) {
+  .day-chip { min-height: 44px; }
+  .day-chip-word { display: none; }
+  .day-chip-dot { width: 14px; height: 14px; }
+  .day-chip-dot .day-chip-glyph { display: block; width: 10px; height: 10px; stroke-width: 2.5; }
+  .day-chip.is-punched .day-chip-dot { color: var(--accent-text); }
+  .day-chip.is-today:not(.is-punched) .day-chip-dot { background: transparent; border-color: currentColor; }
+}
 .day-chip[aria-current="date"] { border-color: var(--accent); background: var(--accent-subtle); color: var(--text); box-shadow: inset 0 0 0 1px var(--accent); }
 
 /* ---------- Fix report (U7) ---------- */

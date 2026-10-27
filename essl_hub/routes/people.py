@@ -9,12 +9,14 @@ import hmac
 import io
 import json
 import time
+from datetime import date, datetime
 
 import openpyxl
 from flask import Blueprint, Response, abort, g, make_response, redirect, render_template, request, url_for
 
 from .. import access, export, id_issues, roster
-from ..db import IntegrityError, RuleViolation, reports_message
+from ..db import TIMESTAMP_FORMAT, IntegrityError, RuleViolation, reports_message
+from ..hours import work_day_window
 from .common import (
     ROLE_LABELS,
     ROSTER_EXAMPLE_ROW,
@@ -218,6 +220,9 @@ def _device_id_change(target: dict, raw: str | None):
         return None, (f"{_who(holder)} already uses device ID {value}.", 400)
     if holder is not None:
         return None, (f"{value} is already one of {target['name']}'s other device IDs. Remove it there first.", 400)
+    if (held := database.active_archive_for(value)) is not None:
+        return None, (f"Device ID {value} has {held['hidden']} archived punches that would stay hidden. "
+                      "Change it on the person's page to confirm, or restore the archive first.", 400)
     return value, None
 
 
@@ -280,7 +285,10 @@ def _who(person: dict) -> str:
     return f"{person['name']} (archived)" if person.get("archived_at") else person["name"]
 
 
-def _render_person_form(target: dict | None, values: dict, errors: dict, status: int = 200):
+def _render_person_form(target: dict | None, values: dict, errors: dict, status: int = 200, *,
+                        archive_hold: dict | None = None, extra_hold: dict | None = None):
+    """``archive_hold`` / ``extra_hold``: the confirm step when the new main
+    or extra device ID has archived punches (_archive_hold)."""
     actor = g.employee
     locked = target is not None and not access.can_modify_employee(actor, target, "email")
     if target is None:
@@ -302,9 +310,21 @@ def _render_person_form(target: dict | None, values: dict, errors: dict, status:
             managers=[p for p in database.employees() if target is None or p["id"] != target["id"]],
             extra_ids=database.extra_device_ids(target["id"]) if target is not None else [],
             extra_locked=target is not None and not access.can_modify_employee(actor, target, "device_ids"),
+            archive_hold=archive_hold,
+            extra_hold=extra_hold,
         ),
         status,
     )
+
+
+def _archive_hold(device_user_id: str) -> dict | None:
+    """Giving someone an ID with active punch archives leaves those punches
+    hidden (they do not start counting), so the form asks once more. The
+    confirm carries the ID itself (archived_ok), so a different ID asks again."""
+    if not device_user_id or request.form.get("archived_ok") == device_user_id:
+        return None
+    held = database.active_archive_for(device_user_id)
+    return {"device_user_id": device_user_id, **held} if held else None
 
 
 def _person_form_values() -> dict:
@@ -358,6 +378,8 @@ def person_create():
         errors["manager_id"] = "Choose a manager from the list."
     if errors:
         return _render_person_form(None, values, errors, status=400)
+    if (hold := _archive_hold(values["device_user_id"])) is not None:
+        return _render_person_form(None, values, {}, archive_hold=hold)
     try:
         database.upsert_employee(
             device_user_id=values["device_user_id"], name=values["name"], email=values["email"]
@@ -417,6 +439,8 @@ def person_add_device_id(employee_id: int):
     elif (holder := database.employee_by_device_user_id(device_user_id)) is not None:
         error = (f"{target['name']} already has this device ID." if holder["id"] == target["id"]
                  else f"{_who(holder)} already uses device ID {device_user_id}.")
+    elif (hold := _archive_hold(device_user_id)) is not None:
+        return _render_person_form(target, _target_values(target), {"extra_value": device_user_id}, extra_hold=hold)
     if error is None:
         try:
             database.add_extra_device_id(target["id"], device_user_id)
@@ -467,6 +491,10 @@ def person_update(employee_id: int):
         del errors["device_user_id"]  # untouched legacy ID; only new IDs are checked
     if errors:
         return _render_person_form(target, values, errors, status=400)
+    if values["device_user_id"] != str(target["device_user_id"]) and (
+        hold := _archive_hold(values["device_user_id"])
+    ) is not None:
+        return _render_person_form(target, values, {}, archive_hold=hold)
     result = _change_assignment(target, manager_raw=values["manager_id"], role_raw=values["role"])
     if result is not None:
         return _render_person_form(target, values, {"form": result[0]}, status=result[1] if result[1] != 200 else 400)
@@ -712,6 +740,11 @@ def _punch_count(device_user_id: str) -> int:
 @bp.get("/people/issues")
 @_role_required(*access.EDITOR_ROLES)
 def id_issues_view():
+    return _render_id_issues()
+
+
+def _render_id_issues(error: str | None = None, status: int = 200):
+    """The ID issues page; ``error`` (a refused POST) replaces any flash."""
     dismissed = _dismissed()
     issues = _issues(dismissed)
     order = {"bad": 0, "warn": 1, "info": 2}
@@ -720,12 +753,17 @@ def id_issues_view():
     pairs = id_issues.suggestions(issues)
     roster_people = database.employees()
     twins = id_issues.id_twins(issues, database.employees(include_archived=True))
-    flash = _take_flash()
-    confirm = None
+    flash = {"error": error} if error else _take_flash()
+    confirm = archive = None
+    can_archive_punches = access.can_archive_punches(g.employee)
     if request.args.get("confirm"):
         confirm = _link_preview(request.args.get("device_user_id") or "", request.args.get("person") or "")
         if isinstance(confirm, str):
             flash, confirm = {"error": confirm}, None
+    elif request.args.get("archive") and can_archive_punches:
+        archive = _archive_preview(issues, request.args["archive"].strip())
+        if isinstance(archive, str):
+            flash, archive = {"error": archive}, None
     response = make_response(render_template(
         "id_issues.html",
         employee=g.employee,
@@ -741,8 +779,13 @@ def id_issues_view():
         csrf_token=g.csrf_token,
         flash=flash,
         confirm=confirm,
+        archive=archive,
+        can_archive_punches=can_archive_punches,
+        archivable_kinds=id_issues.ARCHIVABLE_KINDS,
+        today=_today(),
+        timestamp_format=TIMESTAMP_FORMAT,
         checked_at=_now_naive(),
-    ))
+    ), status)
     if request.cookies.get(_FLASH_COOKIE):
         response.delete_cookie(_FLASH_COOKIE)
     return response
@@ -761,7 +804,7 @@ def _link_preview(device_user_id: str, person: str) -> dict | str:
     if clash is not None:
         return f"{target['name']} already has device ID {device_user_id}."
     return {"device_user_id": device_user_id, "employee": target, "punches": _punch_count(device_user_id),
-            "mode": _link_mode(target)}
+            "mode": _link_mode(target), "archived": database.active_archive_for(device_user_id)}
 
 
 def _link_mode(target: dict) -> str:
@@ -818,3 +861,122 @@ def id_issues_link():
     forget_issue_count()
     return _redirect_with_flash("people.id_issues_view", linked=device_user_id, who=target["name"],
                                 punches=_punch_count(device_user_id))
+
+
+# --- Punch archive (v9, KTD1-KTD4) -------------------------------------
+# Admins hide an unknown ID's or shared card's punches from ID issues; the
+# rows stay in punches and restore brings them back. HR reads the list.
+
+_NOT_ARCHIVABLE = "Only an ID that is not in the Directory, or a shared card, can be archived."
+
+
+def _archive_preview(issues: list[id_issues.Issue], device_user_id: str) -> dict | str:
+    """What archiving would hide, for the confirm step: optional from and to
+    days resolved to work-day bounds once (KTD3), so the rule saved is the
+    range counted. An error string when the ID cannot be archived."""
+    if id_issues.archivable(issues, device_user_id) is None:
+        return _NOT_ARCHIVABLE
+    raw_from = (request.args.get("from") or "").strip()
+    raw_to = (request.args.get("to") or "").strip()
+    preview = {"device_user_id": device_user_id, "from_date": raw_from, "to_date": raw_to, "error": None}
+    try:
+        from_day = date.fromisoformat(raw_from) if raw_from else None
+        to_day = date.fromisoformat(raw_to) if raw_to else None
+    except ValueError:
+        preview["error"] = "Pick the dates from the calendar."
+        return preview
+    if from_day and to_day and from_day > to_day:
+        preview["error"] = "The from date is after the to date."
+        return preview
+    hour = _day_start_hour(database)
+    # A from day starts at its work-day start; a to day is inclusive, so it
+    # ends at the next work-day start (clamped to now by the database).
+    from_ts = work_day_window(from_day, hour)[0] if from_day else None
+    to_ts = work_day_window(to_day, hour)[1] if to_day else None
+    try:
+        preview.update(database.archive_preview(device_user_id, from_ts, to_ts))
+    except RuleViolation as exc:
+        preview["error"] = str(exc)
+    return preview
+
+
+def _form_timestamp(name: str) -> datetime | None:
+    raw = (request.form.get(name) or "").strip()
+    if not raw:
+        return None
+    parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is not None:
+        raise ValueError("stored timestamps are naive local time")
+    return parsed
+
+
+@bp.post("/people/issues/archive")
+@_role_required(*access.PUNCH_ARCHIVE_ROLES)
+def id_issues_archive():
+    """Write the rule the confirm step previewed: its hidden from_ts / to_ts,
+    so punches arriving in between are never swept in."""
+    _require_csrf()
+    device_user_id = (request.form.get("device_user_id") or "").strip()
+    if id_issues.archivable(_issues(), device_user_id) is None:
+        return _render_id_issues(error=_NOT_ARCHIVABLE, status=400)
+    try:
+        from_ts, to_ts = _form_timestamp("from_ts"), _form_timestamp("to_ts")
+    except ValueError:
+        from_ts = to_ts = None
+    if to_ts is None:
+        return _render_id_issues(error="The archive range was lost; open the preview again.", status=400)
+    try:
+        count = database.archive_preview(device_user_id, from_ts, to_ts)["count"]
+        if not count:
+            return _render_id_issues(error="No punches in this range.", status=400)
+        database.archive_punches(device_user_id, from_ts=from_ts, to_ts=to_ts,
+                                 reason=request.form.get("reason"), actor_id=g.employee["id"])
+    except RuleViolation as exc:
+        return _render_id_issues(error=str(exc), status=400)
+    forget_issue_count()
+    return _redirect_with_flash("people.id_issues_view", archived=device_user_id, punches=count)
+
+
+@bp.get("/people/issues/archived")
+@_role_required(*access.EDITOR_ROLES)
+def punch_archives_view():
+    """Every archive rule: active ones with their live hidden count, then
+    restored ones as the audit record. ?restore=<id> is the admin's confirm
+    step before the restore POST."""
+    can_restore = access.can_archive_punches(g.employee)
+    archives = database.punch_archives()
+    confirm = None
+    restore = request.args.get("restore", "")
+    if can_restore and restore.isascii() and restore.isdigit():
+        wanted = int(restore)
+        confirm = next((a for a in archives if a["id"] == wanted and a["restored_at"] is None), None)
+    response = make_response(render_template(
+        "punch_archives.html",
+        employee=g.employee,
+        csrf_token=g.csrf_token,
+        active=[a for a in archives if a["restored_at"] is None],
+        restored=[a for a in archives if a["restored_at"] is not None],
+        can_restore=can_restore,
+        confirm=confirm,
+        flash=_take_flash(),
+    ))
+    if request.cookies.get(_FLASH_COOKIE):
+        response.delete_cookie(_FLASH_COOKIE)
+    return response
+
+
+@bp.post("/people/issues/archived/<int:archive_id>/restore")
+@_role_required(*access.PUNCH_ARCHIVE_ROLES)
+def punch_archive_restore(archive_id: int):
+    _require_csrf()
+    archive = database.punch_archive(archive_id)
+    if archive is None:
+        abort(404)
+    uid = str(archive["device_user_id"])
+    before = (database.active_archive_for(uid) or {}).get("hidden", 0)
+    if not database.restore_punch_archive(archive_id, actor_id=g.employee["id"]):
+        return _redirect_with_flash("people.punch_archives_view", already=uid)
+    forget_issue_count()
+    # Overlapping rules: only punches no other active rule covers reappear.
+    still = (database.active_archive_for(uid) or {}).get("hidden", 0)
+    return _redirect_with_flash("people.punch_archives_view", restored=uid, punches=before - still, still=still)

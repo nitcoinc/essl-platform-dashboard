@@ -80,6 +80,8 @@ class FakeDatabase:
         self.fix_lines: dict[int, dict] = {}
         self.corrections: list[dict] = []
         self.fix_events: list[dict] = []
+        # Punch archive rules (v9).
+        self.archive_rules: list[dict] = []
         # `offline` makes every write raise OfflineError, the way an
         # unavailable database does.
         self.offline = False
@@ -130,7 +132,7 @@ class FakeDatabase:
         rows: dict[str, dict] = {}
         for p in self.punches:
             uid = p.get("device_user_id")
-            if not uid:
+            if not uid or self._archived(p):
                 continue
             row = rows.setdefault(uid, {"device_user_id": uid, "punch_count": 0, "first_seen": None, "last_seen": None, "device_name": "", "sites": set()})
             row["punch_count"] += 1
@@ -148,6 +150,11 @@ class FakeDatabase:
         if not values or any(v is None for v in values):
             return None
         return min(values)
+
+    def unreachable_device_details(self) -> list[dict]:
+        rows = [d for d in self.devices_by_id.values() if d["retired_at"] is None and d["status"] == "error"]
+        return [{"id": d["id"], "name": f"{d['site']} {d['model']}", "last_success": d["last_success"]}
+                for d in sorted(rows, key=lambda d: (d["site"], d["id"]))]
 
     def update_device(self, device_id: str, *, ip: str, port: int, comm_password):
         device = self.devices_by_id[device_id]
@@ -295,6 +302,7 @@ class FakeDatabase:
             }
             for p in self.punches
             if p.get("device_user_id") in wanted and start <= p["event_timestamp"] < end
+            and not self._archived(p)
         ]
         rows.sort(key=lambda p: p["event_timestamp"])
         return apply_corrections(rows, self.corrections_for(main_ids, start, end), main_ids)
@@ -305,7 +313,8 @@ class FakeDatabase:
 
     def first_punch_at(self, device_user_ids):
         wanted = set(device_user_ids)
-        stamps = [p["event_timestamp"] for p in self.punches if p.get("device_user_id") in wanted]
+        stamps = [p["event_timestamp"] for p in self.punches
+                  if p.get("device_user_id") in wanted and not self._archived(p)]
         return min(stamps) if stamps else None
 
     def punches_for_device_users_range(self, device_user_ids, start: datetime, end: datetime):
@@ -317,9 +326,79 @@ class FakeDatabase:
         counts: dict[str, int] = {}
         for p in self.punches:
             uid = p.get("device_user_id")
-            if uid and uid not in mapped:
+            if uid and uid not in mapped and not self._archived(p):
                 counts[uid] = counts.get(uid, 0) + 1
         return [{"device_user_id": uid, "punch_count": n} for uid, n in sorted(counts.items())]
+
+    # punch archives (v9) ---------------------------------------------------
+
+    @staticmethod
+    def _covers(rule: dict, p: dict) -> bool:
+        return (p.get("device_user_id") == rule["device_user_id"]
+                and (rule["from_ts"] is None or p["event_timestamp"] >= rule["from_ts"])
+                and p["event_timestamp"] < rule["to_ts"])
+
+    def _archived(self, p: dict) -> bool:
+        """Database._ACTIVE_PUNCH_SQL, negated: an active rule covers it."""
+        return any(r["restored_at"] is None and self._covers(r, p) for r in self.archive_rules)
+
+    def _archive_range(self, from_ts, to_ts):
+        from essl_hub.db import RuleViolation
+
+        now = _ist_now().replace(microsecond=0)
+        to_ts = now if to_ts is None else min(to_ts.replace(microsecond=0), now)
+        if from_ts is not None and from_ts >= to_ts:
+            raise RuleViolation("The from date must be before the to date.")
+        return from_ts, to_ts
+
+    def archive_preview(self, device_user_id, from_ts, to_ts) -> dict:
+        from_ts, to_ts = self._archive_range(from_ts, to_ts)
+        rule = {"device_user_id": device_user_id, "from_ts": from_ts, "to_ts": to_ts}
+        stamps = sorted(p["event_timestamp"] for p in self.punches
+                        if self._covers(rule, p) and not self._archived(p))
+        return {"device_user_id": device_user_id, "from_ts": from_ts, "to_ts": to_ts, "count": len(stamps),
+                "first": stamps[0] if stamps else None, "last": stamps[-1] if stamps else None}
+
+    def archive_punches(self, device_user_id, *, from_ts, to_ts, reason=None, actor_id=None) -> int:
+        self._check_online()
+        from_ts, to_ts = self._archive_range(from_ts, to_ts)
+        rule = {"id": len(self.archive_rules) + 1, "device_user_id": device_user_id, "from_ts": from_ts,
+                "to_ts": to_ts, "reason": (reason or "").strip()[:200] or None, "created_by": actor_id,
+                "created_at": _ist_now(), "restored_by": None, "restored_at": None}
+        self.archive_rules.append(rule)
+        return rule["id"]
+
+    def restore_punch_archive(self, archive_id, *, actor_id=None) -> bool:
+        self._check_online()
+        rule = next((r for r in self.archive_rules if r["id"] == archive_id), None)
+        if rule is None or rule["restored_at"] is not None:
+            return False
+        rule.update(restored_at=_ist_now(), restored_by=actor_id)
+        return True
+
+    def _archive_view(self, rule: dict) -> dict:
+        active = rule["restored_at"] is None
+        return {**rule, "created_by_name": self._name(rule["created_by"]),
+                "restored_by_name": self._name(rule["restored_by"]),
+                "hidden_count": sum(self._covers(rule, p) for p in self.punches) if active else None}
+
+    def punch_archive(self, archive_id):
+        rule = next((r for r in self.archive_rules if r["id"] == archive_id), None)
+        return self._archive_view(rule) if rule else None
+
+    def punch_archives(self, include_restored: bool = True) -> list[dict]:
+        rules = [r for r in self.archive_rules if include_restored or r["restored_at"] is None]
+        rules.sort(key=lambda r: (r["restored_at"] is not None, r["restored_at"] or r["created_at"], r["id"]),
+                   reverse=True)
+        rules.sort(key=lambda r: r["restored_at"] is not None)
+        return [self._archive_view(r) for r in rules]
+
+    def active_archive_for(self, device_user_id):
+        rules = [r for r in self.archive_rules if r["device_user_id"] == device_user_id and r["restored_at"] is None]
+        if not rules:
+            return None
+        hidden = sum(1 for p in self.punches if p.get("device_user_id") == device_user_id and self._archived(p))
+        return {"archives": len(rules), "hidden": hidden}
 
     # employees ------------------------------------------------------------
 
@@ -944,6 +1023,25 @@ class FakeFixRequestsTest(unittest.TestCase):
         token = self.db.create_report_link(1, self.day, expires_at=_ist_now() + timedelta(days=1))
         self.assertEqual(self.db.report_link(token)["employee_id"], 1)
         self.assertEqual([p["name"] for p in self.db.active_hr_users()], ["Hari"])
+
+
+class FakeArchiveTest(unittest.TestCase):
+    """The fake's archive rules hide punches like Database._ACTIVE_PUNCH_SQL."""
+
+    def test_archive_hides_and_restore_shows_again(self) -> None:
+        db = FakeDatabase()
+        at = datetime(2026, 10, 1, 9, 0)
+        db.insert_punches([{"fingerprint": f"f{n}", "device_id": "d", "device_user_id": "9999",
+                            "event_timestamp": at + timedelta(days=n)} for n in range(3)])
+        archive_id = db.archive_punches("9999", from_ts=at + timedelta(days=1), to_ts=None)
+        self.assertEqual(db.device_id_summary()[0]["punch_count"], 1)
+        self.assertEqual(db.unmapped_device_user_ids(), [{"device_user_id": "9999", "punch_count": 1}])
+        self.assertEqual(db.active_archive_for("9999"), {"archives": 1, "hidden": 2})
+        self.assertEqual(db.punch_archives()[0]["hidden_count"], 2)
+        self.assertTrue(db.restore_punch_archive(archive_id))
+        self.assertFalse(db.restore_punch_archive(archive_id))
+        self.assertEqual(db.first_punch_at(["9999"]), at)
+        self.assertEqual(db.device_id_summary()[0]["punch_count"], 3)
 
 
 def _make_app():
@@ -1891,7 +1989,7 @@ class HistoryPagingTest(_QuickViewBase):
         self._sign_in(self._person("1", "Hema HR", "hr"))
         for page in (self.client.get(f"/day?employee={self.ravi['id']}").text, self._quick(self.ravi["id"]).text):
             chips = self._chips(page)
-            self.assertIn('aria-label="Wednesday 09 September, Today"', chips[-1])
+            self.assertIn('aria-label="Wednesday 09 September, Today, no punches"', chips[-1])
             self.assertIn('aria-current="date"', chips[-1])
             self.assertNotIn('data-qv-page="later"', page)
             self.assertNotIn('aria-label="Later week,', page)
@@ -1902,11 +2000,11 @@ class HistoryPagingTest(_QuickViewBase):
         self._sign_in(self._person("1", "Hema HR", "hr"))
         rid = self.ravi["id"]
         page = self.client.get(f"/day?employee={rid}&date=2026-09-05&strip_end=2026-12-01").text
-        self.assertIn('aria-label="Wednesday 09 September, Today"', self._chips(page)[-1])
+        self.assertIn('aria-label="Wednesday 09 September, Today, no punches"', self._chips(page)[-1])
         self.assertFalse(any("strip_end=" in c for c in self._chips(page)))
         drawer = self._quick(rid, "?date=2026-09-05&strip_end=2026-12-01")
         self.assertEqual(drawer.status_code, 200)
-        self.assertIn('aria-label="Wednesday 09 September, Today"', self._chips(drawer.text)[-1])
+        self.assertIn('aria-label="Wednesday 09 September, Today, no punches"', self._chips(drawer.text)[-1])
         # A malformed strip_end on /day falls back like a malformed date.
         self.assertEqual(self.client.get(f"/day?employee={rid}&strip_end=nope").status_code, 200)
 
@@ -2891,6 +2989,12 @@ class DeviceDoorSettingsTest(_DeviceSettingsBase):
         self.assertIn(f"Requested {device['door_params_requested_at'].strftime('%H:%M')}", card)
         self.assertNotIn("Change door settings", card)
 
+    def test_door_confirm_page_keeps_devices_current(self) -> None:
+        self._read_c3()
+        response = self._door("", **self._form(Door1Intertime="0"))
+        self.assertIn("Punch interval, door 1: 1 → 0", response.text)
+        self.assertEqual(_current_nav(response.text), ["Devices"])
+
     def test_select_change_shows_option_labels(self) -> None:
         self._read_c3()
         response = self._door("", **self._form(Door2CloseAndLock="0"))
@@ -3598,6 +3702,135 @@ class AppShellTest(unittest.TestCase):
                 html = self._client_as(role).get("/week").text
                 self.assertEqual(self._sidebar_labels(html), labels)
                 self.assertIn('aria-current="page"', html)
+
+
+def _current_nav(html: str) -> list[str]:
+    """Labels of the main sidebar entries marked aria-current="page"."""
+    start = html.index('<nav aria-label="Main">')
+    nav = html[start : html.index("</nav>", start)]
+    return re.findall(r'<a class="nav-item" href="[^"]*" aria-current="page"[^>]*>.*?<span>([^<]+)</span>', nav, re.S)
+
+
+class NavSectionTest(unittest.TestCase):
+    """U4 (KTD7): the nav highlights the section, from the endpoint and whose
+    page it is, on sub-pages and other people's days too."""
+
+    def setUp(self) -> None:
+        self.app, self.database = _make_app()
+        self.client = self.app.test_client()
+        from essl_hub import mail as mail_module
+
+        self.captured = {}
+        original = mail_module.send_login_code
+        mail_module.send_login_code = lambda e, c: self.captured.update(code=c)
+        self.addCleanup(lambda: setattr(mail_module, "send_login_code", original))
+
+    def _person(self, uid: str, role: str = "employee") -> dict:
+        email = f"nav{uid}@example.com"
+        self.database.upsert_employee(device_user_id=uid, name=f"N{uid}", email=email)
+        person = self.database.employee_by_email(email)
+        self.database.set_employee_role(person["id"], role)
+        return person
+
+    def _sign_in(self, person: dict) -> None:
+        self.client.post("/signout")
+        self.client.post("/signin", data={"email": person["email"]})
+        self.client.post("/signin/verify", data={"code": self.captured["code"]})
+
+    def _csrf(self) -> str:
+        html = self.client.get("/day").text
+        marker = 'name="csrf-token" content="'
+        start = html.index(marker) + len(marker)
+        return html[start : html.index('"', start)]
+
+    def _current(self, path: str) -> list[str]:
+        response = self.client.get(path)
+        self.assertEqual(response.status_code, 200, path)
+        return _current_nav(response.text)
+
+    def test_rules_in_order(self) -> None:
+        from essl_hub.web import nav_section
+
+        cases = [
+            ("people.id_issues_view", True, "id_issues"),
+            ("people.id_issues_archive", True, "id_issues"),
+            ("people.punch_archives_view", True, "id_issues"),
+            ("people.punch_archive_restore", True, "id_issues"),
+            ("people.people_archive_view", True, "people"),
+            ("people.person_edit", False, "people"),  # an id in the path is not "someone else's day"
+            ("me.week_view", True, "week"),
+            ("me.day_view", True, "today"),
+            ("me.quick_view", True, "today"),
+            ("fixes.report_view", True, "today"),
+            ("fixes.report_submit", True, "today"),
+            ("me.day_view", False, "team"),
+            ("me.week_view", False, "team"),
+            ("me.quick_view", False, "team"),
+            ("team.team_view", True, "team"),
+            ("team.export_csv", True, "team"),
+            ("fixes.review_list", True, "fix_requests"),
+            ("fixes.review_detail", True, "fix_requests"),
+            ("fixes.review_confirm", True, "fix_requests"),
+            ("admin.devices_view", True, "devices"),
+            ("admin.devices_door", True, "devices"),
+            ("admin.settings_view", True, "settings"),
+            ("admin.settings_create_key", True, "settings"),
+            ("admin.health_view", True, "settings"),
+            ("fixes.link_view", True, None),
+            ("auth.signin", True, None),
+            ("admin.admin_view", True, None),
+            (None, True, None),
+        ]
+        for endpoint, own, section in cases:
+            with self.subTest(endpoint=endpoint, own=own):
+                self.assertEqual(nav_section(endpoint, own=own), section)
+
+    def test_people_sub_pages_keep_people_current(self) -> None:
+        hr = self._person("1", "hr")
+        self._sign_in(hr)
+        # The fake has no archived people; the page itself is covered in test_people_edit.
+        self.database.archived_employees = lambda: []
+        for path in ("/people", "/people/archive", "/people/new", f"/people/{hr['id']}/edit", "/people/import"):
+            with self.subTest(path=path):
+                self.assertEqual(self._current(path), ["People"])
+
+    def test_id_issues_and_archive_list_are_the_id_issues_tab_not_directory(self) -> None:
+        self._sign_in(self._person("1", "hr"))
+        for path in ("/people/issues", "/people/issues/archived"):
+            with self.subTest(path=path):
+                html = self.client.get(path).text
+                # ID issues has no sidebar entry; People hosts it as a sub-tab.
+                self.assertEqual(_current_nav(html), ["People"])
+                self.assertIn('href="/people/issues" aria-current="page">ID issues', html)
+                self.assertNotIn('href="/people" aria-current="page">Directory', html)
+                self.assertNotIn('href="/people/archive" aria-current="page">Archive', html)
+
+    def test_manager_viewing_a_report_is_team_and_own_pages_are_today_and_week(self) -> None:
+        boss = self._person("10", "manager")
+        report = self._person("11")
+        report["manager_id"] = boss["id"]
+        self._sign_in(boss)
+        self.assertEqual(self._current(f"/day?employee={report['id']}"), ["Team"])
+        self.assertEqual(self._current(f"/week?employee={report['id']}"), ["Team"])
+        self.assertEqual(self._current("/team"), ["Team"])
+        self.assertEqual(self._current("/day"), ["Today"])
+        self.assertEqual(self._current(f"/day?employee={boss['id']}"), ["Today"])
+        self.assertEqual(self._current("/week"), ["Week"])
+
+    def test_employee_own_day_and_week(self) -> None:
+        self._sign_in(self._person("20"))
+        self.assertEqual(self._current("/day"), ["Today"])
+        self.assertEqual(self._current("/week"), ["Week"])
+
+    def test_health_and_settings_re_render_are_settings(self) -> None:
+        self._sign_in(self._person("30", "admin"))
+        self.assertEqual(self._current("/settings"), ["Settings"])
+        self.assertEqual(self._current("/health"), ["Settings"])
+        self.assertEqual(self._current("/devices"), ["Devices"])
+        response = self.client.post("/settings/keys", data={"label": "HRMS", "csrf": self._csrf()})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('<div class="key-reveal">', response.text)
+        self.assertEqual(_current_nav(response.text), ["Settings"])
 
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
@@ -4599,6 +4832,321 @@ class PeopleManagementTest(unittest.TestCase):
         self.assertEqual(self.database.employee_by_id(self.ravi["id"])["device_user_id"], "5")
 
 
+class PunchArchiveWebTest(unittest.TestCase):
+    """Punch archive U3 and the retired-device fix U1, on a real SQLite
+    database so the archive filter and timestamp types are exercised."""
+
+    def setUp(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        from essl_hub import mail as mail_module
+        from essl_hub.db import Database
+
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.database = Database(str(Path(tmp.name) / "essl.db"))
+        self.app = create_app(database=self.database)
+        self.app.testing = True
+        self.client = self.app.test_client()
+        self.captured = {}
+        original = mail_module.send_login_code
+        mail_module.send_login_code = lambda e, c: self.captured.update(code=c)
+        self.addCleanup(lambda: setattr(mail_module, "send_login_code", original))
+        self.hr = self._person("1", "Hema HR", "hr")
+        self.admin = self._person("2", "Arun Admin", "admin")
+        self.sita = self._person("3", "Sita Rao")
+        today = datetime.combine(_ist_today(), datetime.min.time())
+        self.days = [today - timedelta(days=n) for n in (10, 5, 2)]
+        self._punches("9999", [day + timedelta(hours=9) for day in self.days], name="Test card")
+        # Sita's own ID, but the device calls it someone else: a "name" issue.
+        self._punches("3", [self.days[-1] + timedelta(hours=9)], name="Mohan Das")
+
+    def _person(self, device_user_id, name, role="employee") -> dict:
+        email = f"{device_user_id}@n.com"
+        self.database.upsert_employee(device_user_id=device_user_id, name=name, email=email)
+        person = self.database.employee_by_email(email)
+        if role != "employee":
+            self.database.set_employee_role(person["id"], role)
+        return self.database.employee_by_id(person["id"])
+
+    def _punches(self, uid: str, stamps, name: str = "") -> None:
+        self.database.insert_punches([
+            {"fingerprint": f"fp-{uid}-{at.isoformat()}", "device_id": DEVICES[0].id, "site": "Uppal",
+             "device_user_id": uid, "employee_name": name, "event_timestamp": at}
+            for at in stamps
+        ])
+
+    def _sign_in(self, person: dict) -> None:
+        self.client.post("/signin", data={"email": person["email"]})
+        self.client.post("/signin/verify", data={"code": self.captured["code"]})
+
+    def _csrf(self) -> str:
+        return re.search(r'name="csrf" value="([^"]+)"', self.client.get("/day").text).group(1)
+
+    def _count(self, uid: str = "9999") -> int:
+        return next((r["punch_count"] for r in self.database.device_id_summary() if r["device_user_id"] == uid), 0)
+
+    def _preview(self, query: str = "") -> str:
+        return self.client.get(f"/people/issues?archive=9999{query}").text
+
+    @staticmethod
+    def _hidden(page: str, name: str) -> str:
+        return re.search(rf'name="{name}" value="([^"]*)"', page).group(1)
+
+    def _confirm(self, page: str, **extra):
+        data = {"csrf": self._csrf(), "device_user_id": self._hidden(page, "device_user_id"),
+                "from_ts": self._hidden(page, "from_ts"), "to_ts": self._hidden(page, "to_ts"), **extra}
+        return self.client.post("/people/issues/archive", data=data, follow_redirects=True)
+
+    # --- U1 ---------------------------------------------------------------
+
+    def test_devices_page_renders_with_a_retired_device(self) -> None:
+        self._sign_in(self.admin)
+        self.database.set_device_retired(DEVICES[1].id, True)
+        response = self.client.get("/devices")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(DEVICES[1].id, response.text)
+
+    # --- archive ------------------------------------------------------------
+
+    def test_admin_previews_and_archives_every_punch_of_an_unknown_id(self) -> None:
+        self._sign_in(self.admin)
+        issues = self.client.get("/people/issues").text
+        self.assertIn('name="archive" value="9999"', issues)
+        self.assertIn('href="/people/issues/archived"', issues)
+        page = self._preview()
+        self.assertIn("Archive punches of 9999?", page)
+        self.assertIn("<strong>3 punches</strong>", page)
+        self.assertIn("from the first punch", page)
+        self.assertEqual(self._hidden(page, "from_ts"), "")
+        response = self._confirm(page, reason="Test card")
+        self.assertIn("Archived 3 punches from ID 9999.", response.text)
+        self.assertNotIn('name="archive" value="9999"', response.text)
+        self.assertEqual(self._count(), 0)
+        (rule,) = self.database.punch_archives()
+        self.assertEqual((rule["reason"], rule["created_by_name"]), ("Test card", "Arun Admin"))
+
+    def test_a_date_range_archives_only_its_days_and_the_issue_stays(self) -> None:
+        self._sign_in(self.admin)
+        day = self.days[1].date().isoformat()
+        page = self._preview(f"&from={day}&to={day}")
+        self.assertIn("<strong>1 punch</strong>", page)
+        self.assertIn(f'value="{day}"', page)
+        response = self._confirm(page)
+        self.assertIn("Archived 1 punch from ID 9999.", response.text)
+        self.assertEqual(self._count(), 2)
+        self.assertIn('name="archive" value="9999"', response.text)
+        (rule,) = self.database.punch_archives()
+        self.assertEqual(rule["from_ts"], self.days[1] + timedelta(hours=6))
+        self.assertEqual(rule["to_ts"], self.days[1] + timedelta(days=1, hours=6))
+
+    def test_hr_gets_no_archive_action_and_a_direct_post_is_403(self) -> None:
+        self._sign_in(self.hr)
+        self.assertNotIn('name="archive"', self.client.get("/people/issues").text)
+        self.assertNotIn("Archive punches of", self._preview())
+        response = self.client.post("/people/issues/archive", data={
+            "csrf": self._csrf(), "device_user_id": "9999", "to_ts": "2030-01-01 00:00:00"})
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.database.punch_archives(), [])
+
+    def test_a_mapped_id_cannot_be_archived(self) -> None:
+        self._sign_in(self.admin)
+        self.assertIn("Name differs", self.client.get("/people/issues").text)
+        self.assertIn("can be archived", self.client.get("/people/issues?archive=3").text)
+        response = self.client.post("/people/issues/archive", data={
+            "csrf": self._csrf(), "device_user_id": "3", "to_ts": _ist_now().strftime("%Y-%m-%d %H:%M:%S")})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("can be archived", response.text)
+        self.assertEqual(self.database.punch_archives(), [])
+
+    def test_missing_csrf_is_refused(self) -> None:
+        self._sign_in(self.admin)
+        page = self._preview()
+        response = self.client.post("/people/issues/archive", data={
+            "device_user_id": "9999", "to_ts": self._hidden(page, "to_ts")})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.database.punch_archives(), [])
+
+    def test_a_to_date_of_today_is_clamped_so_later_swipes_stay_visible(self) -> None:
+        self._sign_in(self.admin)
+        page = self._preview(f"&to={_ist_today().isoformat()}")
+        to_ts = datetime.fromisoformat(self._hidden(page, "to_ts"))
+        self.assertLessEqual(to_ts, _ist_now())
+        self._confirm(page)
+        self._punches("9999", [to_ts + timedelta(minutes=1)])
+        self.assertEqual(self._count(), 1)
+
+    def test_from_after_to_is_a_form_error_and_writes_nothing(self) -> None:
+        self._sign_in(self.admin)
+        page = self._preview(f"&from={self.days[2].date().isoformat()}&to={self.days[0].date().isoformat()}")
+        self.assertIn("The from date is after the to date.", page)
+        self.assertNotIn('action="/people/issues/archive"', page)
+        self.assertEqual(self.database.punch_archives(), [])
+
+    def test_an_empty_range_disables_confirm(self) -> None:
+        self._sign_in(self.admin)
+        day = (self.days[0] + timedelta(days=1)).date().isoformat()
+        page = self._preview(f"&from={day}&to={day}")
+        self.assertIn("No punches in this range.", page)
+        self.assertRegex(page, r'<button class="button button-primary" type="submit" disabled>')
+        response = self._confirm(page)
+        self.assertIn("No punches in this range.", response.text)
+        self.assertEqual(self.database.punch_archives(), [])
+
+    def test_the_previewed_end_is_stored_even_when_punches_arrive_before_confirm(self) -> None:
+        self._sign_in(self.admin)
+        page = self._preview()
+        to_ts = datetime.fromisoformat(self._hidden(page, "to_ts"))
+        self._punches("9999", [to_ts + timedelta(seconds=2)])
+        self.assertIn("Archived 3 punches from ID 9999.", self._confirm(page).text)
+        self.assertEqual(self.database.punch_archives()[0]["to_ts"], to_ts)
+        self.assertEqual(self._count(), 1)
+
+    # --- archive list and restore ----------------------------------------
+
+    def test_archive_list_empty_state(self) -> None:
+        self._sign_in(self.hr)
+        page = self.client.get("/people/issues/archived")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("No archived punches", page.text)
+
+    def test_hr_reads_the_list_and_an_admin_restores(self) -> None:
+        archive_id = self.database.archive_punches("9999", from_ts=None, to_ts=None, reason="Test card",
+                                                   actor_id=self.admin["id"])
+        self._sign_in(self.hr)
+        page = self.client.get("/people/issues/archived").text
+        self.assertIn('<td data-label="Reason">Test card</td>', page)
+        self.assertIn('<td data-label="Device ID"><strong>9999</strong></td>', page)
+        self.assertIn("Arun Admin", page)
+        self.assertNotIn("Restore", page.split("<h1")[1].split("Nothing is deleted")[1])
+        self.assertNotIn("Restore the archive of", self.client.get(f"/people/issues/archived?restore={archive_id}").text)
+        self.assertEqual(self.client.post(f"/people/issues/archived/{archive_id}/restore",
+                                          data={"csrf": self._csrf()}).status_code, 403)
+        self.client.post("/signout", data={"csrf": self._csrf()})
+        self._sign_in(self.admin)
+        confirm = self.client.get(f"/people/issues/archived?restore={archive_id}").text
+        self.assertIn("Restore the archive of 9999?", confirm)
+        self.assertIn("<strong>3 punches</strong>", confirm)
+        response = self.client.post(f"/people/issues/archived/{archive_id}/restore",
+                                    data={"csrf": self._csrf()}, follow_redirects=True)
+        self.assertIn("Restored 3 punches of ID 9999.", response.text)
+        self.assertIn('class="admin-section archive-restored"', response.text)
+        self.assertEqual(self._count(), 3)
+        self.assertIn("<span class=\"num\">3</span> punches", self.client.get("/people/issues").text)
+        again = self.client.post(f"/people/issues/archived/{archive_id}/restore",
+                                 data={"csrf": self._csrf()}, follow_redirects=True)
+        self.assertEqual(again.status_code, 200)
+        self.assertIn("was already restored", again.text)
+        self.assertEqual(self.client.post("/people/issues/archived/999/restore",
+                                          data={"csrf": self._csrf()}).status_code, 404)
+
+    # --- later mapping ------------------------------------------------------
+
+    def test_linking_an_archived_id_warns_that_its_punches_stay_hidden(self) -> None:
+        self.database.archive_punches("9999", from_ts=self.days[1], to_ts=None)
+        self._sign_in(self.admin)
+        page = self.client.get(f"/people/issues?confirm=1&device_user_id=9999&person={self.sita['id']}").text
+        self.assertIn("<strong>1 punch</strong> will start counting", page)
+        self.assertIn("2 punches of this ID are archived and stay hidden.", page)
+
+    def test_adding_an_archived_id_on_the_person_form_asks_once_more(self) -> None:
+        self.database.archive_punches("9999", from_ts=None, to_ts=None)
+        self._sign_in(self.admin)
+        url = f"/people/{self.sita['id']}/device-ids"
+        first = self.client.post(url, data={"csrf": self._csrf(), "extra_device_user_id": "9999"})
+        self.assertEqual(first.status_code, 200)
+        self.assertIn("3 punches of this ID are archived and stay hidden.", first.text)
+        self.assertIn('name="archived_ok" value="9999"', first.text)
+        self.assertEqual(self.database.extra_device_ids(self.sita["id"]), [])
+        self.client.post(url, data={"csrf": self._csrf(), "extra_device_user_id": "9999", "archived_ok": "9999"})
+        self.assertEqual(self.database.extra_device_ids(self.sita["id"]), ["9999"])
+
+    def test_changing_a_main_id_to_an_archived_one_asks_once_more(self) -> None:
+        self.database.archive_punches("9999", from_ts=None, to_ts=None)
+        self._sign_in(self.admin)
+        data = {"csrf": self._csrf(), "name": "Sita Rao", "email": self.sita["email"],
+                "device_user_id": "9999", "manager_id": "", "role": "employee"}
+        first = self.client.post(f"/people/{self.sita['id']}/edit", data=data)
+        self.assertIn("3 punches of this ID are archived and stay hidden.", first.text)
+        self.assertEqual(self.database.employee_by_id(self.sita["id"])["device_user_id"], "3")
+        self.client.post(f"/people/{self.sita['id']}/edit", data={**data, "archived_ok": "9999"})
+        self.assertEqual(self.database.employee_by_id(self.sita["id"])["device_user_id"], "9999")
+
+    def test_adding_a_person_with_an_archived_id_asks_once_more(self) -> None:
+        self.database.archive_punches("9999", from_ts=None, to_ts=None)
+        self._sign_in(self.admin)
+        data = {"csrf": self._csrf(), "name": "Temp Tester", "email": "tester@n.com",
+                "device_user_id": "9999", "manager_id": "", "role": "employee"}
+        first = self.client.post("/people/new", data=data)
+        self.assertIn("3 punches of this ID are archived and stay hidden.", first.text)
+        self.assertIsNone(self.database.employee_by_email("tester@n.com"))
+        self.client.post("/people/new", data={**data, "archived_ok": "9999"})
+        self.assertEqual(self.database.employee_by_email("tester@n.com")["device_user_id"], "9999")
+
+    def test_the_inline_device_id_edit_refuses_an_archived_id(self) -> None:
+        self.database.archive_punches("9999", from_ts=None, to_ts=None)
+        self._sign_in(self.admin)
+        response = self.client.post(f"/people/{self.sita['id']}/assign", data={
+            "csrf": self._csrf(), "device_user_id": "9999", "manager_id": "", "role": "employee"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("3 archived punches that would stay hidden", response.text)
+        self.assertEqual(self.database.employee_by_id(self.sita["id"])["device_user_id"], "3")
+
+    # --- bad input ----------------------------------------------------------
+
+    def _post_archive(self, **fields):
+        return self.client.post("/people/issues/archive", data={
+            "csrf": self._csrf(), "device_user_id": "9999", **fields})
+
+    def test_a_lost_or_malformed_range_is_refused_and_writes_nothing(self) -> None:
+        self._sign_in(self.admin)
+        for fields in ({}, {"to_ts": "garbage"}, {"from_ts": "2026-10-01T00:00:00", "to_ts": "garbage"}):
+            response = self._post_archive(**fields)
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("The archive range was lost", response.text)
+        self.assertEqual(self.database.punch_archives(), [])
+
+    def test_a_timezone_aware_range_is_a_400_not_a_500(self) -> None:
+        self._sign_in(self.admin)
+        response = self._post_archive(to_ts="2030-01-01T00:00:00+05:30")
+        self.assertEqual(response.status_code, 400)
+        response = self._post_archive(from_ts="2026-10-01T00:00:00Z", to_ts="2026-10-02 00:00:00")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.database.punch_archives(), [])
+
+    def test_a_reversed_range_is_refused(self) -> None:
+        self._sign_in(self.admin)
+        response = self._post_archive(from_ts="2026-10-09 00:00:00", to_ts="2026-10-02 00:00:00")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("The from date must be before the to date.", response.text)
+        self.assertEqual(self.database.punch_archives(), [])
+
+    def test_a_non_ascii_restore_parameter_is_ignored(self) -> None:
+        self.database.archive_punches("9999", from_ts=None, to_ts=None)
+        self._sign_in(self.admin)
+        page = self.client.get("/people/issues/archived?restore=%C2%B2")
+        self.assertEqual(page.status_code, 200)
+        self.assertNotIn("Restore the archive of 9999?", page.text)
+
+    def test_an_htmx_fragment_skips_the_device_health_and_unmapped_scans(self) -> None:
+        self._sign_in(self.admin)
+        with patch.object(self.database, "unreachable_device_details", return_value=[]) as devices, \
+                patch.object(self.database, "unmapped_device_user_ids", return_value=[]) as unmapped:
+            self.client.get("/team?q=sita", headers={"HX-Request": "true"})
+            devices.assert_not_called()
+            unmapped.assert_not_called()
+            self.client.get("/team")
+            devices.assert_called()
+            unmapped.assert_called()
+
+    def test_action_buttons_carry_a_well_formed_aria_label(self) -> None:
+        archive_id = self.database.archive_punches("9999", from_ts=None, to_ts=None)
+        self._sign_in(self.admin)
+        self.assertIn('aria-label="Restore the archive of 9999"', self.client.get("/people/issues/archived").text)
+        self.database.restore_punch_archive(archive_id)
+        self.assertIn('aria-label="Archive punches of 9999"', self.client.get("/people/issues").text)
+
+
 class ScreensTest(unittest.TestCase):
     """U11: devices split, settings, Today and sign-in screens."""
 
@@ -4808,6 +5356,239 @@ class SyncHealthTest(unittest.TestCase):
         health = self._health(backup=self._backup(timedelta(minutes=40)), collector=self._collector(dead=2))
         self.assertEqual((health["tone"], health["signal"]), ("bad", "collector"))
         self.assertEqual(health["label"], "Collector: 2 dead punches")
+
+    def _devices(self, *names_and_last):
+        return [{"id": name.lower().replace(" ", "-"), "name": name, "last_success": last}
+                for name, last in names_and_last]
+
+    def test_one_unreachable_device_is_named_with_its_last_success(self) -> None:
+        health = self._health_devices(self._devices(("Uppal X990", datetime(2026, 10, 25, 12, 30))))
+        self.assertEqual((health["tone"], health["signal"]), ("bad", "devices"))
+        self.assertEqual(health["label"], "Uppal X990 unreachable since 25 Oct")
+        # No times on this signal: the title carries just its summary.
+        self.assertIn(" · Devices: Uppal X990 unreachable since 25 Oct", health["title"])
+        self.assertEqual(self._signal(health, "devices")["count"], 1)
+        never = self._health_devices(self._devices(("Uppal X990", None)))
+        self.assertEqual(never["label"], "Uppal X990 unreachable, never connected")
+
+    def test_two_unreachable_devices_are_one_signal(self) -> None:
+        health = self._health_devices(self._devices(
+            ("Gachibowli C3-400", datetime(2026, 10, 26, 8, 0)), ("Uppal X990", None)))
+        self.assertEqual([d["key"] for d in health["details"]], ["collector", "backup", "devices"])
+        self.assertEqual(health["label"], "2 devices unreachable")
+        self.assertEqual(self._signal(health, "devices")["summary"],
+                         "2 devices unreachable: Gachibowli C3-400 since 26 Oct; Uppal X990, never connected")
+
+    def test_no_unreachable_devices_adds_no_signal(self) -> None:
+        for devices in (None, []):
+            health = self._health_devices(devices)
+            self.assertEqual([d["key"] for d in health["details"]], ["collector", "backup"])
+            self.assertEqual(health["label"], "All systems healthy")
+
+    def _health_devices(self, devices):
+        from essl_hub.routes.common import sync_health
+
+        return sync_health(self._collector(), self._backup(timedelta(minutes=10)), self.NOW,
+                           backup_minutes=15, devices=devices)
+
+
+class TeamSummaryTest(unittest.TestCase):
+    """U5: the Team / Employees status line, Manager column and unknown-ID notice."""
+
+    NOW = datetime(2026, 10, 26, 18, 0)
+
+    def setUp(self) -> None:
+        self.app, self.database = _make_app()
+        self.client = self.app.test_client()
+        from essl_hub import mail as mail_module
+
+        self.captured = {}
+        original = mail_module.send_login_code
+        mail_module.send_login_code = lambda e, c: self.captured.update(code=c)
+        self.addCleanup(lambda: setattr(mail_module, "send_login_code", original))
+        for patcher in (*_fixed_now(self.NOW), patch("essl_hub.routes.team._now_naive", lambda: self.NOW)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        # A manager (no punches) with 4 reports inside and 2 who met the target.
+        self.boss = self._person("50", "Boss", "manager")
+        day = datetime(2026, 10, 26)
+        punches = []
+        for i in range(6):
+            person = self._person(str(60 + i), f"Report{i}")
+            self.database.set_employee_manager(person["id"], self.boss["id"])
+            punches.append(_punch_row(f"in-{i}", day.replace(hour=9), "entry", uid=str(60 + i)))
+            if i >= 4:
+                punches.append(_punch_row(f"out-{i}", day.replace(hour=17, minute=30), "exit", uid=str(60 + i)))
+        # A swipe from a card nobody owns.
+        punches.append(_punch_row("ghost", day.replace(hour=10), "entry", uid="9999"))
+        self.database.insert_punches(punches)
+        self.hr = self._person("70", "Hema", "hr")
+
+    def _person(self, uid: str, name: str, role: str = "employee") -> dict:
+        email = f"{name.lower()}@example.com"
+        self.database.upsert_employee(device_user_id=uid, name=name, email=email)
+        person = self.database.employee_by_email(email)
+        self.database.set_employee_role(person["id"], role)
+        return person
+
+    def _sign_in(self, person: dict) -> None:
+        self.client.post("/signout")
+        self.client.post("/signin", data={"email": person["email"]})
+        self.client.post("/signin/verify", data={"code": self.captured["code"]})
+
+    @staticmethod
+    def _count(html: str) -> str:
+        return re.search(r'<p id="team-count"[^>]*>([^<]*)</p>', html).group(1)
+
+    def test_summary_counts_each_person_once_by_todays_status(self) -> None:
+        from types import SimpleNamespace
+
+        from essl_hub.routes.team import _status_summary
+
+        self._sign_in(self.boss)
+        page = self.client.get("/team").text
+        self.assertEqual(self._count(page), "7 people: 4 inside · 2 met · 1 no punches")
+        rows = [{"result": SimpleNamespace(status=s)} for s in ("short", "incomplete", "met")]
+        self.assertEqual(_status_summary(rows), "3 people: 1 met · 1 short · 1 needs review")
+        self.assertEqual(_status_summary(rows[:1]), "1 person: 1 short")
+        self.assertEqual(_status_summary([]), "0 people")
+
+    def test_search_recounts_the_summary_out_of_band(self) -> None:
+        self._sign_in(self.boss)
+        fragment = self.client.get("/team?q=report", headers={"HX-Request": "true"}).text
+        self.assertIn('hx-swap-oob="true"', fragment)
+        self.assertEqual(self._count(fragment), "6 people: 4 inside · 2 met")
+        fragment = self.client.get("/team?q=report4", headers={"HX-Request": "true"}).text
+        self.assertEqual(self._count(fragment), "1 person: 1 met")
+
+    def test_manager_sees_no_manager_column_and_no_unknown_id_notice(self) -> None:
+        self._sign_in(self.boss)
+        page = self.client.get("/team").text
+        self.assertNotIn('<th scope="col">Manager</th>', page)
+        self.assertNotIn('data-label="Manager"', page)
+        self.assertNotIn("col-manager", page)
+        self.assertNotIn("no one in the Directory", page)
+
+    def test_hr_sees_manager_column_and_the_notice_above_the_table(self) -> None:
+        self._sign_in(self.hr)
+        page = self.client.get("/team").text
+        self.assertIn('<th scope="col">Manager</th>', page)
+        self.assertIn('data-label="Manager">Boss</td>', page)
+        notice = page.index("1 device ID has punches but no one in the Directory.")
+        self.assertLess(notice, page.index('id="team-count"'))
+        self.assertLess(notice, page.index("<table"))
+        self.assertIn('<a href="/people/issues">Review ID issues</a>', page)
+        self.database.archive_punches("9999", from_ts=None, to_ts=None, actor_id=self.hr["id"])
+        self.assertNotIn("no one in the Directory", self.client.get("/team").text)
+
+
+class DeviceHealthWebTest(unittest.TestCase):
+    """U5 (KTD8): an unreachable device in the health badge and on the Devices nav item."""
+
+    NOW = datetime(2026, 10, 26, 18, 0)
+
+    def setUp(self) -> None:
+        import json
+        import tempfile
+
+        self.app, self.database = _make_app()
+        self.client = self.app.test_client()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        # A healthy collector and backups off, so only the devices can set the tone.
+        collector = os.path.join(tmp.name, "collector.json")
+        backup = os.path.join(tmp.name, "backup.json")
+        with open(collector, "w", encoding="utf-8") as handle:
+            json.dump({"last_poll": (self.NOW - timedelta(minutes=1)).isoformat(sep=" "),
+                       "spool_depth": 0, "dead_count": 0}, handle)
+        with open(backup, "w", encoding="utf-8") as handle:
+            json.dump({"r2_configured": False}, handle)
+        env = {"ESSL_COLLECTOR_STATUS_PATH": collector, "ESSL_BACKUP_STATUS_PATH": backup}
+        for patcher in (*_fixed_now(self.NOW), patch.dict(os.environ, env)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        from essl_hub import mail as mail_module
+
+        captured = {}
+        original = mail_module.send_login_code
+        mail_module.send_login_code = lambda e, c: captured.update(code=c)
+        self.addCleanup(lambda: setattr(mail_module, "send_login_code", original))
+        self.database.upsert_employee(device_user_id="1", name="Ada Admin", email="ada@example.com")
+        self.database.set_employee_role(self.database.employee_by_email("ada@example.com")["id"], "admin")
+        self.client.post("/signin", data={"email": "ada@example.com"})
+        self.client.post("/signin/verify", data={"code": captured["code"]})
+        for device in self.database.devices_by_id.values():
+            device["status"] = "connected"
+
+    def _fail(self, device_id: str, last_success=datetime(2026, 10, 25, 12, 30)) -> None:
+        device = self.database.device_by_id(device_id)
+        device["status"] = "error"
+        device["last_success"] = last_success
+
+    @staticmethod
+    def _devices_entry(html: str) -> str:
+        start = html.index('<nav aria-label="Main">')
+        nav = html[start : html.index("</nav>", start)]
+        return re.search(r'<a class="nav-item" href="/devices".*?</a>', nav, re.S).group(0)
+
+    def test_all_connected_is_healthy_with_no_devices_badge(self) -> None:
+        page = self.client.get("/week").text
+        self.assertIn("<span>All systems healthy</span>", page)
+        self.assertNotIn("nav-count", self._devices_entry(page))
+
+    def test_one_device_in_error_names_it_and_badges_devices(self) -> None:
+        self._fail("uppal-x990")
+        page = self.client.get("/week").text
+        self.assertNotIn("All systems healthy", page)
+        self.assertIn("<span>Uppal X990 unreachable since 25 Oct</span>", page)
+        entry = self._devices_entry(page)
+        self.assertIn('aria-label="Devices, 1 device unreachable"', entry)
+        self.assertIn('<span class="nav-count" title="1 device unreachable" aria-hidden="true">1</span>', entry)
+        health = self.client.get("/health").text
+        self.assertIn('<h2 id="signal-devices">Devices</h2>', health)
+
+    def test_two_devices_are_one_signal_and_a_retired_one_is_ignored(self) -> None:
+        self._fail("uppal-x990")
+        self._fail(_C3)
+        page = self.client.get("/week").text
+        self.assertIn("<span>2 devices unreachable</span>", page)
+        self.assertIn('aria-label="Devices, 2 devices unreachable"', self._devices_entry(page))
+        self.database.set_device_retired(_C3, True)
+        page = self.client.get("/week").text
+        self.assertIn("<span>Uppal X990 unreachable since 25 Oct</span>", page)
+        self.assertIn('aria-label="Devices, 1 device unreachable"', self._devices_entry(page))
+
+    def test_backup_table_cells_carry_data_labels(self) -> None:
+        # U7: on a phone the stacked rows label every value.
+        import json
+
+        with open(os.environ["ESSL_BACKUP_STATUS_PATH"], "w", encoding="utf-8") as handle:
+            json.dump({"r2_configured": False, "entries": [
+                {"status": "ok", "started": "2026-10-26 17:00:00", "finished": "2026-10-26 17:00:05",
+                 "key": "exports/run-1.db.gz", "size": 2048},
+            ]}, handle)
+        page = self.client.get("/health").text
+        row = re.search(r"<tr>\s*<td[^>]*>2026-10-26 17:00:00.*?</tr>", page, re.S).group(0)
+        cells = re.findall(r"<td([^>]*)>", row)
+        self.assertEqual(len(cells), 5)
+        self.assertEqual(
+            [re.search(r'data-label="([^"]+)"', c).group(1) for c in cells],
+            ["Started (IST)", "Finished (IST)", "Result", "Size", "Detail"],
+        )
+
+    def test_id_issue_notice_is_at_the_top_of_devices(self) -> None:
+        from essl_hub.routes.people import forget_issue_count
+
+        # The admin's own swipe keeps "never punched" out of the count.
+        self.database.insert_punches([_punch_row("ghost", datetime(2026, 10, 26, 10), "entry", uid="9999"),
+                                      _punch_row("ada", datetime(2026, 10, 26, 9), "entry", uid="1")])
+        forget_issue_count()  # the badge count is cached across requests
+        page = self.client.get("/devices").text
+        notice = page.index("1 device ID issue to check.")
+        self.assertLess(notice, page.index('class="device-list"'))
+        self.database.archive_punches("9999", from_ts=None, to_ts=None)
+        forget_issue_count()
+        self.assertNotIn("device ID issue", self.client.get("/devices").text)
 
 
 class BrandIconsTest(unittest.TestCase):
@@ -5366,6 +6147,17 @@ class FixReviewTest(unittest.TestCase):
 
     # --- Approving ----------------------------------------------------------
 
+    def test_review_detail_has_fix_requests_current_and_report_form_today(self) -> None:
+        request_id = self._file()
+        self._sign_in(self.hari)
+        detail = self.client.get(f"/fixes/review/{request_id}")
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(_current_nav(detail.text), ["Fix requests"])
+        self._sign_in(self.asha)
+        report = self.client.get(f"/day/{self.DAY.isoformat()}/report")
+        self.assertEqual(report.status_code, 200)
+        self.assertEqual(_current_nav(report.text), ["Today"])
+
     def test_approving_a_missed_in_corrects_hours_audits_and_emails(self) -> None:
         request_id = self._file()
         self._sign_in(self.hari)
@@ -5676,3 +6468,129 @@ class FixReviewTest(unittest.TestCase):
         self.assertTrue(response.headers["Location"].endswith("/fixes/review"))
         self.assertEqual(self.database.fix_request(request_id)["status"], "approved")
         self.assertIn("Saved. 1 line approved, 0 rejected.", self._flash())
+
+
+class CopyAndPhoneLayoutTest(unittest.TestCase):
+    """U6 (chips and copy) and U7 (phone layouts). Today is Wednesday
+    2026-10-28, mid-morning; Asha reports to Meera."""
+
+    NOW = datetime(2026, 10, 28, 12, 0)
+
+    def setUp(self) -> None:
+        self.app, self.database = _make_app()
+        self.client = self.app.test_client()
+        from essl_hub import mail as mail_module
+
+        self.captured = {}
+        original = mail_module.send_login_code
+        mail_module.send_login_code = lambda e, c: self.captured.update(code=c)
+        self.addCleanup(lambda: setattr(mail_module, "send_login_code", original))
+        for patcher in _fixed_now(self.NOW):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.asha = self._person("118", "Asha Rao")
+        self.boss = self._person("200", "Meera Boss", "manager")
+        self.hari = self._person("300", "Hari HR", "hr")
+        self.database.set_employee_manager(self.asha["id"], self.boss["id"])
+
+    def _person(self, uid: str, name: str, role: str = "employee") -> dict:
+        email = f"{name.split()[0].lower()}@example.com"
+        self.database.upsert_employee(device_user_id=uid, name=name, email=email)
+        person = self.database.employee_by_email(email)
+        self.database.set_employee_role(person["id"], role)
+        return person
+
+    def _sign_in(self, person: dict) -> None:
+        self.client.post("/signout")
+        self.client.post("/signin", data={"email": person["email"]})
+        self.client.post("/signin/verify", data={"code": self.captured["code"]})
+
+    def _flag(self, day: datetime) -> None:
+        """A day with an entry that has no exit after it: needs review."""
+        tag = day.date().isoformat()
+        self.database.insert_punches([
+            _punch_row(f"{tag}-1", day + timedelta(hours=9), "entry"),
+            _punch_row(f"{tag}-2", day + timedelta(hours=14, minutes=33), "entry"),
+            _punch_row(f"{tag}-3", day + timedelta(hours=18), "exit"),
+        ])
+
+    @staticmethod
+    def _notice(page: str) -> str:
+        return re.search(r'<div class="notice review-notice">.*?</div>', page, re.S).group(0)
+
+    # --- U6 -----------------------------------------------------------------
+
+    def test_needs_review_chip_is_a_warn_chip_not_the_review_flag(self) -> None:
+        self._flag(datetime(2026, 10, 28))
+        self._sign_in(self.hari)
+        for path in ("/people", "/team"):
+            with self.subTest(path=path):
+                page = self.client.get(path).text
+                self.assertIn('<span class="chip chip-warn" title="No exit after 09:00">Needs review', page)
+                self.assertNotIn("review-flag", page)
+
+    def test_target_reached_line_says_they_to_others_and_you_to_the_person(self) -> None:
+        self.database.insert_punches([_punch_row("live-in", datetime(2026, 10, 28, 9), "entry")])
+        self._sign_in(self.asha)
+        own = self.client.get("/day").text
+        self.assertIn("</strong> if you stay in.", own)
+        self._sign_in(self.hari)
+        other = self.client.get(f"/day?employee={self.asha['id']}").text
+        self.assertIn("</strong> if they stay in.", other)
+        self.assertNotIn("if you stay in", other)
+
+    def test_own_recent_flagged_day_points_to_report_a_problem(self) -> None:
+        self._flag(datetime(2026, 10, 26))
+        self._sign_in(self.asha)
+        page = self.client.get("/day?date=2026-10-26").text
+        notice = self._notice(page)
+        self.assertIn('Use <a href="/day/2026-10-26/report">Report a problem</a> to tell HR what happened.', notice)
+        self.assertNotIn("Ask HR", page)
+        self.assertNotIn("too old", page)
+
+    def test_own_ten_day_old_flagged_day_says_too_old_to_report(self) -> None:
+        self._flag(datetime(2026, 10, 18))
+        self._sign_in(self.asha)
+        page = self.client.get("/day?date=2026-10-18").text
+        self.assertIn("This day is too old to report here — ask HR.", self._notice(page))
+        self.assertNotIn("/day/2026-10-18/report", page)
+
+    def test_manager_view_of_a_flagged_day_keeps_the_hr_line(self) -> None:
+        self._flag(datetime(2026, 10, 26))
+        self._sign_in(self.boss)
+        page = self.client.get(f"/day?employee={self.asha['id']}&date=2026-10-26").text
+        notice = self._notice(page)
+        self.assertIn("Ask HR to record an explanation.", notice)
+        self.assertNotIn("Report a problem", notice)
+
+    # --- U7 -----------------------------------------------------------------
+
+    def test_week_marks_future_days_only(self) -> None:
+        self._sign_in(self.asha)
+        page = self.client.get("/week").text
+        rows = re.findall(r"<tr(?: class=\"([^\"]*)\")?>\s*<td data-label=\"Day\" class=\"week-day\">(.*?)</td>", page, re.S)
+        self.assertEqual(len(rows), 5)
+        classes = {re.search(r"\w{3} \d\d \w{3}", cell).group(0): cls for cls, cell in rows}
+        self.assertEqual(classes, {
+            "Mon 26 Oct": "", "Tue 27 Oct": "", "Wed 28 Oct": "is-today",
+            "Thu 29 Oct": "is-future", "Fri 30 Oct": "is-future",
+        })
+        self.assertIn('Thu 29 Oct<span class="week-future-note"> · not yet</span>', page)
+        self.assertNotIn('href="/day?date=2026-10-29"', page)
+
+    def test_day_strip_chips_carry_full_status_label_and_a_glyph(self) -> None:
+        self.database.insert_punches([_punch_row("strip-1", datetime(2026, 10, 27, 9), "entry")])
+        self._sign_in(self.asha)
+        page = self.client.get("/day").text
+        chips = re.findall(r'<a class="day-chip.*?</a>', page, re.S)
+        self.assertEqual(len(chips), 7)
+        for chip in chips:
+            self.assertRegex(chip, r'aria-label="\w+day \d\d \w+, (Punched|No punches|Today, (punched|no punches))"')
+            self.assertRegex(chip, r'<span class="day-chip-dot" aria-hidden="true"><svg class="icon day-chip-glyph"')
+            self.assertIn('<span class="day-chip-word">', chip)
+        tuesday = next(c for c in chips if "Tuesday 27 October" in c)
+        self.assertIn('aria-label="Tuesday 27 October, Punched"', tuesday)
+        self.assertIn('href="#i-check"', tuesday)
+        today = chips[-1]
+        self.assertIn('aria-label="Wednesday 28 October, Today, no punches"', today)
+        self.assertIn('href="#i-minus"', today)
