@@ -122,7 +122,7 @@ No Python is needed on the host: the installer and the device test run inside th
 3. [Cloudflare setup](#cloudflare-setup)
 4. [Install on the Linux host](#install-on-the-linux-host)
 5. [First administrator](#first-administrator)
-6. [Fixing ID issues](#fixing-id-issues)
+6. [Fixing ID issues](#fixing-id-issues) (including archiving old or test card punches)
    - [Archiving people](#archiving-people)
    - [Breaks and duplicate swipes](#breaks-and-duplicate-swipes)
 7. [Fix the Uppal address](#fix-the-uppal-address)
@@ -337,6 +337,31 @@ Hours count only when the ID on the door device matches a person's main or extra
 Nothing is stored about an issue: the list is rebuilt from the Directory and the punches on every load. Archived people's IDs stay mapped, so their old punches never show as unknown. Fix the Directory (here, on the person form, or by re-importing) and the row disappears; that person's past punches count immediately, no re-collection needed. Linking an ID shows how many past punches it brought in.
 
 **Device IDs.** Each person has one main device ID and any number of extra IDs (People → *name* → Other device IDs, or edit the main ID inline on the Directory row). Punches under any of them count. An ID belongs to one person only. Typed IDs are trimmed and upper-cased, and an all-zero ID (`0`, `NP0000`) is refused because devices use 0 for "no user".
+
+### Archiving punches of old or test cards
+
+Temporary, visitor and test cards leave **Not in Directory** issues whose punches count for nobody. An admin can hide them instead of linking them:
+
+1. **Archive punches** on the issue card (admins only; HR does not see it).
+2. Optionally pick a **from** and **to** date and a reason.
+3. The preview shows exactly how many punches will be hidden and the resolved range, then **Confirm**.
+
+**Rules:**
+- No to date means "up to now".
+- An explicit to date includes that whole work day.
+- Swipes made after you archive always stay visible, so a card handed to a new person is never hidden.
+- Only **Not in Directory** and **Shared card** issues can be archived. An ID that belongs to someone is refused; use a fix request instead.
+
+Archiving never edits or deletes a punch. It stores a rule, and every read hides the punches it covers: hours, Team, People, exports, `/api/v1/hours`, `/api/v1/checkins`, Frappe pending sync, alerts and baselines, the history pager, ID issues and the unknown-ID notices. The collector still sees every row, so the devices' resent history is never inserted again. The device card's *Punches stored* still counts them.
+
+**People → ID issues → Archived punches** lists every archive: who, when, range, reason and how many punches it hides now. HR can see it; admins can **Restore**, which brings the punches back everywhere at once.
+
+**Frappe and checkins after restore:**
+- Punches already sent to Frappe stay there.
+- Restored punches with no sync record are pushed on the next sync.
+- Clients pulling `/api/v1/checkins` that already paged past a restored time will not see it again.
+
+If you later link an archived ID to a person, the link and person forms warn that its archived punches stay hidden until restored.
 
 ### Archiving people
 
