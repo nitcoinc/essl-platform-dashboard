@@ -33,6 +33,7 @@ from .db_alerts import (
     AlertsMixin,
     mail_retry_delay,
 )
+from .db_archives import ARCHIVE_REASON_MAX_CHARS, ArchivesMixin, archive_range
 from .db_fixes import (
     DIRECTIONS,
     FIX_ADD_KINDS,
@@ -51,8 +52,9 @@ from .hours import apply_corrections
 # Layout: this module is the core (connection and transaction machinery,
 # type conversion, schema and MIGRATIONS, errors, devices, punches and their
 # correction overlay, employees, sign-in). The missed-punch alert tables live
-# in db_alerts (AlertsMixin) and fix requests in db_fixes (FixesMixin); both
-# are mixed into Database below. They never import this module at import time
+# in db_alerts (AlertsMixin), fix requests in db_fixes (FixesMixin) and punch
+# archive rules in db_archives (ArchivesMixin); all are mixed into Database
+# below. They never import this module at import time
 # (only inside functions), so the import graph stays acyclic. Their constants
 # are re-exported here, so ``from .db import ...`` keeps working.
 __all__ = [
@@ -72,16 +74,19 @@ __all__ = [
     "DIRECTIONS", "FIX_ADD_KINDS", "FIX_CLOSED_STATUSES", "FIX_DECIDED_STATUSES",
     "FIX_EVENT_KINDS", "FIX_LINE_KINDS", "FIX_MAX_LINES", "FIX_NOTE_MAX_CHARS", "FIX_SOURCES",
     "OPPOSITE_DIRECTION", "FixesMixin",
+    # Re-exported from db_archives.
+    "ARCHIVE_REASON_MAX_CHARS", "ArchivesMixin", "archive_range",
 ]
 
 _TZ = ZoneInfo(TIMEZONE_NAME)
 _logger = logging.getLogger(__name__)
 
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # libsql exposes no declared column types (U8), so read-side conversion is by
-# column name. Every TIMESTAMP column in the schema is listed here.
+# column name. Every TIMESTAMP column in the schema is listed here (a test
+# checks SCHEMA_STATEMENTS and MIGRATIONS against it).
 TIMESTAMP_COLUMNS = frozenset(
     {
         "last_attempt",
@@ -109,6 +114,10 @@ TIMESTAMP_COLUMNS = frozenset(
         "decided_at",
         "event_time",
         "hr_event_time",
+        "retired_at",
+        "from_ts",
+        "to_ts",
+        "restored_at",
     }
 )
 JSON_COLUMNS = frozenset(
@@ -275,6 +284,18 @@ _MAIN_ID_SQL = (
     "COALESCE((SELECT e.device_user_id FROM employee_device_ids x "
     "JOIN employees e ON e.id = x.employee_id WHERE x.device_user_id = p.device_user_id), "
     "p.device_user_id)"
+)
+
+# A punch no active archive rule covers (v9, KTD1-KTD3): rules hide
+# from_ts <= event_timestamp < to_ts, a NULL from_ts meaning "from the start".
+# Needs the punch aliased ``p``. Every read that feeds hours, views, exports,
+# the API, Frappe, alerts and ID issues carries it; the collector's dedupe,
+# direction repair, device counts and backups read punches raw (KTD2).
+_ACTIVE_PUNCH_SQL = (
+    "NOT EXISTS (SELECT 1 FROM punch_archives a "
+    "WHERE a.device_user_id = p.device_user_id AND a.restored_at IS NULL "
+    "AND (a.from_ts IS NULL OR p.event_timestamp >= a.from_ts) "
+    "AND p.event_timestamp < a.to_ts)"
 )
 
 
@@ -714,6 +735,26 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         "CREATE INDEX IF NOT EXISTS idx_fix_request_events_request "
         "ON fix_request_events(request_id, created_at)",
     ),
+    # v9: archive rules for ID-issue punches (KTD1). A rule hides one device
+    # user ID's punches in [from_ts, to_ts) at read time (_ACTIVE_PUNCH_SQL);
+    # the punch rows themselves are never edited. Restore stamps restored_at
+    # and keeps the row as the audit record.
+    9: (
+        """
+        CREATE TABLE IF NOT EXISTS punch_archives (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_user_id TEXT NOT NULL,
+            from_ts TIMESTAMP,
+            to_ts TIMESTAMP NOT NULL,
+            reason TEXT,
+            created_by INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            created_at TIMESTAMP NOT NULL,
+            restored_by INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            restored_at TIMESTAMP
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_punch_archives_user ON punch_archives(device_user_id)",
+    ),
 }
 
 # The C3 library's "unknown" in/out value: a realtime exit (byte 1) arrives as
@@ -770,13 +811,13 @@ def _schema_version(connection: Any) -> int:
     return version
 
 
-class Database(AlertsMixin, FixesMixin):
+class Database(AlertsMixin, FixesMixin, ArchivesMixin):
     """One libsql connection per process, shared under an RLock (KTD1).
 
     Opens `path` as a plain local file in WAL mode, shared by the web app and
     the collector (KTD6); `must_exist` refuses to create it (DatabaseMissing,
-    KTD5). Alert and fix-request methods come from the mixins (db_alerts,
-    db_fixes).
+    KTD5). Alert, fix-request and punch-archive methods come from the mixins
+    (db_alerts, db_fixes, db_archives).
     """
 
     def __init__(self, path: str | None = None, *, must_exist: bool = False):
@@ -1370,8 +1411,9 @@ class Database(AlertsMixin, FixesMixin):
             return None
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT MIN(event_timestamp) AS first FROM punches "
-                "WHERE device_user_id IN (SELECT value FROM json_each(?))",
+                "SELECT MIN(p.event_timestamp) AS first FROM punches p "
+                "WHERE p.device_user_id IN (SELECT value FROM json_each(?)) "
+                f"AND {_ACTIVE_PUNCH_SQL}",
                 (json.dumps(ids),),
             ).fetchone()
         value = row["first"] if row else None
@@ -1405,12 +1447,13 @@ class Database(AlertsMixin, FixesMixin):
             return []
         with self.connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT device_user_id, fingerprint, event_timestamp, trusted_direction,
                     raw_direction_byte, raw_state, raw_json, site, device_id
-                FROM punches
+                FROM punches p
                 WHERE device_user_id IN (SELECT value FROM json_each(?))
                   AND event_timestamp >= ? AND event_timestamp < ?
+                  AND {_ACTIVE_PUNCH_SQL}
                 ORDER BY device_user_id, event_timestamp
                 """,
                 (json.dumps(ids), start, end),
@@ -1570,11 +1613,12 @@ class Database(AlertsMixin, FixesMixin):
         """Archived people, most recently archived first, with their last punch."""
         with self.connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT e.*, (
                     SELECT MAX(p.event_timestamp) FROM punches p
-                    WHERE p.device_user_id = e.device_user_id OR p.device_user_id IN (
-                        SELECT x.device_user_id FROM employee_device_ids x WHERE x.employee_id = e.id)
+                    WHERE (p.device_user_id = e.device_user_id OR p.device_user_id IN (
+                        SELECT x.device_user_id FROM employee_device_ids x WHERE x.employee_id = e.id))
+                      AND {_ACTIVE_PUNCH_SQL}
                 ) AS last_punch
                 FROM employees e WHERE e.archived_at IS NOT NULL
                 ORDER BY e.archived_at DESC, e.name
@@ -1591,13 +1635,14 @@ class Database(AlertsMixin, FixesMixin):
         hours API keep their past hours (archiving never drops data)."""
         with self.connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT e.* FROM employees e
                 WHERE e.archived_at IS NOT NULL AND EXISTS (
                     SELECT 1 FROM punches p
                     WHERE p.event_timestamp >= ? AND p.event_timestamp < ?
                       AND (p.device_user_id = e.device_user_id OR p.device_user_id IN (
                           SELECT x.device_user_id FROM employee_device_ids x WHERE x.employee_id = e.id))
+                      AND {_ACTIVE_PUNCH_SQL}
                 )
                 ORDER BY e.name
                 """,
@@ -1760,7 +1805,7 @@ class Database(AlertsMixin, FixesMixin):
     def unmapped_device_user_ids(self) -> list[dict[str, object]]:
         with self.connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT p.device_user_id, COUNT(*) AS punch_count
                 FROM punches p
                 LEFT JOIN employees e ON e.device_user_id = p.device_user_id
@@ -1769,6 +1814,7 @@ class Database(AlertsMixin, FixesMixin):
                         SELECT 1 FROM employee_device_ids x WHERE x.device_user_id = p.device_user_id
                     )
                     AND p.device_user_id <> ''
+                    AND {_ACTIVE_PUNCH_SQL}
                 GROUP BY p.device_user_id
                 ORDER BY p.device_user_id
                 """,
@@ -1776,10 +1822,12 @@ class Database(AlertsMixin, FixesMixin):
         return list(rows)
 
     def device_id_summary(self) -> list[dict[str, object]]:
-        """One row per device user ID seen in punches, for the ID issues page."""
+        """One row per device user ID seen in unarchived punches, for the ID
+        issues page. The device name comes from the latest punch, archived or
+        not (only the outer rows are filtered, KTD2)."""
         with self.connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT p.device_user_id, COUNT(*) AS punch_count,
                     MIN(p.event_timestamp) AS first_seen, MAX(p.event_timestamp) AS last_seen,
                     (SELECT l.employee_name FROM punches l
@@ -1788,6 +1836,7 @@ class Database(AlertsMixin, FixesMixin):
                     GROUP_CONCAT(DISTINCT p.site) AS sites
                 FROM punches p
                 WHERE p.device_user_id IS NOT NULL AND p.device_user_id <> ''
+                  AND {_ACTIVE_PUNCH_SQL}
                 GROUP BY p.device_user_id
                 """,
             ).fetchall()
@@ -1950,7 +1999,7 @@ class Database(AlertsMixin, FixesMixin):
             "FROM punches p LEFT JOIN frappe_sync_log f ON f.punch_id = p.id "
             "WHERE f.punch_id IS NULL "
             "AND COALESCE(p.raw_state, '') NOT LIKE '%door denied:%' "
-            f"AND NOT {_FRAPPE_HELD_SQL}"
+            f"AND NOT {_FRAPPE_HELD_SQL} AND {_ACTIVE_PUNCH_SQL}"
         )
         params: list[object] = [C3_UNDECODED_BYTE, _now() - FRAPPE_GUESS_HOLD]
         if since is not None:
@@ -1980,7 +2029,7 @@ class Database(AlertsMixin, FixesMixin):
             row = connection.execute(
                 "SELECT MIN(p.event_timestamp) AS event_timestamp FROM punches p "
                 "LEFT JOIN frappe_sync_log f ON f.punch_id = p.id "
-                f"WHERE f.punch_id IS NULL AND {_FRAPPE_HELD_SQL}",
+                f"WHERE f.punch_id IS NULL AND {_FRAPPE_HELD_SQL} AND {_ACTIVE_PUNCH_SQL}",
                 (C3_UNDECODED_BYTE, _now() - FRAPPE_GUESS_HOLD),
             ).fetchone()
         # Aliased to the column name so it is read back as a datetime.
@@ -2019,7 +2068,8 @@ class Database(AlertsMixin, FixesMixin):
             f"SELECT p.id, p.device_id, {_MAIN_ID_SQL} AS device_user_id, "
             "p.event_timestamp, p.trusted_direction "
             "FROM punches p WHERE p.event_timestamp IS NOT NULL "
-            "AND p.device_user_id IS NOT NULL AND p.device_user_id != ''"
+            "AND p.device_user_id IS NOT NULL AND p.device_user_id != '' "
+            f"AND {_ACTIVE_PUNCH_SQL}"
         )
         params: list[object] = []
         if since is not None:
@@ -2065,12 +2115,13 @@ def _overlaid_punches(
     corrections are keyed by employee, so an owner's added punches come back
     even on a day with no device punch."""
     rows = connection.execute(
-        """
+        f"""
         SELECT device_user_id, fingerprint, event_timestamp, trusted_direction,
             raw_direction_byte, raw_state, site, device_id
-        FROM punches
+        FROM punches p
         WHERE device_user_id IN (SELECT value FROM json_each(?))
           AND event_timestamp >= ? AND event_timestamp < ?
+          AND {_ACTIVE_PUNCH_SQL}
         ORDER BY event_timestamp ASC
         """,
         (json.dumps(ids), start, end),

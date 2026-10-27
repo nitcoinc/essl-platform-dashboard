@@ -149,5 +149,19 @@ class ArchivedPeopleTest(unittest.TestCase):
         self.assertEqual(id_twins(issues, [gone]), {})
 
 
+class ArchivableTest(unittest.TestCase):
+    def test_only_unknown_and_shared_ids_can_be_archived(self) -> None:
+        from essl_hub.id_issues import archivable
+
+        summary = [_seen("NP0231", "New Joiner"), _seen("NP0002", "Mohan Das"), _seen("C3-2", "Temporary"), _seen("0", "")]
+        issues = find_issues(summary, [_emp(2, "NP0002", "Ravi"), _emp(4, "NP0500", "Ghost")])
+        self.assertEqual(archivable(issues, "NP0231").kind, "unknown")
+        self.assertEqual(archivable(issues, "C3-2").kind, "shared")
+        self.assertEqual(archivable(issues, "0").kind, "unknown")
+        for uid in ("NP0002", "NP0500", "NP9999", ""):
+            with self.subTest(uid=uid):
+                self.assertIsNone(archivable(issues, uid))
+
+
 if __name__ == "__main__":
     unittest.main()

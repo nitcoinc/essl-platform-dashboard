@@ -368,7 +368,10 @@ input[type="file"]::file-selector-button {
 .field, .auth-field, .device-edit-field { display: flex; flex-direction: column; gap: 6px; }
 .field label, .auth-field label, .device-edit-field label { font-size: var(--text-13); font-weight: 500; color: var(--text); }
 .field-hint { font-size: var(--text-12); color: var(--text-secondary); }
-.field input, .auth-field input, .device-edit-field input { width: 100%; }
+/* Text-like inputs only: a checkbox or radio inside a field keeps its 16px box. */
+.field input:not([type="checkbox"]):not([type="radio"]),
+.auth-field input:not([type="checkbox"]):not([type="radio"]),
+.device-edit-field input:not([type="checkbox"]):not([type="radio"]) { width: 100%; }
 
 .search-field { position: relative; display: flex; align-items: center; }
 .search-field svg { position: absolute; left: 10px; color: var(--text-tertiary); pointer-events: none; }
@@ -863,6 +866,12 @@ input[type="file"]::file-selector-button {
 .issue-guide h2 { margin: 0 0 var(--s2); font-size: var(--text-14); font-weight: 600; }
 .issue-guide ul { margin: 0; padding: 0; list-style: none; display: grid; gap: var(--s2); font-size: var(--text-13); color: var(--text-secondary); }
 .issue-guide .footnote { margin: var(--s3) 0 0; }
+/* Punch archive (v9): the range form on the confirm step and the list page. */
+.archive-range { display: flex; flex-wrap: wrap; gap: var(--s3); align-items: flex-end; margin-bottom: var(--s3); }
+.archive-range .field { flex: 0 1 180px; }
+.issue-confirm .field { margin-bottom: var(--s3); max-width: 420px; }
+.archive-restored { color: var(--text-secondary); }
+.archive-restored .table td { color: var(--text-secondary); }
 .issue-link-form { display: flex; gap: var(--s2); width: 100%; max-width: 420px; }
 .issue-link-form input { min-width: 0; flex: 1; }
 @media (max-width: 767px) {

@@ -80,6 +80,8 @@ class FakeDatabase:
         self.fix_lines: dict[int, dict] = {}
         self.corrections: list[dict] = []
         self.fix_events: list[dict] = []
+        # Punch archive rules (v9).
+        self.archive_rules: list[dict] = []
         # `offline` makes every write raise OfflineError, the way an
         # unavailable database does.
         self.offline = False
@@ -130,7 +132,7 @@ class FakeDatabase:
         rows: dict[str, dict] = {}
         for p in self.punches:
             uid = p.get("device_user_id")
-            if not uid:
+            if not uid or self._archived(p):
                 continue
             row = rows.setdefault(uid, {"device_user_id": uid, "punch_count": 0, "first_seen": None, "last_seen": None, "device_name": "", "sites": set()})
             row["punch_count"] += 1
@@ -295,6 +297,7 @@ class FakeDatabase:
             }
             for p in self.punches
             if p.get("device_user_id") in wanted and start <= p["event_timestamp"] < end
+            and not self._archived(p)
         ]
         rows.sort(key=lambda p: p["event_timestamp"])
         return apply_corrections(rows, self.corrections_for(main_ids, start, end), main_ids)
@@ -305,7 +308,8 @@ class FakeDatabase:
 
     def first_punch_at(self, device_user_ids):
         wanted = set(device_user_ids)
-        stamps = [p["event_timestamp"] for p in self.punches if p.get("device_user_id") in wanted]
+        stamps = [p["event_timestamp"] for p in self.punches
+                  if p.get("device_user_id") in wanted and not self._archived(p)]
         return min(stamps) if stamps else None
 
     def punches_for_device_users_range(self, device_user_ids, start: datetime, end: datetime):
@@ -317,9 +321,79 @@ class FakeDatabase:
         counts: dict[str, int] = {}
         for p in self.punches:
             uid = p.get("device_user_id")
-            if uid and uid not in mapped:
+            if uid and uid not in mapped and not self._archived(p):
                 counts[uid] = counts.get(uid, 0) + 1
         return [{"device_user_id": uid, "punch_count": n} for uid, n in sorted(counts.items())]
+
+    # punch archives (v9) ---------------------------------------------------
+
+    @staticmethod
+    def _covers(rule: dict, p: dict) -> bool:
+        return (p.get("device_user_id") == rule["device_user_id"]
+                and (rule["from_ts"] is None or p["event_timestamp"] >= rule["from_ts"])
+                and p["event_timestamp"] < rule["to_ts"])
+
+    def _archived(self, p: dict) -> bool:
+        """Database._ACTIVE_PUNCH_SQL, negated: an active rule covers it."""
+        return any(r["restored_at"] is None and self._covers(r, p) for r in self.archive_rules)
+
+    def _archive_range(self, from_ts, to_ts):
+        from essl_hub.db import RuleViolation
+
+        now = _ist_now().replace(microsecond=0)
+        to_ts = now if to_ts is None else min(to_ts.replace(microsecond=0), now)
+        if from_ts is not None and from_ts >= to_ts:
+            raise RuleViolation("The from date must be before the to date.")
+        return from_ts, to_ts
+
+    def archive_preview(self, device_user_id, from_ts, to_ts) -> dict:
+        from_ts, to_ts = self._archive_range(from_ts, to_ts)
+        rule = {"device_user_id": device_user_id, "from_ts": from_ts, "to_ts": to_ts}
+        stamps = sorted(p["event_timestamp"] for p in self.punches
+                        if self._covers(rule, p) and not self._archived(p))
+        return {"device_user_id": device_user_id, "from_ts": from_ts, "to_ts": to_ts, "count": len(stamps),
+                "first": stamps[0] if stamps else None, "last": stamps[-1] if stamps else None}
+
+    def archive_punches(self, device_user_id, *, from_ts, to_ts, reason=None, actor_id=None) -> int:
+        self._check_online()
+        from_ts, to_ts = self._archive_range(from_ts, to_ts)
+        rule = {"id": len(self.archive_rules) + 1, "device_user_id": device_user_id, "from_ts": from_ts,
+                "to_ts": to_ts, "reason": (reason or "").strip()[:200] or None, "created_by": actor_id,
+                "created_at": _ist_now(), "restored_by": None, "restored_at": None}
+        self.archive_rules.append(rule)
+        return rule["id"]
+
+    def restore_punch_archive(self, archive_id, *, actor_id=None) -> bool:
+        self._check_online()
+        rule = next((r for r in self.archive_rules if r["id"] == archive_id), None)
+        if rule is None or rule["restored_at"] is not None:
+            return False
+        rule.update(restored_at=_ist_now(), restored_by=actor_id)
+        return True
+
+    def _archive_view(self, rule: dict) -> dict:
+        active = rule["restored_at"] is None
+        return {**rule, "created_by_name": self._name(rule["created_by"]),
+                "restored_by_name": self._name(rule["restored_by"]),
+                "hidden_count": sum(self._covers(rule, p) for p in self.punches) if active else None}
+
+    def punch_archive(self, archive_id):
+        rule = next((r for r in self.archive_rules if r["id"] == archive_id), None)
+        return self._archive_view(rule) if rule else None
+
+    def punch_archives(self, include_restored: bool = True) -> list[dict]:
+        rules = [r for r in self.archive_rules if include_restored or r["restored_at"] is None]
+        rules.sort(key=lambda r: (r["restored_at"] is not None, r["restored_at"] or r["created_at"], r["id"]),
+                   reverse=True)
+        rules.sort(key=lambda r: r["restored_at"] is not None)
+        return [self._archive_view(r) for r in rules]
+
+    def active_archive_for(self, device_user_id):
+        rules = [r for r in self.archive_rules if r["device_user_id"] == device_user_id and r["restored_at"] is None]
+        if not rules:
+            return None
+        hidden = sum(1 for p in self.punches if p.get("device_user_id") == device_user_id and self._archived(p))
+        return {"archives": len(rules), "hidden": hidden}
 
     # employees ------------------------------------------------------------
 
@@ -944,6 +1018,25 @@ class FakeFixRequestsTest(unittest.TestCase):
         token = self.db.create_report_link(1, self.day, expires_at=_ist_now() + timedelta(days=1))
         self.assertEqual(self.db.report_link(token)["employee_id"], 1)
         self.assertEqual([p["name"] for p in self.db.active_hr_users()], ["Hari"])
+
+
+class FakeArchiveTest(unittest.TestCase):
+    """The fake's archive rules hide punches like Database._ACTIVE_PUNCH_SQL."""
+
+    def test_archive_hides_and_restore_shows_again(self) -> None:
+        db = FakeDatabase()
+        at = datetime(2026, 10, 1, 9, 0)
+        db.insert_punches([{"fingerprint": f"f{n}", "device_id": "d", "device_user_id": "9999",
+                            "event_timestamp": at + timedelta(days=n)} for n in range(3)])
+        archive_id = db.archive_punches("9999", from_ts=at + timedelta(days=1), to_ts=None)
+        self.assertEqual(db.device_id_summary()[0]["punch_count"], 1)
+        self.assertEqual(db.unmapped_device_user_ids(), [{"device_user_id": "9999", "punch_count": 1}])
+        self.assertEqual(db.active_archive_for("9999"), {"archives": 1, "hidden": 2})
+        self.assertEqual(db.punch_archives()[0]["hidden_count"], 2)
+        self.assertTrue(db.restore_punch_archive(archive_id))
+        self.assertFalse(db.restore_punch_archive(archive_id))
+        self.assertEqual(db.first_punch_at(["9999"]), at)
+        self.assertEqual(db.device_id_summary()[0]["punch_count"], 3)
 
 
 def _make_app():
@@ -4597,6 +4690,246 @@ class PeopleManagementTest(unittest.TestCase):
         response = self._assign(self.ravi, device_user_id="NP0000", manager_id="", role="employee")
         self.assertIn("Device ID can&#39;t be zero", response.text)
         self.assertEqual(self.database.employee_by_id(self.ravi["id"])["device_user_id"], "5")
+
+
+class PunchArchiveWebTest(unittest.TestCase):
+    """Punch archive U3 and the retired-device fix U1, on a real SQLite
+    database so the archive filter and timestamp types are exercised."""
+
+    def setUp(self) -> None:
+        from tempfile import TemporaryDirectory
+
+        from essl_hub import mail as mail_module
+        from essl_hub.db import Database
+
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.database = Database(str(Path(tmp.name) / "essl.db"))
+        self.app = create_app(database=self.database)
+        self.app.testing = True
+        self.client = self.app.test_client()
+        self.captured = {}
+        original = mail_module.send_login_code
+        mail_module.send_login_code = lambda e, c: self.captured.update(code=c)
+        self.addCleanup(lambda: setattr(mail_module, "send_login_code", original))
+        self.hr = self._person("1", "Hema HR", "hr")
+        self.admin = self._person("2", "Arun Admin", "admin")
+        self.sita = self._person("3", "Sita Rao")
+        today = datetime.combine(_ist_today(), datetime.min.time())
+        self.days = [today - timedelta(days=n) for n in (10, 5, 2)]
+        self._punches("9999", [day + timedelta(hours=9) for day in self.days], name="Test card")
+        # Sita's own ID, but the device calls it someone else: a "name" issue.
+        self._punches("3", [self.days[-1] + timedelta(hours=9)], name="Mohan Das")
+
+    def _person(self, device_user_id, name, role="employee") -> dict:
+        email = f"{device_user_id}@n.com"
+        self.database.upsert_employee(device_user_id=device_user_id, name=name, email=email)
+        person = self.database.employee_by_email(email)
+        if role != "employee":
+            self.database.set_employee_role(person["id"], role)
+        return self.database.employee_by_id(person["id"])
+
+    def _punches(self, uid: str, stamps, name: str = "") -> None:
+        self.database.insert_punches([
+            {"fingerprint": f"fp-{uid}-{at.isoformat()}", "device_id": DEVICES[0].id, "site": "Uppal",
+             "device_user_id": uid, "employee_name": name, "event_timestamp": at}
+            for at in stamps
+        ])
+
+    def _sign_in(self, person: dict) -> None:
+        self.client.post("/signin", data={"email": person["email"]})
+        self.client.post("/signin/verify", data={"code": self.captured["code"]})
+
+    def _csrf(self) -> str:
+        return re.search(r'name="csrf" value="([^"]+)"', self.client.get("/day").text).group(1)
+
+    def _count(self, uid: str = "9999") -> int:
+        return next((r["punch_count"] for r in self.database.device_id_summary() if r["device_user_id"] == uid), 0)
+
+    def _preview(self, query: str = "") -> str:
+        return self.client.get(f"/people/issues?archive=9999{query}").text
+
+    @staticmethod
+    def _hidden(page: str, name: str) -> str:
+        return re.search(rf'name="{name}" value="([^"]*)"', page).group(1)
+
+    def _confirm(self, page: str, **extra):
+        data = {"csrf": self._csrf(), "device_user_id": self._hidden(page, "device_user_id"),
+                "from_ts": self._hidden(page, "from_ts"), "to_ts": self._hidden(page, "to_ts"), **extra}
+        return self.client.post("/people/issues/archive", data=data, follow_redirects=True)
+
+    # --- U1 ---------------------------------------------------------------
+
+    def test_devices_page_renders_with_a_retired_device(self) -> None:
+        self._sign_in(self.admin)
+        self.database.set_device_retired(DEVICES[1].id, True)
+        response = self.client.get("/devices")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(DEVICES[1].id, response.text)
+
+    # --- archive ------------------------------------------------------------
+
+    def test_admin_previews_and_archives_every_punch_of_an_unknown_id(self) -> None:
+        self._sign_in(self.admin)
+        issues = self.client.get("/people/issues").text
+        self.assertIn('name="archive" value="9999"', issues)
+        self.assertIn('href="/people/issues/archived"', issues)
+        page = self._preview()
+        self.assertIn("Archive punches of 9999?", page)
+        self.assertIn("<strong>3 punches</strong>", page)
+        self.assertIn("from the first punch", page)
+        self.assertEqual(self._hidden(page, "from_ts"), "")
+        response = self._confirm(page, reason="Test card")
+        self.assertIn("Archived 3 punches from ID 9999.", response.text)
+        self.assertNotIn('name="archive" value="9999"', response.text)
+        self.assertEqual(self._count(), 0)
+        (rule,) = self.database.punch_archives()
+        self.assertEqual((rule["reason"], rule["created_by_name"]), ("Test card", "Arun Admin"))
+
+    def test_a_date_range_archives_only_its_days_and_the_issue_stays(self) -> None:
+        self._sign_in(self.admin)
+        day = self.days[1].date().isoformat()
+        page = self._preview(f"&from={day}&to={day}")
+        self.assertIn("<strong>1 punch</strong>", page)
+        self.assertIn(f'value="{day}"', page)
+        response = self._confirm(page)
+        self.assertIn("Archived 1 punch from ID 9999.", response.text)
+        self.assertEqual(self._count(), 2)
+        self.assertIn('name="archive" value="9999"', response.text)
+        (rule,) = self.database.punch_archives()
+        self.assertEqual(rule["from_ts"], self.days[1] + timedelta(hours=6))
+        self.assertEqual(rule["to_ts"], self.days[1] + timedelta(days=1, hours=6))
+
+    def test_hr_gets_no_archive_action_and_a_direct_post_is_403(self) -> None:
+        self._sign_in(self.hr)
+        self.assertNotIn('name="archive"', self.client.get("/people/issues").text)
+        self.assertNotIn("Archive punches of", self._preview())
+        response = self.client.post("/people/issues/archive", data={
+            "csrf": self._csrf(), "device_user_id": "9999", "to_ts": "2030-01-01 00:00:00"})
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.database.punch_archives(), [])
+
+    def test_a_mapped_id_cannot_be_archived(self) -> None:
+        self._sign_in(self.admin)
+        self.assertIn("Name differs", self.client.get("/people/issues").text)
+        self.assertIn("can be archived", self.client.get("/people/issues?archive=3").text)
+        response = self.client.post("/people/issues/archive", data={
+            "csrf": self._csrf(), "device_user_id": "3", "to_ts": _ist_now().strftime("%Y-%m-%d %H:%M:%S")})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("can be archived", response.text)
+        self.assertEqual(self.database.punch_archives(), [])
+
+    def test_missing_csrf_is_refused(self) -> None:
+        self._sign_in(self.admin)
+        page = self._preview()
+        response = self.client.post("/people/issues/archive", data={
+            "device_user_id": "9999", "to_ts": self._hidden(page, "to_ts")})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.database.punch_archives(), [])
+
+    def test_a_to_date_of_today_is_clamped_so_later_swipes_stay_visible(self) -> None:
+        self._sign_in(self.admin)
+        page = self._preview(f"&to={_ist_today().isoformat()}")
+        to_ts = datetime.fromisoformat(self._hidden(page, "to_ts"))
+        self.assertLessEqual(to_ts, _ist_now())
+        self._confirm(page)
+        self._punches("9999", [to_ts + timedelta(minutes=1)])
+        self.assertEqual(self._count(), 1)
+
+    def test_from_after_to_is_a_form_error_and_writes_nothing(self) -> None:
+        self._sign_in(self.admin)
+        page = self._preview(f"&from={self.days[2].date().isoformat()}&to={self.days[0].date().isoformat()}")
+        self.assertIn("The from date is after the to date.", page)
+        self.assertNotIn('action="/people/issues/archive"', page)
+        self.assertEqual(self.database.punch_archives(), [])
+
+    def test_an_empty_range_disables_confirm(self) -> None:
+        self._sign_in(self.admin)
+        day = (self.days[0] + timedelta(days=1)).date().isoformat()
+        page = self._preview(f"&from={day}&to={day}")
+        self.assertIn("No punches in this range.", page)
+        self.assertRegex(page, r'<button class="button button-primary" type="submit" disabled>')
+        response = self._confirm(page)
+        self.assertIn("No punches in this range.", response.text)
+        self.assertEqual(self.database.punch_archives(), [])
+
+    def test_the_previewed_end_is_stored_even_when_punches_arrive_before_confirm(self) -> None:
+        self._sign_in(self.admin)
+        page = self._preview()
+        to_ts = datetime.fromisoformat(self._hidden(page, "to_ts"))
+        self._punches("9999", [to_ts + timedelta(seconds=2)])
+        self.assertIn("Archived 3 punches from ID 9999.", self._confirm(page).text)
+        self.assertEqual(self.database.punch_archives()[0]["to_ts"], to_ts)
+        self.assertEqual(self._count(), 1)
+
+    # --- archive list and restore ----------------------------------------
+
+    def test_archive_list_empty_state(self) -> None:
+        self._sign_in(self.hr)
+        page = self.client.get("/people/issues/archived")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("No archived punches", page.text)
+
+    def test_hr_reads_the_list_and_an_admin_restores(self) -> None:
+        archive_id = self.database.archive_punches("9999", from_ts=None, to_ts=None, reason="Test card",
+                                                   actor_id=self.admin["id"])
+        self._sign_in(self.hr)
+        page = self.client.get("/people/issues/archived").text
+        self.assertIn("Test card", page)
+        self.assertIn("Arun Admin", page)
+        self.assertNotIn("Restore", page.split("<h1")[1].split("Nothing is deleted")[1])
+        self.assertNotIn("Restore the archive of", self.client.get(f"/people/issues/archived?restore={archive_id}").text)
+        self.assertEqual(self.client.post(f"/people/issues/archived/{archive_id}/restore",
+                                          data={"csrf": self._csrf()}).status_code, 403)
+        self.client.post("/signout", data={"csrf": self._csrf()})
+        self._sign_in(self.admin)
+        confirm = self.client.get(f"/people/issues/archived?restore={archive_id}").text
+        self.assertIn("Restore the archive of 9999?", confirm)
+        self.assertIn("<strong>3 punches</strong>", confirm)
+        response = self.client.post(f"/people/issues/archived/{archive_id}/restore",
+                                    data={"csrf": self._csrf()}, follow_redirects=True)
+        self.assertIn("Restored 3 punches of ID 9999.", response.text)
+        self.assertIn('class="admin-section archive-restored"', response.text)
+        self.assertEqual(self._count(), 3)
+        self.assertIn("<span class=\"num\">3</span> punches", self.client.get("/people/issues").text)
+        again = self.client.post(f"/people/issues/archived/{archive_id}/restore",
+                                 data={"csrf": self._csrf()}, follow_redirects=True)
+        self.assertEqual(again.status_code, 200)
+        self.assertIn("was already restored", again.text)
+        self.assertEqual(self.client.post("/people/issues/archived/999/restore",
+                                          data={"csrf": self._csrf()}).status_code, 404)
+
+    # --- later mapping ------------------------------------------------------
+
+    def test_linking_an_archived_id_warns_that_its_punches_stay_hidden(self) -> None:
+        self.database.archive_punches("9999", from_ts=self.days[1], to_ts=None)
+        self._sign_in(self.admin)
+        page = self.client.get(f"/people/issues?confirm=1&device_user_id=9999&person={self.sita['id']}").text
+        self.assertIn("<strong>1 punch</strong> will start counting", page)
+        self.assertIn("2 punches of this ID are archived and stay hidden.", page)
+
+    def test_adding_an_archived_id_on_the_person_form_asks_once_more(self) -> None:
+        self.database.archive_punches("9999", from_ts=None, to_ts=None)
+        self._sign_in(self.admin)
+        url = f"/people/{self.sita['id']}/device-ids"
+        first = self.client.post(url, data={"csrf": self._csrf(), "extra_device_user_id": "9999"})
+        self.assertEqual(first.status_code, 200)
+        self.assertIn("3 punches of this ID are archived and stay hidden.", first.text)
+        self.assertIn('name="archived_ok" value="9999"', first.text)
+        self.assertEqual(self.database.extra_device_ids(self.sita["id"]), [])
+        self.client.post(url, data={"csrf": self._csrf(), "extra_device_user_id": "9999", "archived_ok": "9999"})
+        self.assertEqual(self.database.extra_device_ids(self.sita["id"]), ["9999"])
+
+    def test_changing_a_main_id_to_an_archived_one_asks_once_more(self) -> None:
+        self.database.archive_punches("9999", from_ts=None, to_ts=None)
+        self._sign_in(self.admin)
+        data = {"csrf": self._csrf(), "name": "Sita Rao", "email": self.sita["email"],
+                "device_user_id": "9999", "manager_id": "", "role": "employee"}
+        first = self.client.post(f"/people/{self.sita['id']}/edit", data=data)
+        self.assertIn("3 punches of this ID are archived and stay hidden.", first.text)
+        self.assertEqual(self.database.employee_by_id(self.sita["id"])["device_user_id"], "3")
+        self.client.post(f"/people/{self.sita['id']}/edit", data={**data, "archived_ok": "9999"})
+        self.assertEqual(self.database.employee_by_id(self.sita["id"])["device_user_id"], "9999")
 
 
 class ScreensTest(unittest.TestCase):

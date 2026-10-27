@@ -2,6 +2,13 @@
 {% import "_ui.html" as ui %}
 {% block title %}{{ 'Edit ' ~ target.name if target else 'Add person' }} - eSSL Attendance Hub{% endblock %}
 {% block content %}
+{# The confirm step when a new device ID has archived punches (routes.people._archive_hold). #}
+{% macro archive_hold_notice(hold) -%}
+{% set n = hold.hidden %}
+<div class="notice notice-warn" role="alert">{{ ui.icon('circle-alert') }}<p><strong>{{ n }} {{ 'punch' if n == 1 else 'punches' }} of this ID are archived and stay hidden.</strong>
+  They will not count for this person unless the archive of {{ hold.device_user_id }} is restored on <a href="{{ url_for('people.punch_archives_view') }}">Archived punches</a>. Save again to continue.</p></div>
+<input type="hidden" name="archived_ok" value="{{ hold.device_user_id }}">
+{%- endmacro %}
 <header class="topbar">
   <div>
     <a class="back-link" href="{{ url_for('people.people_view') }}">{{ ui.icon('arrow-left') }}<span>People</span></a>
@@ -59,6 +66,7 @@
     {% endif %}
   </div>
 
+  {% if archive_hold %}{{ archive_hold_notice(archive_hold) }}{% endif %}
   <div class="form-actions">
     {{ ui.button('Save changes' if target else 'Add person', 'primary', type='submit') }}
     {{ ui.button('Cancel', 'tertiary', href=url_for('people.people_view')) }}
@@ -91,6 +99,7 @@
   <form method="post" action="{{ url_for('people.person_add_device_id', employee_id=target.id) }}" novalidate>
     <input type="hidden" name="csrf" value="{{ csrf_token }}">
     {{ ui.field('extra_device_user_id', 'Add another device ID', errors.extra_value or '', error=errors.extra_id, attrs='autocomplete="off" autocapitalize="characters"') }}
+    {% if extra_hold %}{{ archive_hold_notice(extra_hold) }}{% endif %}
     <div class="form-actions">{{ ui.button('Add device ID', 'secondary', type='submit') }}</div>
   </form>
   {% endif %}

@@ -107,6 +107,17 @@ class FrappeSyncTest(unittest.TestCase):
         self.assertEqual(status, "skipped")
         self.assertIn("No Employee found", error)
 
+    def test_archived_punches_are_not_sent_until_restored(self):
+        self.add(punch("a", "101", "2026-03-02 09:00:00", "entry"),
+                 punch("t", "9999", "2026-03-02 09:05:00", "entry"))
+        archive_id = self.database.archive_punches("9999", from_ts=None, to_ts=None)
+        self.assertEqual(self.sync().run_once().synced, 1)
+        self.assertEqual([c[3]["employee_field_value"] for c in self.transport.calls], ["101"])
+        self.database.restore_punch_archive(archive_id)
+        self.assertEqual(self.sync().run_once().synced, 1)
+        self.assertEqual([c[3]["employee_field_value"] for c in self.transport.calls], ["101", "9999"])
+        self.assertEqual(self.database.frappe_sync_counts(), {"synced": 2})
+
     def test_duplicate_counts_as_synced(self):
         self.add(punch("a", "101", "2026-03-02 09:00:00", "entry"))
         self.transport.responses = [frappe_error(417, "This employee already has a log with the same timestamp.")]

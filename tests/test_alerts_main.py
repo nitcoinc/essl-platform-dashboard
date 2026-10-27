@@ -679,20 +679,20 @@ class AlertsServiceTest(unittest.TestCase):
         self.assertEqual(service.tick.call_count, 3)
         self.assertEqual(len(sleeps), 3)
 
-    def test_waits_for_schema_v8(self) -> None:
+    def test_waits_for_schema_v9(self) -> None:
         self.person("101")
         self.database.enqueue_mail(["hr@example.com"], "queued", "text")
         with self.database.transaction() as connection:
-            connection.execute("PRAGMA user_version=7")
-            connection.execute("UPDATE settings SET value = '7' WHERE key = 'schema_version'")
+            connection.execute("PRAGMA user_version=8")
+            connection.execute("UPDATE settings SET value = '8' WHERE key = 'schema_version'")
         self.tick()
         self.tick(self.now + timedelta(minutes=1))
         self.assertEqual(self.sent, [])
         self.assertEqual(self.snapshots(), 0)
-        self.assertEqual(len(self.messages(needle="waiting for v8")), 1)
+        self.assertEqual(len(self.messages(needle="waiting for v9")), 1)
         with self.database.transaction() as connection:
-            connection.execute("PRAGMA user_version=8")
-            connection.execute("UPDATE settings SET value = '8' WHERE key = 'schema_version'")
+            connection.execute("PRAGMA user_version=9")
+            connection.execute("UPDATE settings SET value = '9' WHERE key = 'schema_version'")
         self.tick(self.now + timedelta(minutes=5))
         self.assertEqual([m["subject"] for m in self.sent], ["queued"])
         self.assertEqual(self.snapshots(), 1)

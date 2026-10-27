@@ -72,8 +72,9 @@ from .punch_alerts import (
 
 _logger = logging.getLogger(__name__)
 
-# The schema this service needs (v8: baselines, alerts, outbox, fix requests).
-REQUIRED_SCHEMA = 8
+# The schema this service needs (v8: baselines, alerts, outbox, fix requests;
+# v9: punch archives, which the shared punch reads filter on).
+REQUIRED_SCHEMA = 9
 TICK_SECONDS = 60
 LIVE_INTERVAL = timedelta(minutes=5)
 # KTD9 stale guard: the collector writes last_poll every cycle (60 s default).
@@ -177,7 +178,7 @@ class AlertsService:
         return None
 
     def _ready(self) -> bool:
-        """KTD3: wait for schema v8 (the web or collector migrates; never here)."""
+        """KTD3: wait for REQUIRED_SCHEMA (the web or collector migrates; never here)."""
         if self._schema_ready:
             return True
         try:
