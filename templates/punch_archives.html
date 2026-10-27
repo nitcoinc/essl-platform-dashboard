@@ -53,11 +53,11 @@
       <tbody>
         {% for a in active %}
         <tr>
-          <td class="num"><strong>{{ a.device_user_id }}</strong></td>
-          <td>{{ span(a) }}</td>
-          <td>{{ a.reason or '' }}</td>
-          <td>{{ when(a.created_at) }}<br><span class="muted">{{ a.created_by_name or 'Unknown' }}</span></td>
-          <td class="num">{{ a.hidden_count }}</td>
+          <td data-label="Device ID"><strong>{{ a.device_user_id }}</strong></td>
+          <td data-label="Range">{{ span(a) }}</td>
+          <td data-label="Reason">{{ a.reason or '-' }}</td>
+          <td data-label="Archived">{{ when(a.created_at) }}<br><span class="muted">{{ a.created_by_name or 'Unknown' }}</span></td>
+          <td class="num" data-label="Hidden">{{ a.hidden_count }}</td>
           {% if can_restore %}
           <td>{{ ui.button('Restore', 'secondary', href=url_for('people.punch_archives_view', restore=a.id), size='sm', attrs='aria-label="Restore the archive of ' ~ a.device_user_id|e ~ '"') }}</td>
           {% endif %}
@@ -84,11 +84,11 @@
       <tbody>
         {% for a in restored %}
         <tr>
-          <td class="num">{{ a.device_user_id }}</td>
-          <td>{{ span(a) }}</td>
-          <td>{{ a.reason or '' }}</td>
-          <td>{{ when(a.created_at) }}<br><span class="muted">{{ a.created_by_name or 'Unknown' }}</span></td>
-          <td>{{ when(a.restored_at) }}<br><span class="muted">{{ a.restored_by_name or 'Unknown' }}</span></td>
+          <td data-label="Device ID">{{ a.device_user_id }}</td>
+          <td data-label="Range">{{ span(a) }}</td>
+          <td data-label="Reason">{{ a.reason or '-' }}</td>
+          <td data-label="Archived">{{ when(a.created_at) }}<br><span class="muted">{{ a.created_by_name or 'Unknown' }}</span></td>
+          <td data-label="Restored">{{ when(a.restored_at) }}<br><span class="muted">{{ a.restored_by_name or 'Unknown' }}</span></td>
         </tr>
         {% endfor %}
       </tbody>

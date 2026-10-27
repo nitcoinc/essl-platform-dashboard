@@ -589,7 +589,7 @@ input[type="file"]::file-selector-button {
 .health-recovery { max-width: 70ch; margin-top: var(--s6); font-size: var(--text-14); color: var(--text-secondary); }
 .health-recovery ol { padding-left: var(--s5); }
 .admin-section { padding: var(--s8) 0; border-top: 1px solid var(--border); }
-.topbar + .admin-section { border-top: 0; padding-top: 0; }
+.topbar + .admin-section, .subtabs + .admin-section { border-top: 0; padding-top: 0; }
 .admin-section > h2 { margin-bottom: var(--s1); }
 .admin-section > h3 { margin: var(--s6) 0 var(--s2); }
 .section-intro { margin-bottom: var(--s4); max-width: 70ch; font-size: var(--text-14); color: var(--text-secondary); }
@@ -891,6 +891,7 @@ input[type="file"]::file-selector-button {
 .archive-range { display: flex; flex-wrap: wrap; gap: var(--s3); align-items: flex-end; margin-bottom: var(--s3); }
 .archive-range .field { flex: 0 1 180px; }
 .issue-confirm .field { margin-bottom: var(--s3); max-width: 420px; }
+.issue-confirm .archive-range .field { margin-bottom: 0; }
 .archive-restored { color: var(--text-secondary); }
 .archive-restored .table td { color: var(--text-secondary); }
 .issue-link-form { display: flex; gap: var(--s2); width: 100%; max-width: 420px; }

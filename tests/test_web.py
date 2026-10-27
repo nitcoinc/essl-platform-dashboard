@@ -5015,7 +5015,8 @@ class PunchArchiveWebTest(unittest.TestCase):
                                                    actor_id=self.admin["id"])
         self._sign_in(self.hr)
         page = self.client.get("/people/issues/archived").text
-        self.assertIn("Test card", page)
+        self.assertIn('<td data-label="Reason">Test card</td>', page)
+        self.assertIn('<td data-label="Device ID"><strong>9999</strong></td>', page)
         self.assertIn("Arun Admin", page)
         self.assertNotIn("Restore", page.split("<h1")[1].split("Nothing is deleted")[1])
         self.assertNotIn("Restore the archive of", self.client.get(f"/people/issues/archived?restore={archive_id}").text)
