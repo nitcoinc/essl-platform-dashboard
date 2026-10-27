@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -170,6 +173,35 @@ def mail_provider() -> str:
     if os.getenv("CLOUDFLARE_API_TOKEN") and os.getenv("CLOUDFLARE_ACCOUNT_ID"):
         return "cloudflare"
     return "resend"
+
+
+def public_url() -> str | None:
+    """The dashboard's public base URL (``ESSL_PUBLIC_URL``), used to build the
+    absolute links in alert and fix-request emails. Background services have no
+    request to derive it from. Unset means emails with links cannot go live.
+    """
+    value = (os.getenv("ESSL_PUBLIC_URL") or "").strip().rstrip("/")
+    if not value:
+        return None
+    if not value.startswith(("https://", "http://")):
+        raise RuntimeError("ESSL_PUBLIC_URL must start with https:// or http://")
+    return value
+
+
+def public_url_or_none(context: str) -> str | None:
+    """``public_url``, but a malformed value logs a warning (``context`` says
+    what goes out without a link) and reads as unset, so an email still sends."""
+    try:
+        return public_url()
+    except RuntimeError as exc:
+        _logger.warning("%s: %s", context, exc)
+        return None
+
+
+def hr_reply_to() -> str | None:
+    """Reply-To address for alert and fix-request emails (``ESSL_HR_REPLY_TO``)."""
+    value = (os.getenv("ESSL_HR_REPLY_TO") or "").strip()
+    return value or None
 
 
 TIMEZONE_NAME = "Asia/Kolkata"

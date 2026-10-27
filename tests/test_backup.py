@@ -78,13 +78,20 @@ def _insert_punch(path: str, n: int) -> None:
         db.close()
 
 
+# Columns whose CHECK constraint refuses the generic "x" placeholder.
+_SEED_OVERRIDES = {("mail_outbox", "status"): "pending"}
+
+
 def _seed_secrets(path: str) -> None:
     raw = sqlite3.connect(path)
     raw.execute("PRAGMA foreign_keys=OFF")
     for table in bk.SCRUBBED_TABLES:
         info = raw.execute(f"PRAGMA table_info({table})").fetchall()
         cols = [r[1] for r in info if r[5] == 0]
-        values = ["x" if "TEXT" in (r[2] or "").upper() else 1 for r in info if r[5] == 0]
+        values = [
+            _SEED_OVERRIDES.get((table, r[1]), "x" if "TEXT" in (r[2] or "").upper() else 1)
+            for r in info if r[5] == 0
+        ]
         raw.execute(
             f"INSERT INTO {table} ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
             values,
@@ -270,6 +277,34 @@ class CycleTest(Base):
         src = sqlite3.connect(self.db_path)
         self.assertEqual(src.execute("SELECT COUNT(*) FROM sessions").fetchone()[0], 1)
         src.close()
+
+    def test_snapshot_drops_report_links_and_outbox(self) -> None:
+        # Both hold raw or hashed report tokens (KTD7, KTD8).
+        self.assertIn("fix_report_links", bk.SCRUBBED_TABLES)
+        self.assertIn("mail_outbox", bk.SCRUBBED_TABLES)
+        self.init_db()
+        db = Database(self.db_path, must_exist=True)
+        try:
+            with db.transaction() as c:
+                c.execute(
+                    "INSERT INTO employees (device_user_id, name, email, created_at, updated_at) "
+                    "VALUES ('1', 'A', 'a@x.com', ?, ?)", (NOW, NOW))
+            token = db.create_report_link(1, NOW.date(), expires_at=NOW + timedelta(days=7))
+            db.enqueue_mail(["a@x.com"], "Subject", f"open /fix/{token}")
+        finally:
+            db.close()
+        work = self.dir / "w"
+        work.mkdir()
+        snapshot = bk._build_snapshot(self.db_path, work)
+        out = self.dir / "check.db"
+        out.write_bytes(gzip.decompress(snapshot.path.read_bytes()))
+        conn = sqlite3.connect(out)
+        try:
+            for table in ("fix_report_links", "mail_outbox"):
+                self.assertEqual(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM employees").fetchone()[0], 1)
+        finally:
+            conn.close()
 
     def test_schema_behind_fails_without_migrating(self) -> None:
         self.init_db()

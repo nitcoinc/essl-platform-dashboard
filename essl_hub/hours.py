@@ -11,6 +11,7 @@ DirectionSource = Literal["raw_byte", "alternation", "mixed", "none"]
 # A work day runs from this hour to the same hour next day (R1). Night shifts
 # cross calendar midnight, so a midnight cut splits one shift over two days.
 DEFAULT_DAY_START_HOUR = 6
+DEFAULT_TARGET_MINUTES = 480
 
 # KTD9: a direction-less swipe within the quick-swipe window of the previous
 # kept swipe, or a same-direction re-swipe, is a duplicate: stored, shown
@@ -220,11 +221,111 @@ def work_day_window(day: date, day_start_hour: int) -> tuple[datetime, datetime]
     return start, start + timedelta(days=1)
 
 
+def read_day_start_hour(database) -> int:
+    """The stored work-day start hour (R1); a missing or corrupt value falls back."""
+    try:
+        hour = int(database.setting("day_start_hour", str(DEFAULT_DAY_START_HOUR)))
+    except (TypeError, ValueError):
+        return DEFAULT_DAY_START_HOUR
+    return hour if 0 <= hour <= 23 else DEFAULT_DAY_START_HOUR
+
+
+def read_target_minutes(database) -> int:
+    """The stored daily target; a missing or corrupt value (outside the
+    1 minute to 24 hours the settings page accepts) is the default."""
+    try:
+        minutes = int(database.setting("daily_target_minutes", str(DEFAULT_TARGET_MINUTES)))
+    except (TypeError, ValueError):
+        return DEFAULT_TARGET_MINUTES
+    return minutes if 1 <= minutes <= 24 * 60 else DEFAULT_TARGET_MINUTES
+
+
+# A work day can be reported while it is one of the last REPORT_DAYS work
+# days, today included; an emailed report link expires REPORT_DAYS after its
+# work day ends (KTD7), and the form refuses the day once it is too old.
+REPORT_DAYS = 7
+
+
+def reportable(day: date, today: date) -> bool:
+    """True while ``day`` is one of the last REPORT_DAYS work days."""
+    return 0 <= (today - day).days < REPORT_DAYS
+
+
+# KTD4: what an approved fix did to a punch row (its ``correction`` key).
+CORRECTION_ADDED = "added"
+CORRECTION_DIRECTION = "direction_fixed"
+CORRECTION_IGNORED = "ignored"
+
+
 def punch_from_row(row, windows: dict[str, int]) -> Punch:
     """A Punch from a punch row carrying ``device_id``, with that device's
-    quick-swipe window (KTD3); an unknown device keeps the default."""
-    window = windows.get(row.get("device_id"), DUPLICATE_WINDOW_SECONDS)
+    quick-swipe window (KTD3); an unknown device keeps the default. A punch
+    HR added or re-directed (KTD4) gets a zero window: it is never collapsed."""
+    if row.get("correction") in (CORRECTION_ADDED, CORRECTION_DIRECTION):
+        window = 0
+    else:
+        window = windows.get(row.get("device_id"), DUPLICATE_WINDOW_SECONDS)
     return Punch(row["event_timestamp"], row["trusted_direction"], window)
+
+
+def counted_punches(rows, windows: dict[str, int]) -> list[Punch]:
+    """The Punches ``compute_day`` scores from merged rows: a punch HR ignored
+    (KTD4) stays in the raw list but never counts."""
+    return [punch_from_row(row, windows) for row in rows if row.get("correction") != CORRECTION_IGNORED]
+
+
+def apply_corrections(rows, corrections, main_ids: dict[int, str]) -> list[dict]:
+    """Merge approved fixes (KTD4) into punch rows, in time order. Pure, so
+    the HR preview can merge proposed lines the same way.
+
+    ``rows`` carry ``fingerprint`` and their owner's ``employee_id`` (None for
+    an unmapped ID); ``corrections`` are ``punch_corrections`` rows, oldest
+    first; ``main_ids`` maps each owner to their main device user ID. Inputs
+    are never mutated; every returned row has a ``correction`` key:
+
+    - ``set_direction`` overrides the direction of its fingerprint's row;
+    - ``ignore`` keeps its row, marked, for the raw list;
+    - ``add`` becomes a row under the owner's main ID with no device, so no
+      device window, site or raw byte.
+
+    A fingerprint correction applies only to a row its own employee owns: a
+    target that no longer exists, or whose ID moved to someone else, is inert.
+    """
+    targeted: dict[str, list[dict]] = {}
+    for correction in corrections:
+        if correction["kind"] != "add" and correction.get("fingerprint"):
+            targeted.setdefault(correction["fingerprint"], []).append(correction)
+    merged = []
+    for row in rows:
+        out = {**row, "correction": None}
+        for correction in targeted.get(row.get("fingerprint"), ()):
+            if correction["employee_id"] != row.get("employee_id"):
+                continue
+            if correction["kind"] == "ignore":
+                out["correction"] = CORRECTION_IGNORED
+            elif correction["kind"] == "set_direction":
+                out["trusted_direction"] = correction["direction"]
+                if out["correction"] != CORRECTION_IGNORED:
+                    out["correction"] = CORRECTION_DIRECTION
+        merged.append(out)
+    for correction in corrections:
+        owner = correction["employee_id"]
+        if correction["kind"] != "add" or correction.get("event_timestamp") is None or owner not in main_ids:
+            continue
+        merged.append({
+            "device_user_id": main_ids[owner],
+            "employee_id": owner,
+            "fingerprint": f"correction:{correction.get('id')}",
+            "event_timestamp": correction["event_timestamp"],
+            "trusted_direction": correction["direction"],
+            "raw_direction_byte": None,
+            "raw_state": None,
+            "site": None,
+            "device_id": None,
+            "correction": CORRECTION_ADDED,
+        })
+    merged.sort(key=lambda r: r["event_timestamp"])
+    return merged
 
 
 def _resolve_directions(

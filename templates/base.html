@@ -7,13 +7,15 @@
   ('me.week_view', 'Week', 'calendar-days', ('employee', 'manager', 'hr', 'admin')),
   ('team.team_view', 'Employees' if role in ('hr', 'admin') else 'Team', 'users', ('manager', 'hr', 'admin')),
   ('people.people_view', 'People', 'user-round-cog', ('hr', 'admin')),
+  ('fixes.review_list', 'Fix requests', 'inbox', ('hr', 'admin')),
   ('admin.devices_view', 'Devices', 'server', ('admin',)),
   ('admin.settings_view', 'Settings', 'settings', ('admin',)),
 ] -%}
 {%- macro nav_links() -%}
 <ul class="nav-list">
   {%- for endpoint, label, icon_name, roles in nav if role in roles and has_endpoint(endpoint) %}
-  <li><a class="nav-item" href="{{ url_for(endpoint) }}"{% if request.endpoint == endpoint or (endpoint == 'people.people_view' and request.endpoint == 'people.id_issues_view') %} aria-current="page"{% endif %}>{{ ui.icon(icon_name) }}<span>{{ label }}</span>{% if endpoint == 'people.people_view' and nav_issue_count %}<span class="nav-count" title="{{ nav_issue_count }} ID {{ 'issue' if nav_issue_count == 1 else 'issues' }} to check" aria-label="{{ nav_issue_count }} ID issues to check">{{ nav_issue_count }}</span>{% endif %}</a></li>
+  {%- set fix_badge = endpoint == 'fixes.review_list' and nav_fix_count %}
+  <li><a class="nav-item" href="{{ url_for(endpoint) }}"{% if request.endpoint == endpoint or (endpoint == 'people.people_view' and request.endpoint == 'people.id_issues_view') or (endpoint == 'fixes.review_list' and request.endpoint in ('fixes.review_detail', 'fixes.review_preview', 'fixes.review_confirm')) %} aria-current="page"{% endif %}{% if fix_badge %} aria-label="{{ label }}, {{ nav_fix_count }} pending"{% endif %}>{{ ui.icon(icon_name) }}<span>{{ label }}</span>{% if endpoint == 'people.people_view' and nav_issue_count %}<span class="nav-count" title="{{ nav_issue_count }} ID {{ 'issue' if nav_issue_count == 1 else 'issues' }} to check" aria-label="{{ nav_issue_count }} ID issues to check">{{ nav_issue_count }}</span>{% endif %}{% if fix_badge %}<span class="nav-count" title="{{ nav_fix_count }} fix {{ 'request' if nav_fix_count == 1 else 'requests' }} waiting" aria-hidden="true">{{ nav_fix_count }}</span>{% endif %}</a></li>
   {%- endfor %}
 </ul>
 {%- endmacro -%}

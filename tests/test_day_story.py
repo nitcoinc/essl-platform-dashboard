@@ -242,3 +242,27 @@ class BreakViewTest(unittest.TestCase):
         swipes = [(_at(9), "entry"), (_at(13), "exit"), (again, "exit"), (_at(14), "entry"), (_at(18), "exit")]
         view = day_story.break_view(self._day(*swipes), None, self._rows(*swipes))
         self.assertEqual(view.punches[2].note, "same as Out 13:00:00, 12s earlier")
+
+    def test_corrected_swipes_carry_text_chips_and_the_bar_names_them(self) -> None:
+        # KTD4: rows as hours.apply_corrections returns them.
+        dup = D.replace(hour=9, minute=5)
+        swipes = [(_at(9), "entry"), (_at(13), "exit"), (_at(13, 40), "entry"), (_at(18), "exit")]
+        rows = self._rows(*swipes[:1], (dup, "entry"), *swipes[1:])
+        for row, mark in zip(rows, (None, "ignored", None, "added", "direction_fixed")):
+            row["correction"] = mark
+        view = day_story.break_view(self._day(*swipes), None, rows)
+        self.assertEqual([(p.direction, p.flags) for p in view.punches], [
+            ("entry", ()), ("entry", ("ignored",)), ("exit", ()),
+            ("entry", ("added by HR",)), ("exit", ("direction fixed",))])
+        self.assertTrue(view.bar_label.endswith(", 1 punch added by HR, 1 punch ignored"))
+
+    def test_day_level_fix_chip_follows_the_latest_request(self) -> None:
+        swipes = [(_at(9), "entry"), (_at(18), "exit")]
+        result, rows = self._day(*swipes), self._rows(*swipes)
+        cases = (((), ()), (["pending"], ("Fix pending",)), (["rejected"], ("Fix rejected",)),
+                 (["rejected", "pending"], ("Fix pending",)), (["pending", "approved"], ()),
+                 (["closed_correct"], ()))
+        for statuses, chips in cases:
+            with self.subTest(statuses=statuses):
+                self.assertEqual(day_story.break_view(result, None, rows, statuses).fix_flags, chips)
+

@@ -36,6 +36,7 @@ sys.path.insert(0, str(ROOT))
 from essl_hub import roster
 from essl_hub.config import DEVICES
 from essl_hub.db import OfflineError
+from essl_hub.hours import apply_corrections
 from essl_hub.web import create_app
 
 
@@ -70,6 +71,15 @@ class FakeDatabase:
         self.sessions: dict[str, dict] = {}
         self.api_keys_list: list[dict] = []
         self.device_change_rows: list[dict] = []
+        # Missed-punch alerts and fix requests (v8).
+        self.report_links: list[dict] = []
+        self.outbox: list[dict] = []
+        self.alerts: list[dict] = []
+        self.baselines: dict[int, dict] = {}
+        self.fix_requests: dict[int, dict] = {}
+        self.fix_lines: dict[int, dict] = {}
+        self.corrections: list[dict] = []
+        self.fix_events: list[dict] = []
         # `offline` makes every write raise OfflineError, the way an
         # unavailable database does.
         self.offline = False
@@ -264,24 +274,34 @@ class FakeDatabase:
             inserted += 1
         return inserted
 
-    def punches_for_employee_range(self, device_user_ids, start: datetime, end: datetime):
-        wanted = {device_user_ids} if isinstance(device_user_ids, str) else set(device_user_ids)
+    def _overlaid_punches(self, wanted, start: datetime, end: datetime) -> list[dict]:
+        """Database._overlaid_punches: owners via main and extra IDs, then the
+        same pure merge of approved fixes (KTD4)."""
+        owner_of = {e["device_user_id"]: e["id"] for e in self.employees_by_id.values()}
+        owner_of.update(self.extra_ids)
+        main_ids = {owner_of[uid]: self.employees_by_id[owner_of[uid]]["device_user_id"]
+                    for uid in wanted if uid in owner_of}
         rows = [
-            p
-            for p in self.punches
-            if p.get("device_user_id") in wanted and start <= p["event_timestamp"] < end
-        ]
-        rows.sort(key=lambda p: p["event_timestamp"])
-        return [
             {
+                "device_user_id": p.get("device_user_id"),
+                "employee_id": owner_of.get(p.get("device_user_id")),
+                "fingerprint": p.get("fingerprint"),
                 "event_timestamp": p["event_timestamp"],
                 "trusted_direction": p.get("trusted_direction"),
                 "raw_direction_byte": p.get("raw_direction_byte"),
                 "raw_state": p.get("raw_state", ""),
+                "site": p.get("site"),
                 "device_id": p.get("device_id"),
             }
-            for p in rows
+            for p in self.punches
+            if p.get("device_user_id") in wanted and start <= p["event_timestamp"] < end
         ]
+        rows.sort(key=lambda p: p["event_timestamp"])
+        return apply_corrections(rows, self.corrections_for(main_ids, start, end), main_ids)
+
+    def punches_for_employee_range(self, device_user_ids, start: datetime, end: datetime):
+        wanted = {device_user_ids} if isinstance(device_user_ids, str) else set(device_user_ids)
+        return self._overlaid_punches(wanted, start, end)
 
     def first_punch_at(self, device_user_ids):
         wanted = set(device_user_ids)
@@ -289,22 +309,8 @@ class FakeDatabase:
         return min(stamps) if stamps else None
 
     def punches_for_device_users_range(self, device_user_ids, start: datetime, end: datetime):
-        wanted = set(device_user_ids)
-        rows = [
-            p for p in self.punches
-            if p.get("device_user_id") in wanted and start <= p["event_timestamp"] < end
-        ]
-        rows.sort(key=lambda p: (p["device_user_id"], p["event_timestamp"]))
-        return [
-            {
-                "device_user_id": p["device_user_id"],
-                "event_timestamp": p["event_timestamp"],
-                "trusted_direction": p.get("trusted_direction"),
-                "site": p.get("site"),
-                "device_id": p.get("device_id"),
-            }
-            for p in rows
-        ]
+        rows = self._overlaid_punches(set(device_user_ids), start, end)
+        return sorted(rows, key=lambda p: (p["device_user_id"], p["event_timestamp"]))
 
     def unmapped_device_user_ids(self):
         mapped = {e["device_user_id"] for e in self.employees_by_id.values()} | set(self.extra_ids)
@@ -568,6 +574,327 @@ class FakeDatabase:
     def api_keys(self):
         return sorted(self.api_keys_list, key=lambda k: k["created_at"], reverse=True)
 
+    # alerts, outbox and report links (v8) -----------------------------------
+
+    def _with_role(self, role: str) -> list[dict]:
+        return sorted(
+            (self._ids(e) for e in self.employees_by_id.values()
+             if e["role"] == role and not e.get("archived_at")),
+            key=lambda e: e["name"],
+        )
+
+    def active_hr_users(self) -> list[dict]:
+        return self._with_role("hr")
+
+    def has_active_hr_other_than(self, employee_id) -> bool:
+        return any(p["id"] != employee_id for p in self._with_role("hr"))
+
+    def active_admins(self) -> list[dict]:
+        return self._with_role("admin")
+
+    def latest_baselines(self) -> dict[int, dict]:
+        return dict(self.baselines)
+
+    def latest_baseline_at(self):
+        """Database.latest_baseline_at: the newest snapshot's computed_at
+        (``baselines`` holds only the newest snapshot)."""
+        stamps = [row["computed_at"] for row in self.baselines.values() if row.get("computed_at")]
+        return max(stamps) if stamps else None
+
+    def alert_counts(self, since) -> list[dict]:
+        counts: dict[tuple, int] = {}
+        for alert in self.alerts:
+            if alert["work_day"] >= since:
+                key = (alert.get("site"), alert["kind"], alert["mode"], alert["status"])
+                counts[key] = counts.get(key, 0) + 1
+        return [
+            {"site": site, "kind": kind, "mode": mode, "status": status, "n": n}
+            for (site, kind, mode, status), n in sorted(counts.items(), key=lambda i: str(i[0]))
+        ]
+
+    def enqueue_mail(self, recipients, subject, text_body, html_body=None) -> int:
+        self._check_online()
+        unique: dict[str, str] = {}
+        for address in recipients:
+            address = (address or "").strip()
+            if address:
+                unique.setdefault(address.lower(), address)
+        if not unique:
+            raise ValueError("an email needs at least one recipient")
+        row = {
+            "id": len(self.outbox) + 1, "recipients": list(unique.values()), "subject": subject,
+            "text_body": text_body, "html_body": html_body, "status": "pending", "attempts": 0,
+            "last_error": None, "next_attempt_at": _ist_now(), "created_at": _ist_now(),
+            "sent_at": None,
+        }
+        self.outbox.append(row)
+        return row["id"]
+
+    def create_report_link(self, employee_id, work_day, *, expires_at) -> str:
+        import secrets
+        from essl_hub.hashing import sha256_hex
+
+        self._check_online()
+        token = secrets.token_urlsafe(32)
+        self.report_links.append({
+            "id": len(self.report_links) + 1, "token_hash": sha256_hex(token),
+            "employee_id": employee_id, "work_day": work_day, "expires_at": expires_at,
+            "created_at": _ist_now(),
+        })
+        return token
+
+    def report_link(self, token):
+        from essl_hub.hashing import sha256_hex
+
+        if not token:
+            return None
+        digest = sha256_hex(token)
+        return next(
+            (dict(l) for l in self.report_links
+             if l["token_hash"] == digest and l["expires_at"] > _ist_now()),
+            None,
+        )
+
+    # fix requests and corrections (v8) ----------------------------------------
+
+    def _fix_event(self, request_id, line_id, actor_id, kind, old_value, new_value) -> None:
+        self.fix_events.append({
+            "id": len(self.fix_events) + 1, "request_id": request_id, "line_id": line_id,
+            "actor_employee_id": actor_id, "kind": kind, "old_value": old_value,
+            "new_value": new_value, "created_at": _ist_now(),
+        })
+
+    def _name(self, employee_id):
+        return (self.employees_by_id.get(employee_id) or {}).get("name")
+
+    def _request_lines(self, request_id) -> list[dict]:
+        return [dict(l, decided_by_name=self._name(l["decided_by"]))
+                for l in sorted(self.fix_lines.values(), key=lambda l: l["id"])
+                if l["request_id"] == request_id]
+
+    def pending_fix_request(self, employee_id, work_day):
+        return next(
+            (dict(r) for r in self.fix_requests.values()
+             if (r["employee_id"], r["work_day"], r["status"]) == (employee_id, work_day, "pending")),
+            None,
+        )
+
+    def latest_fix_request(self, employee_id, work_day):
+        rows = [r for r in self.fix_requests.values()
+                if (r["employee_id"], r["work_day"]) == (employee_id, work_day)]
+        return dict(max(rows, key=lambda r: r["id"])) if rows else None
+
+    def file_fix_lines(self, employee_id, work_day, lines, *, source, punch_set_hash=None):
+        from essl_hub import db as db_module
+        from essl_hub import db_fixes
+
+        self._check_online()
+        if source not in db_module.FIX_SOURCES:
+            raise ValueError(f"unknown fix request source: {source}")
+        prepared = [db_fixes._fix_line_values(line) for line in lines]
+        if not prepared:
+            raise ValueError("a fix request needs at least one line")
+        latest = self.latest_fix_request(employee_id, work_day)
+        if latest is not None and latest["status"] in db_module.FIX_CLOSED_STATUSES | {"pending"}:
+            request_id = latest["id"]
+            held = self._request_lines(request_id)
+            existing = len(held)
+            keys = {db_fixes._fix_line_key(line) for line in held}
+            prepared = [values for values in prepared if db_fixes._fix_line_key(values) not in keys]
+            if not prepared:
+                return {"request_id": request_id, "first_lines": False}
+        else:
+            request_id, existing = len(self.fix_requests) + 1, 0
+        if existing + len(prepared) > db_module.FIX_MAX_LINES:
+            raise db_module.FixLineLimit(f"A request holds at most {db_module.FIX_MAX_LINES} lines.")
+        now = _ist_now()
+        if latest is not None and latest["id"] == request_id:
+            event = "lines_added"
+            if latest["status"] != "pending":
+                self.fix_requests[request_id].update(
+                    status="pending", source=source, punch_set_hash=punch_set_hash,
+                    decided_at=None, decided_by=None, created_at=now)
+                self._fix_event(request_id, None, employee_id, "reopened",
+                                {"status": latest["status"]}, {"status": "pending"})
+        else:
+            event = "filed"
+            self.fix_requests[request_id] = {
+                "id": request_id, "employee_id": employee_id, "work_day": work_day,
+                "status": "pending", "punch_set_hash": punch_set_hash, "source": source,
+                "previous_request_id": latest["id"] if latest else None, "decision_note": None,
+                "created_at": now, "decided_at": None, "decided_by": None,
+            }
+        line_ids = []
+        for kind, target, event_time, direction, note in prepared:
+            line_id = len(self.fix_lines) + 1
+            self.fix_lines[line_id] = {
+                "id": line_id, "request_id": request_id, "kind": kind,
+                "target_fingerprint": target, "event_time": event_time, "direction": direction,
+                "note": note, "status": "pending", "hr_event_time": None, "hr_direction": None,
+                "decided_by": None, "decided_at": None, "created_at": now,
+            }
+            line_ids.append(line_id)
+        self._fix_event(request_id, None, employee_id, event, None, {"lines": line_ids})
+        return {"request_id": request_id, "first_lines": existing == 0}
+
+    def close_fix_day(self, employee_id, work_day, status, *, source) -> int:
+        from essl_hub import db as db_module
+
+        self._check_online()
+        if status not in db_module.FIX_CLOSED_STATUSES:
+            raise ValueError(f"not a closing status: {status}")
+        latest = self.latest_fix_request(employee_id, work_day)
+        if latest is not None and latest["status"] == "pending":
+            raise db_module.RuleViolation("A fix request for this day is waiting for HR.")
+        now = _ist_now()
+        if latest is not None and latest["status"] in db_module.FIX_CLOSED_STATUSES:
+            request_id = latest["id"]
+            self.fix_requests[request_id].update(status=status, source=source, decided_at=now)
+        else:
+            request_id = len(self.fix_requests) + 1
+            self.fix_requests[request_id] = {
+                "id": request_id, "employee_id": employee_id, "work_day": work_day,
+                "status": status, "punch_set_hash": None, "source": source,
+                "previous_request_id": latest["id"] if latest else None, "decision_note": None,
+                "created_at": now, "decided_at": now, "decided_by": None,
+            }
+        self._fix_event(request_id, None, employee_id, "closed", None, {"status": status})
+        return request_id
+
+    def fix_request(self, request_id):
+        row = self.fix_requests.get(request_id)
+        if row is None:
+            return None
+        employee = self.employees_by_id.get(row["employee_id"]) or {}
+        return {
+            **row, "employee_name": employee.get("name"), "employee_email": employee.get("email"),
+            "employee_manager_id": employee.get("manager_id"),
+            "decided_by_name": self._name(row["decided_by"]),
+            "lines": self._request_lines(request_id),
+        }
+
+    def fix_request_events(self, request_id) -> list[dict]:
+        return [dict(e, actor_name=self._name(e["actor_employee_id"]))
+                for e in self.fix_events if e["request_id"] == request_id]
+
+    def fix_requests_for_review(self, recent: int = 20) -> list[dict]:
+        def view(row):
+            return {**row, "employee_name": self._name(row["employee_id"]),
+                    "decided_by_name": self._name(row["decided_by"]),
+                    "line_count": len(self._request_lines(row["id"]))}
+
+        rows = sorted(self.fix_requests.values(), key=lambda r: r["id"])
+        pending = [view(r) for r in rows if r["status"] == "pending"]
+        decided = [view(r) for r in reversed(rows) if r["status"] in ("approved", "partial", "rejected")]
+        return pending + decided[:recent]
+
+    def pending_fix_request_count(self) -> int:
+        return sum(r["status"] == "pending" for r in self.fix_requests.values())
+
+    def decide_fix_lines(self, request_id, decisions, *, actor_id, note=None):
+        from essl_hub import db as db_module
+
+        self._check_online()
+        decisions = list(decisions)
+        note = (note or "").strip() or None
+        for decision in decisions:
+            if decision.get("status") not in ("approved", "rejected"):
+                raise ValueError(f"bad line decision: {decision.get('status')}")
+            if decision.get("direction") not in (None, *db_module.DIRECTIONS):
+                raise ValueError(f"bad direction: {decision.get('direction')}")
+        if note is None and any(d["status"] == "rejected" for d in decisions):
+            raise ValueError("A note is required when rejecting.")
+        if note is not None and len(note) > db_module.FIX_NOTE_MAX_CHARS:
+            raise ValueError(f"note is longer than {db_module.FIX_NOTE_MAX_CHARS} characters")
+        request = self.fix_requests.get(request_id)
+        if request is None:
+            raise db_module.RuleViolation("No such fix request.")
+        if actor_id == request["employee_id"]:
+            raise db_module.RuleViolation("Nobody decides their own fix request.")
+        now = _ist_now()
+        decided, skipped, corrections, events = [], [], [], []
+        updates = {}
+        for decision in decisions:
+            line = self.fix_lines.get(decision["line_id"])
+            if line is None or line["request_id"] != request_id:
+                raise ValueError(f"line {decision['line_id']} is not on request {request_id}")
+            if line["status"] != "pending":
+                skipped.append({"line_id": line["id"], "status": line["status"],
+                                "decided_by": line["decided_by"],
+                                "decided_by_name": self._name(line["decided_by"])})
+                continue
+            adds = line["kind"] in ("add_in", "add_out")
+            hr_time = decision.get("event_time") if adds else None
+            hr_direction = decision.get("direction") if line["kind"] != "ignore" else None
+            correction = None
+            if decision["status"] == "approved":
+                if adds:
+                    correction = {"kind": "add", "fingerprint": None,
+                                  "event_timestamp": hr_time or line["event_time"],
+                                  "direction": hr_direction or line["direction"]}
+                elif line["kind"] == "ignore":
+                    correction = {"kind": "ignore", "fingerprint": line["target_fingerprint"],
+                                  "event_timestamp": None, "direction": None}
+                else:
+                    direction = hr_direction or line["direction"]
+                    if direction is None:
+                        stored = next((p.get("trusted_direction") for p in self.punches
+                                       if p["fingerprint"] == line["target_fingerprint"]), None)
+                        direction = {"entry": "exit", "exit": "entry"}.get(stored)
+                    if direction is None:
+                        raise ValueError(f"line {line['id']} needs a direction to flip to")
+                    correction = {"kind": "set_direction", "fingerprint": line["target_fingerprint"],
+                                  "event_timestamp": None, "direction": direction}
+                corrections.append({
+                    **correction, "employee_id": request["employee_id"],
+                    "work_day": request["work_day"], "request_line_id": line["id"], "created_at": now,
+                })
+            updates[line["id"]] = {"status": decision["status"], "hr_event_time": hr_time,
+                                   "hr_direction": hr_direction, "decided_by": actor_id,
+                                   "decided_at": now}
+            events.append((line["id"], "line_approved" if decision["status"] == "approved"
+                           else "line_rejected",
+                           {"status": "pending", "kind": line["kind"],
+                            "target_fingerprint": line["target_fingerprint"],
+                            "event_time": line["event_time"], "direction": line["direction"]},
+                           {"status": decision["status"], "correction": correction}))
+            decided.append(line["id"])
+        # All checks passed: apply together, like the real transaction.
+        for line_id, values in updates.items():
+            self.fix_lines[line_id].update(values)
+        for correction in corrections:
+            self.corrections.append({"id": len(self.corrections) + 1, **correction})
+        for line_id, kind, old_value, new_value in events:
+            self._fix_event(request_id, line_id, actor_id, kind, old_value, {**new_value, "note": note})
+        if note is not None and decided:
+            request["decision_note"] = note
+        statuses = {l["status"] for l in self._request_lines(request_id)}
+        if decided and statuses and "pending" not in statuses and request["status"] == "pending":
+            final = ("approved" if statuses == {"approved"}
+                     else "rejected" if statuses == {"rejected"} else "partial")
+            request.update(status=final, decided_at=now, decided_by=actor_id)
+            self._fix_event(request_id, None, actor_id, "decided", {"status": "pending"},
+                            {"status": final, "note": note})
+        return {"status": request["status"], "decided": decided, "skipped": skipped}
+
+    def corrections_for(self, employee_ids, start: datetime, end: datetime) -> list[dict]:
+        wanted = set(employee_ids)
+        first_day, last_day = start.date() - timedelta(days=1), end.date()
+        return [
+            dict(c) for c in self.corrections
+            if c["employee_id"] in wanted and (
+                (c["kind"] == "add" and start <= c["event_timestamp"] < end)
+                or (c["kind"] != "add" and first_day <= c["work_day"] <= last_day))
+        ]
+
+    def fix_request_days(self, employee_ids, start, end) -> dict:
+        wanted = set(employee_ids)
+        days: dict = {}
+        for row in sorted(self.fix_requests.values(), key=lambda r: r["id"]):
+            if row["employee_id"] in wanted and start <= row["work_day"] <= end:
+                days.setdefault((row["employee_id"], row["work_day"]), []).append(row["status"])
+        return days
+
     # settings ---------------------------------------------------------------
 
     def setting(self, key: str, default=None):
@@ -575,6 +902,48 @@ class FakeDatabase:
 
     def set_setting(self, key: str, value: str) -> None:
         self.settings[key] = value
+
+
+class FakeFixRequestsTest(unittest.TestCase):
+    """The FakeDatabase fix-request mirror behaves like essl_hub.db (U1)."""
+
+    def setUp(self) -> None:
+        self.db = FakeDatabase()
+        for uid, name, role in (("101", "Asha", "employee"), ("102", "Hari", "hr")):
+            self.db.upsert_employee(device_user_id=uid, name=name, email=f"{name.lower()}@x.com")
+            self.db.set_employee_role(self.db.employee_by_device_user_id(uid)["id"], role)
+        self.day = datetime(2026, 10, 26).date()
+
+    def test_file_decide_and_read_back(self) -> None:
+        from essl_hub.db import FixLineLimit
+
+        line = {"kind": "add_in", "event_time": datetime(2026, 10, 26, 13, 40)}
+        first = self.db.file_fix_lines(1, self.day, [line], source="link")
+        self.assertEqual(first, {"request_id": 1, "first_lines": True})
+        # A double-submitted line is skipped, as in essl_hub.db.
+        self.assertFalse(self.db.file_fix_lines(1, self.day, [line], source="link")["first_lines"])
+        self.assertEqual(len(self.db.fix_request(1)["lines"]), 1)
+        later = {"kind": "add_in", "event_time": datetime(2026, 10, 26, 13, 45)}
+        self.assertFalse(self.db.file_fix_lines(1, self.day, [later], source="session")["first_lines"])
+        with self.assertRaises(FixLineLimit):
+            self.db.file_fix_lines(1, self.day, [
+                {"kind": "add_out", "event_time": datetime(2026, 10, 26, 18, minute)} for minute in range(9)
+            ], source="link")
+        lines = self.db.fix_request(1)["lines"]
+        result = self.db.decide_fix_lines(1, [
+            {"line_id": lines[0]["id"], "status": "approved"},
+            {"line_id": lines[1]["id"], "status": "rejected"},
+        ], actor_id=2, note="Duplicate")
+        self.assertEqual(result["status"], "partial")
+        again = self.db.decide_fix_lines(1, [{"line_id": lines[0]["id"], "status": "approved"}],
+                                         actor_id=2)
+        self.assertEqual(again["skipped"][0]["decided_by_name"], "Hari")
+        corrections = self.db.corrections_for([1], datetime(2026, 10, 26, 6), datetime(2026, 10, 27, 6))
+        self.assertEqual([(c["kind"], c["direction"]) for c in corrections], [("add", "entry")])
+        self.assertEqual(self.db.fix_request_days([1], self.day, self.day), {(1, self.day): ["partial"]})
+        token = self.db.create_report_link(1, self.day, expires_at=_ist_now() + timedelta(days=1))
+        self.assertEqual(self.db.report_link(token)["employee_id"], 1)
+        self.assertEqual([p["name"] for p in self.db.active_hr_users()], ["Hari"])
 
 
 def _make_app():
@@ -1595,6 +1964,99 @@ class HistoryPagingTest(_QuickViewBase):
         self.assertIn(f'data-qv-day="/quick/{rid}?date=2026-07-30&amp;strip_end=2026-08-03&amp;from=people"', page)
         self.assertIn(f'data-qv-date="/quick/{rid}?from=people"', page)
         self.assertIn('min="2026-06-01" max="2026-09-09"', page)
+
+
+class CorrectionOverlayWebTest(_QuickViewBase):
+    """U2/KTD4: approved fixes change hours on every screen; raw punches,
+    Frappe and /api/checkins never see them."""
+
+    DAY = datetime(2026, 9, 9)
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Pin the clock after the day so Team and People show it as today, closed.
+        common, me = _fixed_now(self.DAY + timedelta(hours=20))
+        common.start()
+        me.start()
+        self.addCleanup(common.stop)
+        self.addCleanup(me.stop)
+        self.hema = self._person("1", "Hema HR", "hr")
+        at = lambda h, m=0: self.DAY + timedelta(hours=h, minutes=m)  # noqa: E731
+        # 09:05 is a stray In; 13:40 was recorded Out but was an In.
+        self.database.insert_punches([
+            _punch_row("ov-in", at(9), "entry"), _punch_row("ov-stray", at(9, 5), "entry"),
+            _punch_row("ov-out", at(13), "exit"), _punch_row("ov-wrong", at(13, 40), "exit"),
+            _punch_row("ov-last", at(17), "exit"),
+        ])
+        self.lines = [
+            {"kind": "ignore", "target_fingerprint": "ov-stray"},
+            {"kind": "flip", "target_fingerprint": "ov-wrong", "direction": "entry"},
+            {"kind": "add_in", "event_time": at(17, 30)},
+            {"kind": "add_out", "event_time": at(18, 30)},
+        ]
+
+    def _decide(self, status: str) -> None:
+        request_id = self.database.file_fix_lines(
+            self.ravi["id"], self.DAY.date(), self.lines, source="session")["request_id"]
+        self.database.decide_fix_lines(request_id, [
+            {"line_id": l["id"], "status": status} for l in self.database.fix_request(request_id)["lines"]
+        ], actor_id=self.hema["id"], note="Checked" if status == "rejected" else None)
+
+    def _screens(self) -> dict:
+        import csv as csv_module
+
+        from essl_hub import export
+        self._sign_in(self.hema)
+        day = self.DAY.date().isoformat()
+        csv_text = self.client.get(f"/export.csv?from={day}&to={day}").text
+        row = next(r for r in csv_module.reader(io.StringIO(csv_text.lstrip("\ufeff"))) if "Ravi Kumar" in r)
+        team = self.client.get("/team").text
+        team_row = team[team.index("Ravi Kumar"):]
+        return {
+            "day": self.client.get(f"/day?employee={self.ravi['id']}").text,
+            "quick": self._quick(self.ravi["id"]).text,
+            "team": team_row[:team_row.index("</tr>")],
+            "people": self.client.get("/people").text,
+            "csv": row[export.DAILY_HEADER.index("Effective")],
+        }
+
+    def test_raw_day_reads_short_with_review(self) -> None:
+        screens = self._screens()
+        self.assertIn("3h 55m", screens["team"])
+        self.assertEqual(screens["csv"], "3:55")
+        self.assertNotIn("added by HR", screens["day"])
+
+    def test_approved_fixes_show_the_same_corrected_hours_everywhere(self) -> None:
+        self._decide("approved")
+        screens = self._screens()
+        # 09:00-13:00, 13:40-17:00, 17:30-18:30 = 8h 20m.
+        self.assertIn("8h 20m", screens["team"])
+        self.assertEqual(screens["csv"], "8:20")
+        for name in ("day", "quick"):
+            page = screens[name]
+            self.assertIn("8h 20m", page)
+            self.assertIn('<h3 class="raw-punches-title">All punches (7)</h3>', page)
+            self.assertIn('<span class="chip chip-neutral">ignored</span>', page)
+            self.assertIn('<span class="chip chip-info">direction fixed</span>', page)
+            self.assertEqual(page.count('<span class="chip chip-info">added by HR</span>'), 2)
+            self.assertIn("2 punches added by HR, 1 punch ignored", page)
+            self.assertNotIn("Fix pending", page)
+        self.assertIn('status-chip status-met">Met</span>', screens["people"])
+        # The device rows are untouched.
+        self.assertEqual([p.get("trusted_direction") for p in self.database.punches],
+                         ["entry", "entry", "exit", "exit", "exit"])
+
+    def test_day_chip_says_pending_then_rejected_and_hours_stay_raw(self) -> None:
+        self.database.file_fix_lines(self.ravi["id"], self.DAY.date(), self.lines[:1], source="session")
+        self.assertIn('<span class="chip chip-info">Fix pending</span>', self._screens()["day"])
+        request_id = self.database.pending_fix_request(self.ravi["id"], self.DAY.date())["id"]
+        line = self.database.fix_request(request_id)["lines"][0]["id"]
+        self.database.decide_fix_lines(request_id, [{"line_id": line, "status": "rejected"}],
+                                       actor_id=self.hema["id"], note="Badge log agrees")
+        screens = self._screens()
+        self.assertIn('<span class="chip chip-warn">Fix rejected</span>', screens["day"])
+        self.assertEqual(screens["csv"], "3:55")
+        self.assertNotIn(">ignored</span>", screens["day"])
 
 
 class QuickViewDrawerTest(_QuickViewBase):
@@ -3128,8 +3590,8 @@ class AppShellTest(unittest.TestCase):
         # The manager role arrives with U5.
         expected = {
             "employee": ["Today", "Week"],
-            "hr": ["Today", "Week", "Employees", "People"],
-            "admin": ["Today", "Week", "Employees", "People", "Devices", "Settings"],
+            "hr": ["Today", "Week", "Employees", "People", "Fix requests"],
+            "admin": ["Today", "Week", "Employees", "People", "Fix requests", "Devices", "Settings"],
         }
         for role, labels in expected.items():
             with self.subTest(role=role):
@@ -3530,7 +3992,7 @@ class RolesAndVisibilityTest(unittest.TestCase):
         expected = {
             "employee": ["Today", "Week"],
             "manager": ["Today", "Week", "Team"],
-            "hr": ["Today", "Week", "Employees", "People"],
+            "hr": ["Today", "Week", "Employees", "People", "Fix requests"],
         }
         for i, (role, labels) in enumerate(expected.items()):
             self._sign_in(self._person(f"5{i}", role))
@@ -4386,3 +4848,831 @@ class BrandIconsTest(unittest.TestCase):
         self.assertIn("max-age", cache)
         self.assertNotIn("no-store", cache)
         response.close()
+
+
+class FixReportTest(unittest.TestCase):
+    """U7: the employee report flow, from the emailed link and the day view."""
+
+    DAY = datetime(2026, 10, 26).date()
+    NOW = datetime(2026, 10, 26, 18, 0)
+
+    def setUp(self) -> None:
+        self.app, self.database = _make_app()
+        self.client = self.app.test_client()
+        from essl_hub import mail as mail_module
+
+        self.captured = {}
+        original = mail_module.send_login_code
+        mail_module.send_login_code = lambda e, c: self.captured.update(code=c)
+        self.addCleanup(lambda: setattr(mail_module, "send_login_code", original))
+        for patcher in (*_fixed_now(self.NOW), patch.dict(os.environ, {"ESSL_PUBLIC_URL": "https://hub.example.com"})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.asha = self._person("118", "Asha Rao")
+        self.bob = self._person("119", "Bob Das")
+        self.boss = self._person("200", "Meera Boss", "manager")
+        self.hari = self._person("300", "Hari HR", "hr")
+        self.admin = self._person("400", "Ada Admin", "admin")
+        self.database.set_employee_manager(self.asha["id"], self.boss["id"])
+        self.database.insert_punches([
+            _punch_row("a-in", datetime(2026, 10, 26, 9, 0), "entry", uid="118"),
+            _punch_row("a-out", datetime(2026, 10, 26, 13, 0), "exit", uid="118"),
+            _punch_row("b-in", datetime(2026, 10, 26, 9, 5), "entry", uid="119"),
+        ])
+        self.token = self._link(self.asha, self.DAY)
+
+    def _person(self, uid: str, name: str, role: str = "employee") -> dict:
+        email = f"{name.split()[0].lower()}@example.com"
+        self.database.upsert_employee(device_user_id=uid, name=name, email=email)
+        person = self.database.employee_by_email(email)
+        self.database.set_employee_role(person["id"], role)
+        return person
+
+    def _link(self, person: dict, day, expires_at=None) -> str:
+        return self.database.create_report_link(
+            person["id"], day, expires_at=expires_at or _ist_now() + timedelta(days=7))
+
+    def _sign_in(self, person: dict) -> None:
+        self.client.post("/signout")
+        self.client.post("/signin", data={"email": person["email"]})
+        self.client.post("/signin/verify", data={"code": self.captured["code"]})
+
+    def _csrf(self) -> str:
+        html = self.client.get("/day").text
+        marker = 'name="csrf-token" content="'
+        start = html.index(marker) + len(marker)
+        return html[start : html.index('"', start)]
+
+    def _post_link(self, token=None, **data):
+        return self.client.post(f"/fix/{token or self.token}", data={"action": "send", **data})
+
+    def _missed_in(self, at="13:40", row=0, **extra):
+        return self._post_link(**{f"add-{row}-time": at, f"add-{row}-dir": "in"}, **extra)
+
+    def _requests(self, person=None) -> list[dict]:
+        person = person or self.asha
+        return [r for r in self.database.fix_requests.values() if r["employee_id"] == person["id"]]
+
+    # --- Viewing the link ---------------------------------------------------
+
+    def test_get_and_head_render_the_swipes_and_create_nothing(self) -> None:
+        page = self.client.get(f"/fix/{self.token}")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("09:00:00", page.text)
+        self.assertIn("13:00:00", page.text)
+        self.assertNotIn("09:05:00", page.text)  # Bob's swipe
+        self.assertIn("This was the other direction", page.text)
+        self.assertIn("Ignore this swipe", page.text)
+        self.assertIn('value="a-in"', page.text)
+        self.assertIn("Everything&#39;s correct", page.text)
+        self.assertIn('href="/privacy"', page.text)
+        self.assertIn('class="auth-panel"', page.text)
+        self.assertEqual(page.headers["Referrer-Policy"], "no-referrer")
+        self.assertEqual(self.client.head(f"/fix/{self.token}").status_code, 200)
+        self.assertEqual(self.database.fix_requests, {})
+        self.assertEqual(self.database.outbox, [])
+        self.assertIsNone(self.client.get_cookie("es_session"))
+
+    def test_expired_and_unknown_tokens_show_the_same_expired_page(self) -> None:
+        expired = self._link(self.asha, self.DAY, expires_at=_ist_now() - timedelta(minutes=1))
+        for token in ("not-a-real-token", expired):
+            for response in (self.client.get(f"/fix/{token}"), self._missed_in(token=token)):
+                self.assertEqual(response.status_code, 404)
+                self.assertIn("This link has expired or isn", response.text)
+                self.assertIn('href="/signin"', response.text)
+                self.assertEqual(response.headers["Referrer-Policy"], "no-referrer")
+        self.assertEqual(self.database.fix_requests, {})
+
+    def test_link_for_a_day_older_than_seven_days_is_expired(self) -> None:
+        old = self._link(self.asha, self.DAY - timedelta(days=7))
+        self.assertEqual(self.client.get(f"/fix/{old}").status_code, 404)
+
+    # --- Filing a fix -------------------------------------------------------
+
+    def test_missed_in_creates_a_pending_request_and_emails_hr_and_manager(self) -> None:
+        response = self._missed_in("13:40")
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], f"/fix/{self.token}?sent=1")
+        [request] = self._requests()
+        self.assertEqual((request["status"], request["source"], request["work_day"]),
+                         ("pending", "link", self.DAY))
+        self.assertTrue(request["punch_set_hash"])
+        [line] = self.database.fix_request(request["id"])["lines"]
+        self.assertEqual((line["kind"], line["event_time"], line["direction"]),
+                         ("add_in", datetime(2026, 10, 26, 13, 40), "entry"))
+        hr_mail, manager_mail = self.database.outbox
+        self.assertEqual(hr_mail["recipients"], ["hari@example.com"])
+        self.assertIn(f"https://hub.example.com/fixes/review/{request['id']}", hr_mail["text_body"])
+        self.assertIn("Missed swipe-in at 13:40", hr_mail["text_body"])
+        self.assertEqual(manager_mail["recipients"], ["meera@example.com"])
+        self.assertNotIn("/fixes/review/", manager_mail["text_body"])
+        self.assertNotIn("Review request", manager_mail["html_body"])
+        done = self.client.get(response.headers["Location"])
+        self.assertEqual(done.status_code, 200)
+        self.assertIn("Sent to HR", done.text)
+        self.assertIn("Missed swipe-in at 13:40", done.text)
+
+    def test_a_second_post_adds_a_line_and_sends_no_new_email(self) -> None:
+        self._missed_in("13:40")
+        self.assertEqual(len(self.database.outbox), 2)
+        page = self.client.get(f"/fix/{self.token}")
+        self.assertIn("Your report is with HR", page.text)
+        self.assertIn("Missed swipe-in at 13:40", page.text)
+        self.assertNotIn("Everything&#39;s correct", page.text)
+        response = self._post_link(flip="a-out", note="I went back in.")
+        self.assertEqual(response.status_code, 302)
+        [request] = self._requests()
+        lines = self.database.fix_request(request["id"])["lines"]
+        self.assertEqual([(l["kind"], l["target_fingerprint"], l["direction"]) for l in lines],
+                         [("add_in", None, "entry"), ("flip", "a-out", "entry")])
+        self.assertEqual(lines[1]["note"], "I went back in.")
+        self.assertEqual(len(self.database.outbox), 2)
+
+    def test_flip_and_ignore_targets_and_after_midnight_times(self) -> None:
+        self._post_link(ignore="a-in", **{"add-0-time": "01:30", "add-0-dir": "out"},
+                        token=self._link(self.asha, self.DAY - timedelta(days=1)))
+        # Day before: no punches of Asha's, so a-in is not hers that day.
+        self.assertEqual(self._requests(), [])
+        response = self._post_link(token=self._link(self.asha, self.DAY - timedelta(days=1)),
+                                   **{"add-0-time": "01:30", "add-0-dir": "out"})
+        self.assertEqual(response.status_code, 302)
+        [request] = self._requests()
+        [line] = self.database.fix_request(request["id"])["lines"]
+        # 01:30 on the 25th's work day is the early hours of the 26th.
+        self.assertEqual((line["kind"], line["event_time"]), ("add_out", datetime(2026, 10, 26, 1, 30)))
+
+    # --- Closing and reopening ----------------------------------------------
+
+    def test_everythings_correct_closes_the_day_and_notifies_nobody(self) -> None:
+        response = self._post_link(action="correct")
+        self.assertEqual(response.status_code, 302)
+        [request] = self._requests()
+        self.assertEqual(request["status"], "closed_correct")
+        self.assertEqual(self.database.outbox, [])
+        done = self.client.get(response.headers["Location"])
+        self.assertIn("we won't send more reminders for this day", done.text)
+        page = self.client.get(f"/fix/{self.token}")
+        self.assertIn("You told us everything on this day was correct", page.text)
+        self.assertIn("Actually, something&#39;s wrong", page.text)
+        self.assertNotIn('name="flip"', page.text)
+        reopened = self.client.get(f"/fix/{self.token}?report=1")
+        self.assertIn('name="flip"', reopened.text)
+        self._missed_in("13:40")
+        [request] = self._requests()
+        self.assertEqual(request["status"], "pending")
+        self.assertEqual(len(self.database.outbox), 2)
+
+    def test_i_left_for_the_day_closes_it(self) -> None:
+        self._post_link(action="left")
+        self.assertEqual(self._requests()[0]["status"], "closed_left")
+        self.assertIn("You told us you left for the day", self.client.get(f"/fix/{self.token}").text)
+
+    def test_closing_cannot_be_combined_with_fix_lines(self) -> None:
+        response = self._post_link(action="left", flip="a-out")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("press Send to HR", response.text)
+        self.assertIn('value="a-out" checked', response.text)
+        self.assertEqual(self._requests(), [])
+
+    # --- Decided days -------------------------------------------------------
+
+    def test_a_report_on_a_rejected_day_starts_a_new_linked_request(self) -> None:
+        self._missed_in("13:40")
+        [first] = self._requests()
+        line_id = self.database.fix_request(first["id"])["lines"][0]["id"]
+        self.database.decide_fix_lines(first["id"], [{"line_id": line_id, "status": "rejected"}],
+                                       actor_id=self.hari["id"], note="The reader shows you out until 15:00.")
+        page = self.client.get(f"/fix/{self.token}")
+        self.assertIn("Not approved", page.text)
+        self.assertIn("The reader shows you out until 15:00.", page.text)
+        self.assertIn("Report another problem", page.text)
+        self.assertNotIn('name="flip"', page.text)
+        self.assertIn('name="flip"', self.client.get(f"/fix/{self.token}?report=1").text)
+        self._missed_in("15:00")
+        first_again, second = sorted(self._requests(), key=lambda r: r["id"])
+        self.assertEqual(first_again["status"], "rejected")
+        self.assertEqual((second["status"], second["previous_request_id"]), ("pending", first["id"]))
+        self.assertEqual(len(self.database.outbox), 4)
+
+    # --- Token and ownership limits ------------------------------------------
+
+    def test_a_token_for_a_cannot_file_for_b_or_another_day(self) -> None:
+        response = self._missed_in("13:40", employee_id=str(self.bob["id"]), employee=str(self.bob["id"]),
+                                   work_day="2026-10-25", day="2026-10-25")
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(self._requests(self.bob), [])
+        [request] = self._requests()
+        self.assertEqual(request["work_day"], self.DAY)
+
+    def test_another_employees_fingerprint_is_rejected(self) -> None:
+        for field in ("flip", "ignore"):
+            response = self._post_link(**{field: "b-in"})
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("isn&#39;t on this day", response.text)
+        self.assertEqual(self.database.fix_requests, {})
+
+    def test_manager_and_hr_cannot_report_someone_elses_day(self) -> None:
+        for actor in (self.boss, self.hari):
+            self._sign_in(actor)
+            csrf = self._csrf()
+            url = f"/day/{self.DAY.isoformat()}/report"
+            self.assertEqual(self.client.get(f"{url}?employee={self.asha['id']}").status_code, 403)
+            response = self.client.post(f"{url}?employee={self.asha['id']}", data={
+                "csrf": csrf, "action": "send", "add-0-time": "13:40", "add-0-dir": "in"})
+            self.assertEqual(response.status_code, 403)
+            response = self.client.post(url, data={"csrf": csrf, "action": "send", "flip": "a-out",
+                                                   "employee": str(self.asha["id"])})
+            self.assertEqual(response.status_code, 403)
+            # Their own page: Asha's swipe is not theirs to flip.
+            response = self.client.post(url, data={"csrf": csrf, "action": "send", "flip": "a-out"})
+            self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.database.fix_requests, {})
+
+    def test_signed_in_report_lands_on_the_same_pending_request_as_the_link(self) -> None:
+        self._missed_in("13:40")
+        self._sign_in(self.asha)
+        url = f"/day/{self.DAY.isoformat()}/report"
+        page = self.client.get(url)
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("Your report is with HR", page.text)
+        self.assertIn('class="app-shell"', page.text)
+        response = self.client.post(url, data={"csrf": self._csrf(), "action": "send", "ignore": "a-in"})
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], f"{url}?sent=1")
+        [request] = self._requests()
+        self.assertEqual(len(self.database.fix_request(request["id"])["lines"]), 2)
+        self.assertEqual(len(self.database.outbox), 2)
+        self.assertIn("Sent to HR", self.client.get(response.headers["Location"]).text)
+
+    def test_signed_in_report_needs_csrf_and_a_recent_own_day(self) -> None:
+        self._sign_in(self.asha)
+        url = f"/day/{self.DAY.isoformat()}/report"
+        self.assertEqual(self.client.post(url, data={"action": "correct"}).status_code, 400)
+        for day in ("2026-10-19", "2026-10-27", "not-a-date"):
+            self.assertEqual(self.client.get(f"/day/{day}/report").status_code, 404, day)
+        self.assertEqual(self.client.get("/day/2026-10-20/report").status_code, 200)
+        self.client.post("/signout")
+        self.assertEqual(self.client.get(url).status_code, 302)
+
+    # --- Validation limits --------------------------------------------------
+
+    def test_future_and_malformed_times_are_form_errors(self) -> None:
+        for value, message in (("19:30", "hasn&#39;t happened yet"), ("03:00", "hasn&#39;t happened yet"),
+                               ("25:10", "Enter a time like 13:40"), ("noon", "Enter a time like 13:40")):
+            response = self._missed_in(value)
+            self.assertEqual(response.status_code, 400, value)
+            self.assertIn(message, response.text)
+            self.assertIn('id="f-add-0-time"', response.text)
+            self.assertRegex(response.text, r'id="f-add-0-time"[^>]*aria-invalid="true"')
+        response = self._post_link(**{"add-0-time": "13:40"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Choose In or Out", response.text)
+        self.assertEqual(self.database.fix_requests, {})
+
+    def test_note_over_500_characters_is_a_form_error(self) -> None:
+        response = self._missed_in("13:40", note="x" * 501)
+        self.assertEqual(response.status_code, 400)
+        self.assertRegex(response.text, r'id="f-note"[^>]*aria-invalid="true"')
+        self.assertEqual(self.database.fix_requests, {})
+
+    def test_an_eleventh_line_is_refused(self) -> None:
+        ten = {}
+        for i in range(10):
+            ten.update({f"add-{i}-time": f"{10 + i // 2}:{(i % 2) * 30:02d}", f"add-{i}-dir": "in" if i % 2 else "out"})
+        self.assertEqual(self._post_link(**ten).status_code, 302)
+        response = self._missed_in("17:00")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("at most 10 changes", response.text)
+        [request] = self._requests()
+        self.assertEqual(len(self.database.fix_request(request["id"])["lines"]), 10)
+
+    def test_an_eleventh_post_from_one_ip_in_a_minute_is_refused(self) -> None:
+        for _ in range(10):
+            self.assertEqual(self._post_link().status_code, 400)
+        response = self._post_link()
+        self.assertEqual(response.status_code, 429)
+        other_ip = self.client.post(f"/fix/{self.token}", data={"action": "send"},
+                                    environ_base={"REMOTE_ADDR": "10.0.0.9"})
+        self.assertEqual(other_ip.status_code, 400)
+
+    # --- Approver fallback --------------------------------------------------
+
+    def test_with_no_hr_user_the_request_email_goes_to_the_admins(self) -> None:
+        self.database.set_employee_role(self.hari["id"], "employee")
+        self._missed_in("13:40")
+        hr_mail, manager_mail = self.database.outbox
+        self.assertEqual(hr_mail["recipients"], ["ada@example.com"])
+        self.assertIn("/fixes/review/", hr_mail["text_body"])
+        self.assertEqual(manager_mail["recipients"], ["meera@example.com"])
+
+    def test_hr_requester_is_not_emailed_about_their_own_request(self) -> None:
+        token = self._link(self.hari, self.DAY)
+        self._post_link(token=token, **{"add-0-time": "10:00", "add-0-dir": "in"})
+        [hr_mail] = self.database.outbox
+        self.assertEqual(hr_mail["recipients"], ["ada@example.com"])
+
+    # --- Privacy and the day view -------------------------------------------
+
+    def test_privacy_page_renders_signed_out(self) -> None:
+        page = self.client.get("/privacy")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("How we use attendance data", page.text)
+        self.assertIn("never used for discipline", page.text)
+        self.assertIn("90 days", page.text)
+
+    def test_report_link_shows_on_own_recent_day_only(self) -> None:
+        self._sign_in(self.asha)
+        link = f'href="/day/{self.DAY.isoformat()}/report"'
+        self.assertIn(link, self.client.get(f"/day?date={self.DAY.isoformat()}").text)
+        self.assertIn('href="/day/2026-10-20/report"', self.client.get("/day?date=2026-10-20").text)
+        self.assertNotIn("Report a problem", self.client.get("/day?date=2026-10-19").text)
+        self._sign_in(self.boss)
+        other = self.client.get(f"/day?employee={self.asha['id']}&date={self.DAY.isoformat()}")
+        self.assertEqual(other.status_code, 200)
+        self.assertNotIn("Report a problem", other.text)
+        self.assertIn("Report a problem", self.client.get("/day").text)
+
+    def test_access_logs_redact_the_report_token(self) -> None:
+        import logging
+
+        records = []
+
+        class _Keep(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        logger = logging.getLogger("werkzeug")
+        handler = _Keep()
+        logger.addHandler(handler)
+        self.addCleanup(logger.removeHandler, handler)
+        previous = logger.level
+        logger.setLevel(logging.INFO)
+        self.addCleanup(logger.setLevel, previous)
+        logger.info('%s - - "%s" %s', "127.0.0.1", f"GET /fix/{self.token}?sent=1 HTTP/1.1", 200)
+        [record] = records
+        self.assertNotIn(self.token, record.getMessage())
+        self.assertIn("/fix/[redacted]?sent=1", record.getMessage())
+
+    def test_a_crash_on_the_link_logs_no_token(self) -> None:
+        # Flask's own "Exception on <path>" line, logged when nothing re-raises.
+        self.app.testing = False
+        with patch.object(self.database, "file_fix_lines", side_effect=RuntimeError("boom")), \
+                self.assertLogs("essl_hub.web", level="ERROR") as captured:
+            response = self._missed_in("13:40")
+        self.assertEqual(response.status_code, 500)
+        messages = [record.getMessage() for record in captured.records]
+        self.assertTrue(any("/fix/[redacted]" in message for message in messages), messages)
+        self.assertFalse(any(self.token in message for message in messages))
+
+    # --- Robustness ---------------------------------------------------------
+
+    def test_a_failed_notification_still_lands_on_sent(self) -> None:
+        with patch.object(self.database, "enqueue_mail", side_effect=RuntimeError("smtp down")), \
+                self.assertLogs("essl_hub.routes.fixes", level="ERROR"):
+            response = self._missed_in("13:40")
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], f"/fix/{self.token}?sent=1")
+        [request] = self._requests()
+        self.assertEqual(request["status"], "pending")
+        self.assertEqual(len(self.database.fix_request(request["id"])["lines"]), 1)
+
+    def test_sending_the_same_form_twice_files_one_line(self) -> None:
+        for _ in range(2):
+            self.assertEqual(self._missed_in("13:40", flip="a-out").status_code, 302)
+        [request] = self._requests()
+        lines = self.database.fix_request(request["id"])["lines"]
+        self.assertEqual([(l["kind"], l["target_fingerprint"]) for l in lines],
+                         [("add_in", None), ("flip", "a-out")])
+        self.assertEqual(len(self.database.outbox), 2)  # HR and manager, once
+
+    def test_the_twenty_first_post_to_one_link_in_an_hour_is_refused(self) -> None:
+        for n in range(20):
+            response = self.client.post(f"/fix/{self.token}", data={"action": "send"},
+                                        environ_base={"REMOTE_ADDR": f"10.0.1.{n}"})
+            self.assertEqual(response.status_code, 400)
+        response = self.client.post(f"/fix/{self.token}", data={"action": "send"},
+                                    environ_base={"REMOTE_ADDR": "10.0.2.1"})
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.headers["Retry-After"], "60")
+        other = self._link(self.bob, self.DAY)
+        response = self.client.post(f"/fix/{other}", data={"action": "send"},
+                                    environ_base={"REMOTE_ADDR": "10.0.2.2"})
+        self.assertEqual(response.status_code, 400)
+
+    def test_sliding_window_frees_hits_once_they_age_out(self) -> None:
+        from essl_hub import rate_limit
+
+        clock = [1000.0]
+        window = rate_limit.SlidingWindow(2, 60)
+        with patch.object(rate_limit._clock, "monotonic", side_effect=lambda: clock[0]):
+            self.assertTrue(window.allow("k"))
+            clock[0] += 30
+            self.assertTrue(window.allow("k"))
+            self.assertFalse(window.allow("k"))
+            self.assertTrue(window.allow("other"))
+            clock[0] += 30  # the first hit is now exactly 60 s old
+            self.assertTrue(window.allow("k"))
+            self.assertFalse(window.allow("k"))
+            clock[0] += 61
+            self.assertTrue(window.allow("k"))
+            self.assertTrue(window.allow("k"))
+
+
+class FixReviewTest(unittest.TestCase):
+    """U8: the HR review page, confirm-then-apply, and the sign-in deep link."""
+
+    DAY = datetime(2026, 10, 26).date()
+    NOW = datetime(2026, 10, 26, 18, 0)
+
+    def setUp(self) -> None:
+        self.app, self.database = _make_app()
+        self.client = self.app.test_client()
+        from essl_hub import mail as mail_module
+
+        self.captured = {}
+        original = mail_module.send_login_code
+        mail_module.send_login_code = lambda e, c: self.captured.update(code=c)
+        self.addCleanup(lambda: setattr(mail_module, "send_login_code", original))
+        for patcher in (*_fixed_now(self.NOW), patch.dict(os.environ, {"ESSL_PUBLIC_URL": "https://hub.example.com"})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.asha = self._person("118", "Asha Rao")
+        self.boss = self._person("200", "Meera Boss", "manager")
+        self.hari = self._person("300", "Hari HR", "hr")
+        self.admin = self._person("400", "Ada Admin", "admin")
+        self.database.set_employee_manager(self.asha["id"], self.boss["id"])
+        # 09:00-13:00, then an Out at 17:00 with no In before it: 4h 00m.
+        self.database.insert_punches([
+            _punch_row("a-in", datetime(2026, 10, 26, 9, 0), "entry", uid="118"),
+            _punch_row("a-out", datetime(2026, 10, 26, 13, 0), "exit", uid="118"),
+            _punch_row("a-last", datetime(2026, 10, 26, 17, 0), "exit", uid="118"),
+        ])
+
+    def _person(self, uid: str, name: str, role: str = "employee") -> dict:
+        email = f"{name.split()[0].lower()}@example.com"
+        self.database.upsert_employee(device_user_id=uid, name=name, email=email)
+        person = self.database.employee_by_email(email)
+        self.database.set_employee_role(person["id"], role)
+        return person
+
+    def _sign_in(self, person: dict, client=None) -> None:
+        client = client or self.client
+        client.post("/signout")
+        client.post("/signin", data={"email": person["email"]})
+        client.post("/signin/verify", data={"code": self.captured["code"]})
+
+    def _csrf(self, client=None) -> str:
+        html = (client or self.client).get("/day").text
+        marker = 'name="csrf-token" content="'
+        start = html.index(marker) + len(marker)
+        return html[start : html.index('"', start)]
+
+    def _file(self, *lines, person=None) -> int:
+        from essl_hub.db import device_ids_of
+        from essl_hub.routes.fixes import punch_set_hash
+
+        person = person or self.asha
+        start, end = datetime(2026, 10, 26, 6), datetime(2026, 10, 27, 6)
+        rows = self.database.punches_for_employee_range(device_ids_of(person), start, end)
+        lines = lines or ({"kind": "add_in", "event_time": datetime(2026, 10, 26, 13, 40)},)
+        return self.database.file_fix_lines(person["id"], self.DAY, list(lines), source="link",
+                                            punch_set_hash=punch_set_hash(rows))["request_id"]
+
+    def _lines(self, request_id: int) -> list[dict]:
+        return self.database.fix_request(request_id)["lines"]
+
+    def _approve_all(self, request_id: int) -> dict:
+        form = {}
+        for line in self._lines(request_id):
+            form[f"line-{line['id']}-decision"] = "approved"
+            if line["kind"] in ("add_in", "add_out"):
+                form[f"line-{line['id']}-time"] = line["event_time"].strftime("%H:%M")
+            if line["kind"] != "ignore":
+                form[f"line-{line['id']}-dir"] = {"entry": "in", "exit": "out"}.get(line["direction"], "in")
+        return form
+
+    def _post(self, request_id: int, form: dict, step: str = "", client=None):
+        client = client or self.client
+        return client.post(f"/fixes/review/{request_id}{step}",
+                           data={"csrf": self._csrf(client), **form})
+
+    def _flash(self, client=None) -> str:
+        return (client or self.client).get("/fixes/review").text
+
+    def _decision_mail(self) -> dict:
+        mails = [m for m in self.database.outbox if m["recipients"] == ["asha@example.com"]]
+        self.assertEqual(len(mails), 1)
+        return mails[0]
+
+    # --- Approving ----------------------------------------------------------
+
+    def test_approving_a_missed_in_corrects_hours_audits_and_emails(self) -> None:
+        request_id = self._file()
+        self._sign_in(self.hari)
+        detail = self.client.get(f"/fixes/review/{request_id}")
+        self.assertEqual(detail.status_code, 200)
+        self.assertIn("Missed swipe-in at 13:40", detail.text)
+        self.assertIn("Waiting for review", detail.text)
+        self.assertIn("17:00:00", detail.text)
+        self.assertIn('value="approved" checked', detail.text)
+        self.assertNotIn("Day changed since report", detail.text)
+        form = self._approve_all(request_id)
+        preview = self._post(request_id, form)
+        self.assertEqual(preview.status_code, 200)
+        self.assertIn("Confirm decision", preview.text)
+        self.assertIn("4h 00m", preview.text)
+        self.assertIn("7h 20m", preview.text)
+        self.assertEqual(self.database.corrections, [])  # the preview writes nothing
+        response = self._post(request_id, form, "/confirm")
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.headers["Location"].endswith("/fixes/review"))
+        self.assertIn("Saved. 1 line approved, 0 rejected.", self._flash())
+        [correction] = self.database.corrections
+        self.assertEqual((correction["kind"], correction["event_timestamp"], correction["direction"]),
+                         ("add", datetime(2026, 10, 26, 13, 40), "entry"))
+        self.assertEqual(self.database.fix_request(request_id)["status"], "approved")
+        approved = [e for e in self.database.fix_request_events(request_id) if e["kind"] == "line_approved"]
+        self.assertEqual([e["actor_name"] for e in approved], ["Hari HR"])
+        mail = self._decision_mail()
+        self.assertIn("was approved", mail["subject"])
+        self.assertIn("Missed swipe-in at 13:40: approved", mail["text_body"])
+        self.assertIn("https://hub.example.com/day?date=2026-10-26", mail["text_body"])
+        day = self.client.get(f"/day?employee={self.asha['id']}&date=2026-10-26").text
+        self.assertIn("7h 20m", day)
+        self.assertIn("added by HR", day)
+
+    def test_hr_edit_of_the_time_is_applied_and_audited_with_both_values(self) -> None:
+        request_id = self._file()
+        self._sign_in(self.hari)
+        form = {**self._approve_all(request_id), f"line-{self._lines(request_id)[0]['id']}-time": "13:35"}
+        preview = self._post(request_id, form)
+        self.assertIn("Missed swipe-in at 13:35", preview.text)
+        self.assertIn("Employee asked: Missed swipe-in at 13:40", preview.text)
+        self.assertIn("7h 25m", preview.text)
+        self.assertEqual(self._post(request_id, form, "/confirm").status_code, 302)
+        [correction] = self.database.corrections
+        self.assertEqual(correction["event_timestamp"], datetime(2026, 10, 26, 13, 35))
+        [line] = self._lines(request_id)
+        self.assertEqual(line["hr_event_time"], datetime(2026, 10, 26, 13, 35))
+        [event] = [e for e in self.database.fix_request_events(request_id) if e["kind"] == "line_approved"]
+        self.assertEqual(event["old_value"]["event_time"], datetime(2026, 10, 26, 13, 40))
+        self.assertEqual(event["new_value"]["correction"]["event_timestamp"], datetime(2026, 10, 26, 13, 35))
+        self.assertIn("Missed swipe-in at 13:35: approved", self._decision_mail()["text_body"])
+
+    def test_change_decisions_returns_to_the_form_with_the_edits(self) -> None:
+        request_id = self._file()
+        self._sign_in(self.hari)
+        line_id = self._lines(request_id)[0]["id"]
+        form = {**self._approve_all(request_id), f"line-{line_id}-time": "13:35", "action": "edit"}
+        page = self._post(request_id, form)
+        self.assertEqual(page.status_code, 200)
+        self.assertIn('value="13:35"', page.text)
+        self.assertEqual(self.database.corrections, [])
+
+    def test_day_changed_since_report_warns_and_still_approves(self) -> None:
+        request_id = self._file()
+        self.database.insert_punches([_punch_row("a-new", datetime(2026, 10, 26, 15, 0), "entry", uid="118")])
+        self._sign_in(self.hari)
+        self.assertIn("Day changed since report", self.client.get(f"/fixes/review/{request_id}").text)
+        self.assertEqual(self._post(request_id, self._approve_all(request_id), "/confirm").status_code, 302)
+        self.assertEqual(self.database.fix_request(request_id)["status"], "approved")
+        self.assertNotIn("Day changed since report", self.client.get(f"/fixes/review/{request_id}").text)
+
+    def test_a_line_whose_swipe_is_gone_is_flagged(self) -> None:
+        request_id = self._file({"kind": "flip", "target_fingerprint": "a-last", "direction": "entry",
+                                 "event_time": datetime(2026, 10, 26, 17, 0)})
+        self.database.punches = [p for p in self.database.punches if p["fingerprint"] != "a-last"]
+        self._sign_in(self.hari)
+        self.assertIn("The swipe this line points to no longer exists",
+                      self.client.get(f"/fixes/review/{request_id}").text)
+
+    def test_bad_time_and_long_note_rerender_the_form(self) -> None:
+        request_id = self._file()
+        self._sign_in(self.hari)
+        line_id = self._lines(request_id)[0]["id"]
+        bad = self._post(request_id, {**self._approve_all(request_id), f"line-{line_id}-time": "25:99"})
+        self.assertEqual(bad.status_code, 400)
+        self.assertIn("Enter a time like 13:40.", bad.text)
+        long_note = self._post(request_id, {**self._approve_all(request_id), "note": "x" * 501}, "/confirm")
+        self.assertEqual(long_note.status_code, 400)
+        self.assertIn("Keep the note to 500 characters", long_note.text)
+        self.assertEqual(self.database.corrections, [])
+
+    # --- Rejecting ----------------------------------------------------------
+
+    def test_reject_needs_a_note_and_the_note_reaches_the_employee(self) -> None:
+        request_id = self._file()
+        self._sign_in(self.hari)
+        line_id = self._lines(request_id)[0]["id"]
+        form = {f"line-{line_id}-decision": "rejected", f"line-{line_id}-time": "13:40", f"line-{line_id}-dir": "in"}
+        for step in ("", "/confirm"):
+            refused = self._post(request_id, form, step)
+            self.assertEqual(refused.status_code, 400)
+            self.assertIn("Add a note for the employee", refused.text)
+        self.assertEqual(self.database.fix_request(request_id)["status"], "pending")
+        form["note"] = "The reader log shows you outside until 15:00."
+        self.assertEqual(self._post(request_id, form, "/confirm").status_code, 302)
+        self.assertIn("Saved. 0 lines approved, 1 rejected.", self._flash())
+        self.assertEqual(self.database.corrections, [])
+        self.assertEqual(self.database.fix_request(request_id)["status"], "rejected")
+        # Alert suppression reads the day's request statuses: rejected never re-alerts.
+        self.assertEqual(self.database.fix_request_days([self.asha["id"]], self.DAY, self.DAY),
+                         {(self.asha["id"], self.DAY): ["rejected"]})
+        mail = self._decision_mail()
+        self.assertIn("wasn't approved", mail["subject"])
+        self.assertIn("The reader log shows you outside until 15:00.", mail["text_body"])
+
+    def test_mixed_decisions_give_partial(self) -> None:
+        request_id = self._file({"kind": "add_in", "event_time": datetime(2026, 10, 26, 13, 40)},
+                                {"kind": "ignore", "target_fingerprint": "a-in",
+                                 "event_time": datetime(2026, 10, 26, 9, 0)})
+        self._sign_in(self.hari)
+        add, ignore = self._lines(request_id)
+        form = {**self._approve_all(request_id), f"line-{ignore['id']}-decision": "rejected", "note": "Keep 09:00."}
+        self.assertEqual(self._post(request_id, form, "/confirm").status_code, 302)
+        self.assertEqual(self.database.fix_request(request_id)["status"], "partial")
+        self.assertEqual([c["kind"] for c in self.database.corrections], ["add"])
+        self.assertIn("Saved. 1 line approved, 1 rejected.", self._flash())
+        self.assertIn("partly approved", self._decision_mail()["subject"])
+
+    # --- Who can approve ----------------------------------------------------
+
+    def test_hr_sees_their_own_request_read_only(self) -> None:
+        self.database.insert_punches([_punch_row("h-in", datetime(2026, 10, 26, 9, 0), "entry", uid="300")])
+        request_id = self._file(person=self.hari)
+        self._sign_in(self.hari)
+        page = self.client.get(f"/fixes/review/{request_id}")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("This is your own request", page.text)
+        self.assertNotIn('name="line-', page.text)
+        form = self._approve_all(request_id)
+        self.assertEqual(self._post(request_id, form).status_code, 403)
+        self.assertEqual(self._post(request_id, form, "/confirm").status_code, 403)
+        self.assertEqual(self.database.corrections, [])
+        # Hari is the only HR user, so the admin decides it.
+        self._sign_in(self.admin)
+        self.assertIn('name="line-', self.client.get(f"/fixes/review/{request_id}").text)
+        self.assertEqual(self._post(request_id, form, "/confirm").status_code, 302)
+        self.assertEqual(self.database.fix_request(request_id)["status"], "approved")
+
+    def test_admin_cannot_approve_while_another_hr_user_exists(self) -> None:
+        request_id = self._file()
+        self._sign_in(self.admin)
+        page = self.client.get(f"/fixes/review/{request_id}")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("Admins approve only when no HR user", page.text)
+        self.assertNotIn('name="line-', page.text)
+        self.assertEqual(self._post(request_id, self._approve_all(request_id), "/confirm").status_code, 403)
+        self.assertEqual(self.database.fix_request(request_id)["status"], "pending")
+
+    def test_admin_never_approves_their_own_request(self) -> None:
+        self.database.set_employee_role(self.hari["id"], "employee")
+        request_id = self._file(person=self.admin)
+        self._sign_in(self.admin)
+        self.assertIn("This is your own request", self.client.get(f"/fixes/review/{request_id}").text)
+        self.assertEqual(self._post(request_id, self._approve_all(request_id), "/confirm").status_code, 403)
+
+    def test_managers_and_employees_get_403(self) -> None:
+        request_id = self._file()
+        for person in (self.boss, self.asha):
+            self._sign_in(person)
+            csrf = self._csrf()
+            self.assertEqual(self.client.get("/fixes/review").status_code, 403)
+            self.assertEqual(self.client.get(f"/fixes/review/{request_id}").status_code, 403)
+            for step in ("", "/confirm"):
+                response = self.client.post(f"/fixes/review/{request_id}{step}",
+                                            data={"csrf": csrf, **self._approve_all(request_id)})
+                self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.database.corrections, [])
+
+    def test_confirm_needs_csrf(self) -> None:
+        request_id = self._file()
+        self._sign_in(self.hari)
+        response = self.client.post(f"/fixes/review/{request_id}/confirm", data=self._approve_all(request_id))
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.database.corrections, [])
+
+    # --- Concurrency --------------------------------------------------------
+
+    def test_two_hr_users_confirming_the_same_line_make_one_correction(self) -> None:
+        gita = self._person("301", "Gita HR", "hr")
+        request_id = self._file()
+        other = self.app.test_client()
+        self._sign_in(self.hari)
+        self._sign_in(gita, client=other)
+        form = self._approve_all(request_id)
+        self.assertEqual(self._post(request_id, form, "/confirm").status_code, 302)
+        self.assertEqual(self._post(request_id, form, "/confirm", client=other).status_code, 302)
+        self.assertEqual(len(self.database.corrections), 1)
+        page = self._flash(client=other)
+        self.assertIn("Nothing was saved.", page)
+        self.assertIn("already decided by Hari HR", page)
+        self.assertEqual(len([m for m in self.database.outbox if m["recipients"] == ["asha@example.com"]]), 1)
+
+    # --- List and nav -------------------------------------------------------
+
+    def test_list_shows_pending_then_decisions_and_empty_states(self) -> None:
+        self._sign_in(self.hari)
+        page = self.client.get("/fixes/review").text
+        self.assertIn("No fix requests waiting.", page)
+        self.assertIn("No decisions yet.", page)
+        request_id = self._file()
+        page = self.client.get("/fixes/review").text
+        self.assertIn("Asha Rao", page)
+        self.assertIn(f'href="/fixes/review/{request_id}"', page)
+        self.assertIn("Waiting for review", page)
+        self.assertNotIn("No fix requests waiting.", page)
+        self._post(request_id, self._approve_all(request_id), "/confirm")
+        page = self.client.get("/fixes/review").text
+        self.assertIn("No fix requests waiting.", page)
+        self.assertIn('class="chip chip-ok">Approved</span>', page)
+
+    def test_nav_badge_counts_pending_requests_for_hr_and_admin(self) -> None:
+        self._file()
+        self.database.insert_punches([_punch_row("h-in", datetime(2026, 10, 26, 9, 0), "entry", uid="300")])
+        self._file(person=self.hari)
+        for person in (self.hari, self.admin):
+            self._sign_in(person)
+            nav = self.client.get("/day").text.split('<nav aria-label="Main">')[1].split("</nav>")[0]
+            self.assertIn('aria-label="Fix requests, 2 pending"', nav)
+            self.assertIn('aria-hidden="true">2</span>', nav)
+        self._sign_in(self.asha)
+        self.assertNotIn("Fix requests", self.client.get("/day").text)
+
+    # --- Sign-in deep link --------------------------------------------------
+
+    def test_signed_out_hr_follows_the_email_link_to_the_request(self) -> None:
+        request_id = self._file()
+        path = f"/fixes/review/{request_id}"
+        response = self.client.get(path)
+        self.assertEqual(response.status_code, 302)
+        signin_url = response.headers["Location"]
+        self.assertIn("/signin?next=", signin_url)
+        self.assertIn(f'name="next" value="{path}"', self.client.get(signin_url).text)
+        code_page = self.client.post("/signin", data={"email": self.hari["email"], "next": path})
+        self.assertIn(f'name="next" value="{path}"', code_page.text)
+        verify = self.client.post("/signin/verify", data={"code": self.captured["code"], "next": path})
+        self.assertEqual(verify.status_code, 302)
+        self.assertEqual(verify.headers["Location"], path)
+        self.assertIn("Missed swipe-in at 13:40", self.client.get(path).text)
+
+    def test_off_site_next_is_ignored(self) -> None:
+        for target in ("https://evil.example.com/x", "//evil.example.com/x", "/\t/evil.example.com"):
+            with self.subTest(target=target):
+                self.client.post("/signout")
+                page = self.client.get("/signin", query_string={"next": target}).text
+                self.assertNotIn('name="next"', page)
+                self.client.post("/signin", data={"email": self.hari["email"], "next": target})
+                verify = self.client.post("/signin/verify", data={"code": self.captured["code"], "next": target})
+                self.assertEqual(verify.status_code, 302)
+                self.assertEqual(verify.headers["Location"], "/team")
+
+    def test_wrong_code_keeps_next_and_the_right_code_then_lands_on_it(self) -> None:
+        path = f"/fixes/review/{self._file()}"
+        self.client.post("/signin", data={"email": self.hari["email"], "next": path})
+        code = self.captured["code"]
+        wrong = "0" * len(code) if code != "0" * len(code) else "1" * len(code)
+        page = self.client.post("/signin/verify", data={"code": wrong, "next": path})
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("That code is not correct", page.text)
+        self.assertIn(f'name="next" value="{path}"', page.text)
+        verify = self.client.post("/signin/verify", data={"code": code, "next": path})
+        self.assertEqual(verify.status_code, 302)
+        self.assertEqual(verify.headers["Location"], path)
+
+    def test_signed_in_visit_to_signin_with_next_goes_there(self) -> None:
+        self._sign_in(self.hari)
+        response = self.client.get("/signin", query_string={"next": "/fixes/review"})
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], "/fixes/review")
+
+    def test_signed_out_post_redirects_to_plain_signin(self) -> None:
+        request_id = self._file()
+        response = self.client.post(f"/fixes/review/{request_id}/confirm",
+                                    data=self._approve_all(request_id))
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], "/signin")
+        self.assertEqual(self.database.fix_request(request_id)["status"], "pending")
+
+    def test_deep_link_keeps_its_query_string(self) -> None:
+        response = self.client.get("/day", query_string={"date": "2026-10-20"})
+        self.assertEqual(response.status_code, 302)
+        signin_url = response.headers["Location"]
+        self.assertIn("next=", signin_url)
+        target = "/day?date=2026-10-20"
+        self.assertIn(f'name="next" value="{target}"', self.client.get(signin_url).text)
+        self.client.post("/signin", data={"email": self.hari["email"], "next": target})
+        verify = self.client.post("/signin/verify", data={"code": self.captured["code"], "next": target})
+        self.assertEqual(verify.headers["Location"], target)
+
+    def test_a_failed_decision_email_still_saves_and_redirects(self) -> None:
+        request_id = self._file()
+        self._sign_in(self.hari)
+        form = self._approve_all(request_id)
+        with patch.object(self.database, "enqueue_mail", side_effect=RuntimeError("smtp down")), \
+                self.assertLogs("essl_hub.routes.fixes", level="ERROR"):
+            response = self._post(request_id, form, "/confirm")
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.headers["Location"].endswith("/fixes/review"))
+        self.assertEqual(self.database.fix_request(request_id)["status"], "approved")
+        self.assertIn("Saved. 1 line approved, 0 rejected.", self._flash())

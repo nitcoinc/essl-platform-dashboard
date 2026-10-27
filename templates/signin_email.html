@@ -7,6 +7,7 @@
 </div>
 {% if bot_error %}<div class="auth-error" role="alert">{{ ui.icon('circle-alert') }}<span>{{ bot_error }}</span></div>{% endif %}
 <form method="post" action="{{ url_for('auth.signin_submit') }}">
+  {% if next %}<input type="hidden" name="next" value="{{ next }}">{% endif %}
   {{ ui.field('email', 'Work email', email or '', type='email', required=True, error=error, attrs='autocomplete="email" autofocus spellcheck="false"') }}
   {% if turnstile_site_key %}<div class="cf-turnstile auth-turnstile" data-sitekey="{{ turnstile_site_key }}" data-theme="auto"></div>{% endif %}
   {{ ui.button('Send code', 'primary', type='submit') }}

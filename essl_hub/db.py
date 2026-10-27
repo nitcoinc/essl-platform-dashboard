@@ -6,19 +6,79 @@ import os
 import re
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Iterable, Iterator
 from zoneinfo import ZoneInfo
 
 import libsql
 
 from .config import C3_PROTOCOL, DeviceConfig, TIMEZONE_NAME, db_path
+from .db_alerts import (
+    ALERT_KINDS,
+    ALERT_LIVE,
+    ALERT_MODES,
+    ALERT_MORNING,
+    ALERT_RETENTION_DAYS,
+    ALERT_STATUSES,
+    BASELINE_SNAPSHOTS_KEPT,
+    MAIL_MAX_ATTEMPTS,
+    MAIL_RETENTION_DAYS,
+    MAIL_RETRY_BASE,
+    MAIL_RETRY_MAX,
+    STATUS_BREAKER,
+    STATUS_FAILED,
+    STATUS_QUEUED,
+    STATUS_RECORDED,
+    STATUS_SENT,
+    AlertsMixin,
+    mail_retry_delay,
+)
+from .db_fixes import (
+    DIRECTIONS,
+    FIX_ADD_KINDS,
+    FIX_CLOSED_STATUSES,
+    FIX_DECIDED_STATUSES,
+    FIX_EVENT_KINDS,
+    FIX_LINE_KINDS,
+    FIX_MAX_LINES,
+    FIX_NOTE_MAX_CHARS,
+    FIX_SOURCES,
+    OPPOSITE_DIRECTION,
+    FixesMixin,
+)
+from .hours import apply_corrections
+
+# Layout: this module is the core (connection and transaction machinery,
+# type conversion, schema and MIGRATIONS, errors, devices, punches and their
+# correction overlay, employees, sign-in). The missed-punch alert tables live
+# in db_alerts (AlertsMixin) and fix requests in db_fixes (FixesMixin); both
+# are mixed into Database below. They never import this module at import time
+# (only inside functions), so the import graph stays acyclic. Their constants
+# are re-exported here, so ``from .db import ...`` keeps working.
+__all__ = [
+    # Core.
+    "BUSY_TIMEOUT_MS", "C3_UNDECODED_BYTE", "DATE_COLUMNS", "DEFAULT_DAY_START_HOUR",
+    "DEFAULT_TARGET_MINUTES", "DEVICE_CHANGE_KINDS", "DUPLICATE_WINDOW_MAX", "FRAPPE_GUESS_HOLD",
+    "JSON_COLUMNS", "MIGRATIONS", "PUNCH_INSERT_BATCH", "PUNCH_TX_ROWS", "SCHEMA_STATEMENTS",
+    "SCHEMA_VERSION", "SETUP_COMMANDS", "TIMESTAMP_COLUMNS", "TIMESTAMP_FORMAT",
+    "BusyError", "Database", "DatabaseMissing", "FixLineLimit", "IntegrityError", "OfflineError",
+    "RuleViolation", "classify_error", "device_ids_of", "reports_message",
+    # Re-exported from db_alerts.
+    "ALERT_KINDS", "ALERT_LIVE", "ALERT_MODES", "ALERT_MORNING", "ALERT_RETENTION_DAYS",
+    "ALERT_STATUSES", "BASELINE_SNAPSHOTS_KEPT", "MAIL_MAX_ATTEMPTS", "MAIL_RETENTION_DAYS",
+    "MAIL_RETRY_BASE", "MAIL_RETRY_MAX", "STATUS_BREAKER", "STATUS_FAILED", "STATUS_QUEUED",
+    "STATUS_RECORDED", "STATUS_SENT", "AlertsMixin", "mail_retry_delay",
+    # Re-exported from db_fixes.
+    "DIRECTIONS", "FIX_ADD_KINDS", "FIX_CLOSED_STATUSES", "FIX_DECIDED_STATUSES",
+    "FIX_EVENT_KINDS", "FIX_LINE_KINDS", "FIX_MAX_LINES", "FIX_NOTE_MAX_CHARS", "FIX_SOURCES",
+    "OPPOSITE_DIRECTION", "FixesMixin",
+]
 
 _TZ = ZoneInfo(TIMEZONE_NAME)
 _logger = logging.getLogger(__name__)
 
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # libsql exposes no declared column types (U8), so read-side conversion is by
 # column name. Every TIMESTAMP column in the schema is listed here.
@@ -43,6 +103,12 @@ TIMESTAMP_COLUMNS = frozenset(
         "door_params_previous_for",
         "door_params_requested_at",
         "policy_updated_at",
+        "computed_at",
+        "next_attempt_at",
+        "sent_at",
+        "decided_at",
+        "event_time",
+        "hr_event_time",
     }
 )
 JSON_COLUMNS = frozenset(
@@ -54,12 +120,21 @@ JSON_COLUMNS = frozenset(
         "door_params_result",
         "old_value",
         "new_value",
+        "metrics",
+        "recipients",
+        "detail",
     }
 )
+# Work days (v8) are stored as ISO 'YYYY-MM-DD' text and read back as dates.
+DATE_COLUMNS = frozenset({"work_day"})
 
 
 class RuleViolation(ValueError):
     """A guarded write broke a data rule (last admin, manager cycle)."""
+
+
+class FixLineLimit(RuleViolation):
+    """A fix request would hold more than FIX_MAX_LINES lines (KTD7)."""
 
 
 class IntegrityError(Exception):
@@ -127,11 +202,14 @@ def _adapt_datetime(value: datetime) -> str:
 
 
 def _bind(params: Iterable[object]) -> tuple[object, ...]:
-    """libsql has no adapters (KTD5): format datetimes and serialise dicts here."""
+    """libsql has no adapters (KTD5): format datetimes and dates and serialise
+    dicts here. datetime subclasses date, so it is checked first."""
     bound = []
     for value in params:
         if isinstance(value, datetime):
             value = _adapt_datetime(value)
+        elif isinstance(value, date):
+            value = value.isoformat()
         elif isinstance(value, dict):
             value = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
         bound.append(value)
@@ -149,6 +227,11 @@ def _convert(name: str, value: object) -> object:
     if name in JSON_COLUMNS:
         try:
             return json.loads(value)
+        except ValueError:
+            return value
+    if name in DATE_COLUMNS:
+        try:
+            return date.fromisoformat(value)
         except ValueError:
             return value
     return value
@@ -497,6 +580,140 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         """,
         "CREATE INDEX IF NOT EXISTS idx_device_changes_device ON device_changes(device_id, created_at)",
     ),
+    # v8: missed-punch alerts, employee fix requests and HR approval. Weekly
+    # baseline snapshots (KTD2), send-once alerts and the mail outbox (KTD8),
+    # hashed report links (KTD7), requests with line items (KTD5), approved
+    # fixes as an overlay keyed by employee (KTD4) and their audit log.
+    # Work days are ISO date text (DATE_COLUMNS).
+    8: (
+        """
+        CREATE TABLE IF NOT EXISTS attendance_baselines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_id INTEGER NOT NULL,
+            employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+            punched_days INTEGER NOT NULL,
+            clean_days INTEGER NOT NULL,
+            metrics TEXT,
+            computed_at TIMESTAMP NOT NULL,
+            UNIQUE (snapshot_id, employee_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS mail_outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recipients TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            text_body TEXT,
+            html_body TEXT,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'sent', 'failed')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            next_attempt_at TIMESTAMP NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            sent_at TIMESTAMP
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_mail_outbox_due ON mail_outbox(status, next_attempt_at)",
+        """
+        CREATE TABLE IF NOT EXISTS attendance_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+            work_day TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('live', 'morning')),
+            mode TEXT NOT NULL CHECK (mode IN ('shadow', 'live')),
+            status TEXT NOT NULL,
+            site TEXT,
+            detail TEXT,
+            outbox_id INTEGER REFERENCES mail_outbox(id) ON DELETE SET NULL,
+            created_at TIMESTAMP NOT NULL,
+            UNIQUE (employee_id, work_day, kind)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_attendance_alerts_day ON attendance_alerts(work_day)",
+        "CREATE INDEX IF NOT EXISTS idx_attendance_alerts_outbox ON attendance_alerts(outbox_id)",
+        """
+        CREATE TABLE IF NOT EXISTS fix_report_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token_hash TEXT NOT NULL UNIQUE,
+            employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+            work_day TEXT NOT NULL,
+            expires_at TIMESTAMP NOT NULL,
+            created_at TIMESTAMP NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS fix_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+            work_day TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('pending', 'closed_correct',
+                'closed_left', 'approved', 'partial', 'rejected')),
+            punch_set_hash TEXT,
+            source TEXT NOT NULL CHECK (source IN ('link', 'session')),
+            previous_request_id INTEGER REFERENCES fix_requests(id) ON DELETE SET NULL,
+            decision_note TEXT,
+            created_at TIMESTAMP NOT NULL,
+            decided_at TIMESTAMP,
+            decided_by INTEGER REFERENCES employees(id) ON DELETE SET NULL
+        )
+        """,
+        # KTD5: at most one pending request per employee per work day.
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_fix_requests_one_pending "
+        "ON fix_requests(employee_id, work_day) WHERE status = 'pending'",
+        "CREATE INDEX IF NOT EXISTS idx_fix_requests_employee_day "
+        "ON fix_requests(employee_id, work_day)",
+        "CREATE INDEX IF NOT EXISTS idx_fix_requests_status ON fix_requests(status, created_at)",
+        """
+        CREATE TABLE IF NOT EXISTS fix_request_lines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id INTEGER NOT NULL REFERENCES fix_requests(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK (kind IN ('add_in', 'add_out', 'flip', 'ignore')),
+            target_fingerprint TEXT,
+            event_time TIMESTAMP,
+            direction TEXT CHECK (direction IN ('entry', 'exit')),
+            note TEXT,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'approved', 'rejected')),
+            hr_event_time TIMESTAMP,
+            hr_direction TEXT CHECK (hr_direction IN ('entry', 'exit')),
+            decided_by INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            decided_at TIMESTAMP,
+            created_at TIMESTAMP NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_fix_request_lines_request ON fix_request_lines(request_id)",
+        """
+        CREATE TABLE IF NOT EXISTS punch_corrections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+            work_day TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('add', 'ignore', 'set_direction')),
+            fingerprint TEXT,
+            event_timestamp TIMESTAMP,
+            direction TEXT CHECK (direction IN ('entry', 'exit')),
+            request_line_id INTEGER NOT NULL UNIQUE REFERENCES fix_request_lines(id),
+            created_at TIMESTAMP NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_punch_corrections_employee "
+        "ON punch_corrections(employee_id, work_day)",
+        """
+        CREATE TABLE IF NOT EXISTS fix_request_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id INTEGER NOT NULL REFERENCES fix_requests(id) ON DELETE CASCADE,
+            line_id INTEGER REFERENCES fix_request_lines(id) ON DELETE CASCADE,
+            actor_employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('filed', 'lines_added', 'closed',
+                'reopened', 'line_approved', 'line_rejected', 'decided')),
+            old_value TEXT,
+            new_value TEXT,
+            created_at TIMESTAMP NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_fix_request_events_request "
+        "ON fix_request_events(request_id, created_at)",
+    ),
 }
 
 # The C3 library's "unknown" in/out value: a realtime exit (byte 1) arrives as
@@ -553,12 +770,13 @@ def _schema_version(connection: Any) -> int:
     return version
 
 
-class Database:
+class Database(AlertsMixin, FixesMixin):
     """One libsql connection per process, shared under an RLock (KTD1).
 
     Opens `path` as a plain local file in WAL mode, shared by the web app and
     the collector (KTD6); `must_exist` refuses to create it (DatabaseMissing,
-    KTD5).
+    KTD5). Alert and fix-request methods come from the mixins (db_alerts,
+    db_fixes).
     """
 
     def __init__(self, path: str | None = None, *, must_exist: bool = False):
@@ -618,6 +836,11 @@ class Database:
                     _logger.exception("ROLLBACK failed")
                 raise
             connection.commit()
+
+    def schema_version(self) -> int:
+        """The database's schema version (see _schema_version)."""
+        with self.connect() as connection:
+            return _schema_version(connection)
 
     def migrate_schema(self) -> None:
         """Bring the schema to SCHEMA_VERSION; no seeding (KTD8). Every step is
@@ -1132,20 +1355,12 @@ class Database:
         self, device_user_ids: str | Iterable[str], start: datetime, end: datetime
     ) -> list[dict[str, object]]:
         """One person's punches; pass every ID (``device_ids_of``) so punches
-        under extra IDs count too."""
+        under extra IDs count too. Approved fixes are merged in (KTD4,
+        ``hours.apply_corrections``); ignored rows come back marked, so the
+        raw list still shows them."""
         ids = [device_user_ids] if isinstance(device_user_ids, str) else sorted(set(device_user_ids))
         with self.connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT event_timestamp, trusted_direction, raw_direction_byte, raw_state, device_id
-                FROM punches
-                WHERE device_user_id IN (SELECT value FROM json_each(?))
-                  AND event_timestamp >= ? AND event_timestamp < ?
-                ORDER BY event_timestamp ASC
-                """,
-                (json.dumps(ids), start, end),
-            ).fetchall()
-        return list(rows)
+            return _overlaid_punches(connection, ids, start, end)
 
     def first_punch_at(self, device_user_ids: Iterable[str]) -> datetime | None:
         """Earliest punch across one person's IDs (``device_ids_of``); None
@@ -1169,18 +1384,34 @@ class Database:
         self, device_user_ids: Iterable[str], start: datetime, end: datetime
     ) -> list[dict[str, object]]:
         """All punches for a set of people over a range in one query, so Team
-        and exports cost the same whatever the people x days product (U9)."""
+        and exports cost the same whatever the people x days product (U9).
+        Approved fixes are merged in as for ``punches_for_employee_range``;
+        an added punch carries its owner's main ID."""
+        ids = sorted(set(device_user_ids))
+        if not ids:
+            return []
+        with self.connect() as connection:
+            rows = _overlaid_punches(connection, ids, start, end)
+        return sorted(rows, key=lambda r: (r["device_user_id"], r["event_timestamp"]))
+
+    def raw_punches_for_device_users_range(
+        self, device_user_ids: Iterable[str], start: datetime, end: datetime
+    ) -> list[dict[str, object]]:
+        """Stored device punches for these IDs in [start, end), with their
+        ``raw_json`` and ``raw_direction_byte`` and no overlay: the morning
+        job's unconfirmed-C3-guess check (KTD9) reads these. Hours never do."""
         ids = sorted(set(device_user_ids))
         if not ids:
             return []
         with self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT device_user_id, event_timestamp, trusted_direction, site, device_id
+                SELECT device_user_id, fingerprint, event_timestamp, trusted_direction,
+                    raw_direction_byte, raw_state, raw_json, site, device_id
                 FROM punches
                 WHERE device_user_id IN (SELECT value FROM json_each(?))
                   AND event_timestamp >= ? AND event_timestamp < ?
-                ORDER BY device_user_id, event_timestamp ASC
+                ORDER BY device_user_id, event_timestamp
                 """,
                 (json.dumps(ids), start, end),
             ).fetchall()
@@ -1774,6 +2005,15 @@ class Database:
             return None
         return min(values)
 
+    def unreachable_devices(self) -> list[str]:
+        """Active devices whose last poll failed (status 'error'); the
+        collector writes it on the first failure, unlike last_success."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT id FROM devices WHERE retired_at IS NULL AND status = 'error' ORDER BY id"
+            ).fetchall()
+        return [row["id"] for row in rows]
+
     def checkins_since(self, *, since: datetime | None, limit: int) -> list[dict]:
         sql = (
             f"SELECT p.id, p.device_id, {_MAIN_ID_SQL} AS device_user_id, "
@@ -1797,6 +2037,67 @@ class Database:
                 "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
                 (key, value),
             )
+
+
+def _corrections_for(
+    connection: _Connection, employee_ids: Iterable[int], start: datetime, end: datetime
+) -> list[dict[str, object]]:
+    """Database.corrections_for on a borrowed connection."""
+    ids = sorted(set(employee_ids))
+    if not ids:
+        return []
+    return connection.execute(
+        "SELECT * FROM punch_corrections "
+        "WHERE employee_id IN (SELECT value FROM json_each(?)) AND ("
+        "(kind = 'add' AND event_timestamp >= ? AND event_timestamp < ?) "
+        "OR (kind <> 'add' AND work_day >= ? AND work_day <= ?)) "
+        "ORDER BY id",
+        (json.dumps(ids), start, end, start.date() - timedelta(days=1), end.date()),
+    ).fetchall()
+
+
+def _overlaid_punches(
+    connection: _Connection, ids: list[str], start: datetime, end: datetime
+) -> list[dict[str, object]]:
+    """Punches under these device user IDs in [start, end), with approved
+    fixes merged (KTD4). Owners resolve like ``_attach_device_ids`` and
+    ``_MAIN_ID_SQL``: a main ID is its employee's, an extra ID its owner's;
+    corrections are keyed by employee, so an owner's added punches come back
+    even on a day with no device punch."""
+    rows = connection.execute(
+        """
+        SELECT device_user_id, fingerprint, event_timestamp, trusted_direction,
+            raw_direction_byte, raw_state, site, device_id
+        FROM punches
+        WHERE device_user_id IN (SELECT value FROM json_each(?))
+          AND event_timestamp >= ? AND event_timestamp < ?
+        ORDER BY event_timestamp ASC
+        """,
+        (json.dumps(ids), start, end),
+    ).fetchall()
+    owners = connection.execute(
+        """
+        SELECT e.device_user_id AS held_id, e.id AS employee_id, e.device_user_id AS main_id
+        FROM employees e WHERE e.device_user_id IN (SELECT value FROM json_each(?))
+        UNION ALL
+        SELECT x.device_user_id, e.id, e.device_user_id
+        FROM employee_device_ids x JOIN employees e ON e.id = x.employee_id
+        WHERE x.device_user_id IN (SELECT value FROM json_each(?))
+        """,
+        (json.dumps(ids), json.dumps(ids)),
+    ).fetchall()
+    owner_of = {str(o["held_id"]): o["employee_id"] for o in owners}
+    main_ids = {o["employee_id"]: str(o["main_id"]) for o in owners}
+    for row in rows:
+        row["employee_id"] = owner_of.get(str(row["device_user_id"]))
+    corrections = _corrections_for(connection, main_ids, start, end)
+    if not corrections:
+        # What apply_corrections returns with nothing to merge, without the
+        # copy and re-sort: these rows are fresh and already in time order.
+        for row in rows:
+            row["correction"] = None
+        return rows
+    return apply_corrections(rows, corrections, main_ids)
 
 
 def _manager_chain(connection: _Connection, employee_id: int) -> list[int]:

@@ -1,0 +1,12 @@
+{#- One request status as a text-labelled chip (colour never stands alone). Needs: status. -#}
+{% import "_ui.html" as ui %}
+{%- set chips = {
+  'pending': ('Waiting for review', 'info'),
+  'approved': ('Approved', 'ok'),
+  'partial': ('Partly approved', 'warn'),
+  'rejected': ('Not approved', 'bad'),
+  'closed_correct': ('Closed: all correct', 'neutral'),
+  'closed_left': ('Closed: left for the day', 'neutral'),
+} -%}
+{%- set chip = chips.get(status, (status, 'neutral')) -%}
+{{ ui.chip(chip[0], chip[1]) }}

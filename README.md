@@ -31,8 +31,9 @@ A small, self-hosted attendance dashboard for eSSL X990 and C3-400 devices, back
 - **Archives** people who have left: they drop out of every working view and cannot sign in, while their punches and past hours stay.
 - **Feeds Frappe HR** (Employee Checkin push) and offers a read-only HRMS API.
 - **Signs in** by emailed one-time code; no passwords. Cloudflare Turnstile guards the sign-in form.
+- **Catches missed swipes** by learning each person's normal day and emailing them when a day looks wrong; they report what happened and HR approves the fix ([Missed-punch alerts and fix requests](#missed-punch-alerts-and-fix-requests)).
 
-Punches come only from the devices. No screen, role or API creates, edits or deletes a punch.
+Punches come only from the devices. No screen, role or API creates, edits or deletes a punch. An approved fix request is stored beside the punches and changes the computed hours; the device punch itself is never touched.
 
 ## Screenshots
 
@@ -133,15 +134,16 @@ No Python is needed on the host: the installer and the device test run inside th
 11. [R2 plan limits](#r2-plan-limits)
 12. [Upgrading from Turso](#upgrading-from-turso)
 13. [Roles](#roles)
-14. [Roster columns](#roster-columns)
-15. [Device setup and troubleshooting](#device-setup-and-troubleshooting)
-16. [Frappe HR integration](#frappe-hr-integration)
-17. [Configuration reference](#configuration-reference)
-18. [Development and tests](#development-and-tests)
+14. [Missed-punch alerts and fix requests](#missed-punch-alerts-and-fix-requests)
+15. [Roster columns](#roster-columns)
+16. [Device setup and troubleshooting](#device-setup-and-troubleshooting)
+17. [Frappe HR integration](#frappe-hr-integration)
+18. [Configuration reference](#configuration-reference)
+19. [Development and tests](#development-and-tests)
 
 ## How it runs
 
-Everything is one `docker-compose.yml` on one x86_64 host that can reach both device subnets. The database is **one local SQLite file** (`essl.db`, WAL mode) in the data folder, shared by the web app and the collector. Every read and write is local, so a punch shows on the dashboard as soon as the collector stores it. The `backup` service copies a scrubbed snapshot to Cloudflare R2 every 15 minutes; that is the off-site copy.
+Everything is one `docker-compose.yml` on one x86_64 host that can reach both device subnets. The database is **one local SQLite file** (`essl.db`, WAL mode) in the data folder, shared by the web app, the collector and the alerts service. Every read and write is local, so a punch shows on the dashboard as soon as the collector stores it. The `backup` service copies a scrubbed snapshot to Cloudflare R2 every 15 minutes; that is the off-site copy.
 
 ```
  office LAN                         office host (docker compose)                 internet
@@ -157,16 +159,18 @@ Everything is one `docker-compose.yml` on one x86_64 host that can reach both de
                                                                   |  every 15 min: snapshot,
                                               backup ------------+  scrub, check, gzip
                                                  +------------------------------> R2 recent/, nightly/
+                                              alerts --reads/writes essl.db, sends queued email--> Resend / Cloudflare
 ```
 
 | Service | Job |
 | --- | --- |
 | `collector` | Polls the devices every `ESSL_COLLECTOR_INTERVAL_SECONDS` and writes punches to `essl.db`. Polls even when the internet is down. A punch write that fails (database busy or not set up) goes to the local spool and is replayed in order later. |
 | `web` | Flask + gunicorn (`-w 1 --threads 4`). The screens and the read-only HRMS API. Owns the schema. Published on host loopback only (`127.0.0.1:ESSL_WEB_PORT`, default 8080). |
-| `backup` | Every `ESSL_BACKUP_MINUTES` (15) takes a snapshot with SQLite's backup API, deletes sessions and login codes, runs `VACUUM` and `integrity_check`, gzips it and uploads it to R2. Also the admin CLI (`python -m essl_hub.backup <command>`, see [Backups](#backups)). The only service with cloud credentials. |
+| `backup` | Every `ESSL_BACKUP_MINUTES` (15) takes a snapshot with SQLite's backup API, deletes sessions, login codes, report links and queued emails, runs `VACUUM` and `integrity_check`, gzips it and uploads it to R2. Also the admin CLI (`python -m essl_hub.backup <command>`, see [Backups](#backups)). The only service with R2 credentials. |
+| `alerts` | Rebuilds each person's baseline weekly, runs the daytime check every 5 minutes and the next-morning check from the morning email hour, and sends every queued email (alerts, fix requests, decisions); the web only queues. Waits for schema v8 and never creates or migrates `essl.db`. Needs the mail variables and `ESSL_PUBLIC_URL`. See [Missed-punch alerts](#missed-punch-alerts-and-fix-requests). |
 | `cloudflared` | *Optional* bundled Cloudflare Tunnel (compose profile `tunnel`). Skip it when the host already runs cloudflared. |
 
-All three app services mount the same data folder at `/data`, so `essl.db`, its `-wal` and `-shm`, the collector spool and the status files (`collector-status.json`, `backup-status.json`) sit side by side. Web and collector **never create** `essl.db`: until an admin runs `init`, `restore` or `import-turso`, the web app shows a "Database not set up" page with the three commands and the collector spools and waits. All containers run as UID/GID 10001.
+All four app services mount the same data folder at `/data`, so `essl.db`, its `-wal` and `-shm`, the collector spool and the status files (`collector-status.json`, `backup-status.json`) sit side by side. Web, collector and alerts **never create** `essl.db`: until an admin runs `init`, `restore` or `import-turso`, the web app shows a "Database not set up" page with the three commands and the collector spools and waits. All containers run as UID/GID 10001.
 
 ### Data folder (`ESSL_DATA_DIR`)
 
@@ -527,7 +531,9 @@ Rolling back to the previous release after the cutover needs Turso, so keep the 
 | ID issues (People → ID issues) | - | - | yes | yes |
 | Edit a device connection | - | - | - | yes |
 | Sync health (`/health`) | - | - | - | yes |
-| Daily target, HRMS API keys (**Settings**) | - | - | - | yes |
+| Daily target, attendance alerts, HRMS API keys (**Settings**) | - | - | - | yes |
+| Report a problem on own day (last 7 days) | yes | yes | yes | yes |
+| Approve or reject fix requests | - | - | yes, never their own | only when no HR user other than the requester exists, never their own |
 
 | Role | Lands on | Sidebar |
 | --- | --- | --- |
@@ -536,7 +542,34 @@ Rolling back to the previous release after the cutover needs Turso, so keep the 
 | hr | Employees | Today, Week, Employees, People (Directory, ID issues, Archive) |
 | admin | Employees | Today, Week, Employees, People (Directory, ID issues, Archive), Devices, Settings (plus the sync-health indicator) |
 
+**Fix requests.** HR approves every fix request, on its own review page. When an employee files one, their manager gets one FYI email listing the lines (no button, HR decides) and every HR user gets the same with a **Review request** link. If the requester is the only HR user, admins other than the requester are emailed and may approve instead. Nobody approves their own request.
+
 Asking for someone you may not see returns 404, the same as an id that does not exist. `/admin` redirects to **Devices**; `/devices/ids` redirects to **People → ID issues**.
+
+## Missed-punch alerts and fix requests
+
+A missed swipe looks like a long break: someone forgets to swipe, or the Gachibowli reader misses a tap and records the next one the wrong way round. The `alerts` service notices and emails the person; they say what happened; HR approves the fix. No AI is involved: the checks are plain rules over each person's own swipe times.
+
+**Each person's normal day.** Every Sunday at 02:00 IST (and on the service's first start) the service looks at each active person's last 8 weeks and works out how long their longest break usually is and when they usually leave. Their personal limit is well above their usual longest break, never under 90 minutes and never over 4 hours. Days with unclear gaps, unpaired swipes or a fix request are left out, so a bad day never becomes "normal". Nobody gets any email until they have 10 days with swipes in those 8 weeks, and no daytime email until 10 of them are clean.
+
+**The two emails.**
+
+- **Daytime ("out too long"):** checked every 5 minutes inside the alert hours (default 09:00-20:00). Sent when someone who came in today has been out 15 minutes past their limit, and it is still before their usual leaving time.
+- **Next morning:** after the morning email hour (default 09:00), about yesterday, when the day ends on an In with no Out, has an Out with no In, two Ins in a row, or an unclear gap. A day with a C3 direction still being guessed waits for the next history read.
+
+At most one of each per person per work day, and never to someone who did not swipe that day. Both skip while the collector's data is stale (no poll for 10 minutes, punches still spooled, or a device that can't be reached). If one check would email more than 5 people, or 20% of those in, it looks like an outage, not missed swipes: those people are recorded as *held* and nobody is emailed. Emails show only times and the length of the out-stretch, never anyone's limit, and assume the reader missed a swipe.
+
+**Rollout: shadow, then live.** **Settings → Attendance alerts** has three modes. A fresh install starts in **Shadow**: every check runs and is recorded, nobody is emailed. Leave it for about two weeks and watch the *would send* counts per site on the same panel, along with how many people have enough history. Then switch to **Live**. Settings refuses live until `ESSL_PUBLIC_URL` is set and at least one active HR user exists. **Off** stops the checks. Fix-request and decision emails go out in every mode, because the web only queues email and the alerts service sends the queue on every tick. Switching shadow to live mid-day never resends a recorded alert.
+
+**Reporting a problem.** Each email has a **Report a missed swipe** button with a personal link that works without signing in, for that one day, until 7 days after it. Opening the link changes nothing (mail scanners open links too); only submitting the form does. A signed-in person can also use **Report a problem** on their own Day view for any of the last 7 days. The form lists the day's swipes, each with "This was the other direction" and "Ignore this swipe", plus rows to add a missed swipe (time and In/Out) and an optional note. **Everything's correct** and **I left for the day** close the day straight away with no HR step and stop further reminders for it.
+
+**Review and approval.** A report that changes anything goes to HR (and an FYI to the manager, see [Roles](#roles)). On the review page HR sees the day's swipes and each requested line, can adjust a time or direction, and approves or rejects each line; rejecting needs a note. A confirm page shows the hours before and after. The employee is emailed the decision. The page warns when the day's swipes changed after the report, or when a swipe a fix points at no longer exists.
+
+**What an approved fix does.** It is stored beside the punches as a correction and changes the computed hours everywhere: Today, Week, Team, exports and `/api/v1/hours`. The device punch itself is never edited or deleted, and the day shows chips such as *added by HR* or *direction fixed*. Frappe HR and `/api/v1/checkins` keep receiving only the raw device punches, so Frappe's hours can differ from the dashboard for a fixed day.
+
+**Email delivery.** All these emails go through the same provider as sign-in codes. Resend sends the HTML version with the NITCO logo. The Cloudflare provider sends **text only**, so there is no logo; set `ESSL_MAIL_PROVIDER=resend` if the branded version matters. `ESSL_HR_REPLY_TO` makes replies go to an HR mailbox.
+
+**Privacy notice.** Employees can read `<ESSL_PUBLIC_URL>/privacy` (linked from every alert email and the report page) without signing in. In short: only swipe times and the device are used; the typical-day pattern is recomputed weekly from recent swipes; reminders assume the device missed a swipe and are never used for discipline; the employee and HR see the details, the manager sees hours as before plus an FYI when a fix is filed, never the pattern; alert records are deleted after 90 days, sent emails after 30, report links when they expire, and only the last 4 weekly baselines are kept. Report links and queued emails are never in backups.
 
 ## Attendance export
 
@@ -627,7 +660,7 @@ After a run with nothing left pending, each `FRAPPE_SHIFT_TYPES` entry gets `las
 
 ## Configuration reference
 
-All settings live in `.env`; `.env.example` documents each one. The daily target and API keys are set on **Settings**, not in env.
+All settings live in `.env`; `.env.example` documents each one. The daily target, work-day start, attendance alert mode and hours, and API keys are set on **Settings**, not in env.
 
 | Variable | Default | Used by |
 | --- | --- | --- |
@@ -650,9 +683,11 @@ All settings live in `.env`; `.env.example` documents each one. The daily target
 | `ESSL_C3_IP` / `_PORT` / `_PASSWORD` | `192.168.1.202` / `4370` / blank | collector (seeds the row once) |
 | `ESSL_C3_MODE`, `ESSL_C3_HISTORY_HOURS`, `ESSL_C3_RTLOG_BATCH` | `auto`, `6`, `250` | collector |
 | `ESSL_C3_ID_FORMAT`, `ESSL_C3_UNLINKED_PINS` | `NP{pin:04d}`, `1,2` | collector: C3 PIN to device ID |
-| `ESSL_MAIL_PROVIDER` | auto | web: `cloudflare`, `resend`, or `console` (local testing only: prints the code to the server log) |
-| `CLOUDFLARE_API_TOKEN` / `_ACCOUNT_ID` / `_FROM_ADDRESS` | | web |
-| `RESEND_API_KEY` / `RESEND_FROM_ADDRESS` | | web |
+| `ESSL_MAIL_PROVIDER` | auto | web, alerts: `cloudflare`, `resend`, or `console` (local testing only: prints the email to the server log) |
+| `CLOUDFLARE_API_TOKEN` / `_ACCOUNT_ID` / `_FROM_ADDRESS` | | web (sign-in codes), alerts (every other email); text only, no logo |
+| `RESEND_API_KEY` / `RESEND_FROM_ADDRESS` | | web (sign-in codes), alerts (every other email); HTML with the NITCO logo |
+| `ESSL_PUBLIC_URL` | unset | web, alerts: the dashboard's public `https://` URL for the links in alert and fix-request emails. Required to switch alerts to live |
+| `ESSL_HR_REPLY_TO` | unset | alerts: Reply-To on alert and fix-request emails, e.g. an HR mailbox |
 | `TURNSTILE_SITE_KEY` / `TURNSTILE_SECRET_KEY` | recommended; both set = bot check on sign-in and setup | web |
 | `ESSL_FORCE_HTTPS_COOKIES` | `true` | web (`false` only for local http) |
 | `ESSL_MAX_UPLOAD_MB` | `5` | web |

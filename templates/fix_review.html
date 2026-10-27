@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% import "_ui.html" as ui %}
+{% block title %}Fix requests - eSSL Attendance Hub{% endblock %}
+{% block content %}
+<header class="topbar">
+  <div>
+    <h1>Fix requests</h1>
+    <p>Employees' reports of missed or misread swipes. Approved changes update hours in every view and export; device records never change.</p>
+  </div>
+</header>
+
+{% if flash.saved %}
+<div class="notice notice-ok" role="status">{{ ui.icon('check') }}<p><strong>{{ flash.saved }}</strong>{% if flash.skipped %} {{ flash.skipped }}{% endif %}</p></div>
+{% elif flash.skipped %}
+<div class="notice" role="status">{{ ui.icon('circle-alert') }}<p>{{ flash.skipped }}</p></div>
+{% endif %}
+
+<section class="review-section" aria-labelledby="pending-heading">
+  <h2 id="pending-heading">Waiting for review{% if pending %} <span class="muted num">({{ pending|length }})</span>{% endif %}</h2>
+  {% if pending %}
+  <div class="table-scroll">
+    <table class="table hours-table review-table">
+      <caption class="visually-hidden">Fix requests waiting for review, oldest first</caption>
+      <thead><tr>
+        <th scope="col">Employee</th><th scope="col">Work day</th><th scope="col" class="num">Changes</th>
+        <th scope="col">Filed</th><th scope="col">Status</th><th scope="col"><span class="visually-hidden">Actions</span></th>
+      </tr></thead>
+      <tbody>
+        {% for r in pending %}
+        <tr>
+          <td data-label="Employee"><strong>{{ r.employee_name }}</strong>{% if r.own %} {{ ui.chip('Your request', 'neutral') }}{% endif %}</td>
+          <td data-label="Work day"><time datetime="{{ r.work_day.isoformat() }}">{{ r.day_label }}</time></td>
+          <td data-label="Changes" class="num">{{ r.line_count }}</td>
+          <td data-label="Filed">{{ r.created_at.strftime('%d %b, %H:%M') if r.created_at else '' }}</td>
+          <td data-label="Status">{% with status = r.status %}{% include "_fix_status_chip.html" %}{% endwith %}</td>
+          <td>{{ ui.button('View' if r.own else 'Review', 'secondary' if r.own else 'primary', href=url_for('fixes.review_detail', request_id=r.id), size='sm', attrs='aria-label="%s"'|format((('View ' if r.own else 'Review ') ~ r.employee_name ~ ', ' ~ r.day_label)|e)) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  {{ ui.empty_state('No fix requests waiting.', 'When an employee reports a missed or misread swipe, it appears here for review.', 'inbox') }}
+  {% endif %}
+</section>
+
+<section class="review-section" aria-labelledby="decided-heading">
+  <h2 id="decided-heading">Recent decisions</h2>
+  {% if decided %}
+  <div class="table-scroll">
+    <table class="table hours-table review-table">
+      <caption class="visually-hidden">Recently decided fix requests, newest first</caption>
+      <thead><tr>
+        <th scope="col">Employee</th><th scope="col">Work day</th><th scope="col" class="num">Changes</th>
+        <th scope="col">Decision</th><th scope="col">Decided by</th><th scope="col"><span class="visually-hidden">Actions</span></th>
+      </tr></thead>
+      <tbody>
+        {% for r in decided %}
+        <tr>
+          <td data-label="Employee"><strong>{{ r.employee_name }}</strong></td>
+          <td data-label="Work day"><time datetime="{{ r.work_day.isoformat() }}">{{ r.day_label }}</time></td>
+          <td data-label="Changes" class="num">{{ r.line_count }}</td>
+          <td data-label="Decision">{% with status = r.status %}{% include "_fix_status_chip.html" %}{% endwith %}</td>
+          <td data-label="Decided by">{{ r.decided_by_name or '' }}{% if r.decided_at %} <span class="muted">{{ r.decided_at.strftime('%d %b, %H:%M') }}</span>{% endif %}</td>
+          <td>{{ ui.button('View', 'tertiary', href=url_for('fixes.review_detail', request_id=r.id), size='sm', attrs='aria-label="%s"'|format(('View ' ~ r.employee_name ~ ', ' ~ r.day_label)|e)) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  {{ ui.empty_state('No decisions yet.', 'Requests you approve or reject are listed here for reference.', 'check') }}
+  {% endif %}
+</section>
+{% endblock %}

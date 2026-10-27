@@ -1,0 +1,11 @@
+{#- The changes on the day's latest fix request, each with a status chip. -#}
+{% import "_ui.html" as ui %}
+{% set line_chip = {'pending': ('Waiting for HR', 'info'), 'approved': ('Approved', 'ok'), 'rejected': ('Not approved', 'bad')} %}
+{% if lines %}
+<ul class="report-lines">
+  {% for line in lines %}
+  {% set chip = line_chip.get(line.status, ('Waiting for HR', 'info')) %}
+  <li><span>{{ line.text }}</span>{{ ui.chip(chip[0], chip[1]) }}{% if line.note %}<span class="report-line-note muted">"{{ line.note }}"</span>{% endif %}</li>
+  {% endfor %}
+</ul>
+{% endif %}

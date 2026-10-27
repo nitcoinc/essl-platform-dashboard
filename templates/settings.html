@@ -5,7 +5,7 @@
 <header class="topbar">
   <div>
     <h1>Settings</h1>
-    <p>The daily target, when a work day starts, and the keys your HRMS uses to read hours.</p>
+    <p>The daily target, when a work day starts, attendance alerts, and the keys your HRMS uses to read hours.</p>
   </div>
 </header>
 
@@ -40,6 +40,53 @@
     {{ ui.button('Save start hour', 'primary', type='submit') }}
   </form>
   {% if day_start_saved %}<p class="device-note" role="status">{{ ui.icon('check') }}<span>Work days now start at {{ '%02d' % day_start_hour }}:00.</span></p>{% endif %}
+</section>
+
+{% set current = alerts.settings %}
+{% set af = alerts_form or {'mode': current.mode, 'start_hour': current.start_hour, 'end_hour': current.end_hour, 'morning_hour': current.morning_hour} %}
+<section class="admin-section" aria-labelledby="alerts-heading">
+  <h2 id="alerts-heading">Attendance alerts</h2>
+  <p class="section-intro">Emails people when a swipe looks missed: during the day when someone has been out much longer than usual, and the next morning when yesterday's swipes don't add up. Each person's limits come from their own last 8 weeks. Leave it on shadow for about two weeks and check the counts below before going live.</p>
+  <form method="post" action="{{ url_for('admin.settings_set_alerts') }}" class="person-form" novalidate>
+    <input type="hidden" name="csrf" value="{{ csrf_token }}">
+    <div class="field">
+      <label for="f-mode">Mode</label>
+      <select id="f-mode" name="mode" aria-describedby="f-mode-hint{% if alerts_errors.mode %} f-mode-error{% endif %}"{% if alerts_errors.mode %} aria-invalid="true"{% endif %}>
+        {% for value, label in alert_mode_labels.items() %}
+        <option value="{{ value }}"{{ ' selected' if af.mode|string == value }}>{{ label }}</option>
+        {% endfor %}
+      </select>
+      <p class="field-hint" id="f-mode-hint">Shadow runs the checks and logs what it would send, emailing nobody. Fix-request and decision emails go out in every mode.</p>
+      {% if alerts_errors.mode %}{{ ui.inline_error(alerts_errors.mode, 'f-mode-error') }}{% endif %}
+    </div>
+    {{ ui.field('start_hour', 'Alert hours start (0-23)', af.start_hour, type='number', error=alerts_errors.start_hour, attrs='min="0" max="23" inputmode="numeric"') }}
+    {{ ui.field('end_hour', 'Alert hours end (0-23)', af.end_hour, type='number', hint='Daytime emails only go out between these hours, IST.', error=alerts_errors.end_hour, attrs='min="0" max="23" inputmode="numeric"') }}
+    {{ ui.field('morning_hour', 'Morning email hour (0-23)', af.morning_hour, type='number', hint='When the next-morning emails about yesterday go out.', error=alerts_errors.morning_hour, attrs='min="0" max="23" inputmode="numeric"') }}
+    <div class="form-actions">{{ ui.button('Save alert settings', 'primary', type='submit') }}</div>
+  </form>
+  {% if alerts_saved %}<p class="device-note" role="status">{{ ui.icon('check') }}<span>Attendance alerts saved: {{ alert_mode_labels[current.mode] }}, {{ '%02d' % current.start_hour }}:00-{{ '%02d' % current.end_hour }}:00, morning emails at {{ '%02d' % current.morning_hour }}:00.</span></p>{% endif %}
+
+  <h3 id="alerts-history-heading">Last {{ alerts.count_days }} days</h3>
+  {% if alerts.rebuilt_at %}
+  <p class="section-intro">{{ alerts.live_ready }} of {{ alerts.people }} people have enough history for daytime emails. Baselines last rebuilt {{ alerts.rebuilt_at.strftime('%d %b %Y, %H:%M') }}.</p>
+  {% endif %}
+  {% if alerts.counts %}
+  {% call ui.table([('Site', 'left'), ('Daytime', 'left'), ('Next morning', 'left')], caption='Attendance alerts per site, last ' ~ alerts.count_days ~ ' days') %}
+    {% for row in alerts.counts %}
+    <tr>
+      <td data-label="Site">{{ row.site }}</td>
+      {% for kind, label in (('live', 'Daytime'), ('morning', 'Next morning')) %}
+      <td data-label="{{ label }}">{% if row[kind] %}{% for n, bucket in row[kind] %}{{ n }} {{ bucket }}{% if not loop.last %}, {% endif %}{% endfor %}{% else %}<span class="muted">None</span>{% endif %}</td>
+      {% endfor %}
+    </tr>
+    {% endfor %}
+  {% endcall %}
+  <p class="footnote">"Would send" is what shadow mode logged without emailing. "Not emailed" is a live alert for someone with no email address. "Held" means the outage guard stopped a burst of alerts at once.</p>
+  {% elif alerts.rebuilt_at %}
+  <p class="muted">No alerts in the last {{ alerts.count_days }} days.</p>
+  {% else %}
+  {{ ui.empty_state('No alerts yet', 'Baselines not built yet — the alerts service builds them on first start, then logs its checks here.', 'inbox') }}
+  {% endif %}
 </section>
 
 <section class="admin-section" aria-labelledby="keys-heading">

@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from .hours import Collapsed, DayResult
+from .hours import CORRECTION_ADDED, CORRECTION_DIRECTION, CORRECTION_IGNORED, Collapsed, DayResult
 
 
 @dataclass(frozen=True)
@@ -116,6 +116,24 @@ def punch_flags(raw_state: str | None) -> tuple[str, ...]:
     return tuple(chip for note, chip in _PUNCH_FLAGS if note in (raw_state or ""))
 
 
+# KTD4: chips for a swipe an approved fix touched, keyed by the row's
+# ``correction`` (hours.apply_corrections).
+CORRECTION_FLAGS = {
+    CORRECTION_ADDED: "added by HR",
+    CORRECTION_DIRECTION: "direction fixed",
+    CORRECTION_IGNORED: "ignored",
+}
+# Day-level chips from the day's latest fix request status.
+_FIX_FLAGS = {"pending": "Fix pending", "rejected": "Fix rejected"}
+
+
+def fix_flags(statuses) -> tuple[str, ...]:
+    """The day's fix-request chip from its request statuses (oldest first, as
+    ``Database.fix_request_days`` gives them): the latest request decides."""
+    latest = next(reversed(list(statuses)), None)
+    return (_FIX_FLAGS[latest],) if latest in _FIX_FLAGS else ()
+
+
 @dataclass(frozen=True)
 class BarSegment:
     kind: str  # "inside" | "break" | "unclear"
@@ -144,7 +162,7 @@ class BarMark:
 class RawPunch:
     time: datetime
     direction: str  # "entry" | "exit" | ""
-    flags: tuple[str, ...]  # "not counted", "unpaired", "inferred", "interval too short"
+    flags: tuple[str, ...]  # "not counted", "unpaired", "inferred", "interval too short", "ignored", ...
     note: str = ""  # R6: why a "not counted" swipe was dropped
 
 
@@ -163,6 +181,7 @@ class BreakView:
     marks: tuple[BarMark, ...]
     gaps: tuple  # result.gaps, time-ordered (breaks and unclear)
     punches: tuple[RawPunch, ...]
+    fix_flags: tuple[str, ...] = ()  # "Fix pending" | "Fix rejected"
 
 
 def _hm(seconds: int) -> str:
@@ -243,9 +262,11 @@ def _bar_marks(bar: list[BarSegment], live: bool) -> tuple[BarMark, ...]:
     return tuple(marks)
 
 
-def break_view(result: DayResult, now: datetime | None, raw_rows=()) -> BreakView:
+def break_view(result: DayResult, now: datetime | None, raw_rows=(), fix_statuses=()) -> BreakView:
     """The break view for one day. ``raw_rows`` are the stored swipes
-    (``event_timestamp``, ``raw_state``) so the raw list shows every one."""
+    (``event_timestamp``, ``raw_state``) so the raw list shows every one,
+    with approved fixes merged (KTD4): ignored swipes stay listed, marked.
+    ``fix_statuses`` are the day's fix request statuses, oldest first."""
     open_day = result.status == "open" and now is not None
     pieces: list[tuple[str, int | None, datetime, datetime, bool]] = []
     for seg in result.segments:
@@ -277,6 +298,12 @@ def break_view(result: DayResult, now: datetime | None, raw_rows=()) -> BreakVie
     if unclear:
         label += f", {_hm(result.unclear_seconds)} unclear: " + "; ".join(
             f"{g.start:%H:%M} to {g.end:%H:%M} ({_dur(g.seconds)})" for g in unclear)
+    raw_rows = list(raw_rows)
+    # KTD4: the bar is the text record, so it names what HR changed.
+    for kind in (CORRECTION_ADDED, CORRECTION_IGNORED):
+        count = sum(1 for row in raw_rows if row.get("correction") == kind)
+        if count:
+            label += f", {count} punch{'es' if count != 1 else ''} {CORRECTION_FLAGS[kind]}"
 
     starts = {s.start for s in result.segments}
     ends = {s.end for s in result.segments if s.end is not None}
@@ -290,6 +317,13 @@ def break_view(result: DayResult, now: datetime | None, raw_rows=()) -> BreakVie
         t = row["event_timestamp"]
         flags: list[str] = []
         note = ""
+        correction = row.get("correction")
+        if correction == CORRECTION_IGNORED:
+            # Never scored, so it pairs with nothing and repeats nothing.
+            flags.append(CORRECTION_FLAGS[correction])
+            flags.extend(punch_flags(row.get("raw_state")))
+            punches.append(RawPunch(t, row.get("trusted_direction") or "", tuple(flags)))
+            continue
         reason = next((c for c in collapsed if c.punch.timestamp == t), None)
         if reason is not None:
             collapsed.remove(reason)
@@ -307,6 +341,8 @@ def break_view(result: DayResult, now: datetime | None, raw_rows=()) -> BreakVie
             direction = row.get("trusted_direction") or ""
         if t in inferred and "not counted" not in flags:
             flags.append("inferred")
+        if correction in CORRECTION_FLAGS:
+            flags.append(CORRECTION_FLAGS[correction])
         flags.extend(punch_flags(row.get("raw_state")))
         punches.append(RawPunch(t, direction, tuple(flags), note))
     return BreakView(
@@ -321,6 +357,7 @@ def break_view(result: DayResult, now: datetime | None, raw_rows=()) -> BreakVie
         marks=_bar_marks(bar, open_day),
         gaps=result.gaps,
         punches=tuple(punches),
+        fix_flags=fix_flags(fix_statuses),
     )
 
 

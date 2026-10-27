@@ -1,0 +1,17 @@
+{#- A report link that is unknown, expired or aged out (KTD7): one page for
+    all of them, so a guess learns nothing. Also the rate-limit reply. -#}
+{% extends "_auth_base.html" %}
+{% block title %}{% if limited %}Too many tries{% else %}Link expired{% endif %}{% endblock %}
+{% block card %}
+<div class="auth-title">
+  {% if limited %}
+  <h1>Too many tries</h1>
+  <p>Wait a minute, then try again.</p>
+  {% else %}
+  <h1>This link has expired or isn't valid</h1>
+  <p>Report links work for 7 days. You can still report a problem with a recent day: sign in and open the day.</p>
+  {% endif %}
+</div>
+{% if not limited %}{{ ui.button('Sign in', 'primary', href=url_for('auth.signin')) }}{% endif %}
+<p class="auth-note"><a href="{{ url_for('fixes.privacy') }}">How we use attendance data</a></p>
+{% endblock %}

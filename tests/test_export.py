@@ -303,5 +303,38 @@ class ExportTest(unittest.TestCase):
         self.assertLessEqual(large, 1)
 
 
+    def test_approved_fixes_change_the_report_and_group_under_the_owner(self) -> None:
+        # KTD4: Person 000 swipes on her extra ID; HR adds an In, re-directs a
+        # wrong Out and ignores a duplicate. The device rows never change.
+        (person,) = self._people(1)
+        self.database.add_extra_device_id(person["id"], "NP0100")
+        self.database.insert_punches([
+            self._punch("NP0100", self._at(hours=9), "entry", 1),
+            self._punch("NP0100", self._at(hours=13), "exit", 2),
+            self._punch("NP0100", self._at(hours=14), "exit", 3),
+            self._punch("NP0100", self._at(hours=14, minutes=30), "exit", 4),
+            self._punch("NP0100", self._at(hours=18), "exit", 5),
+        ])
+        (person,) = self.database.employees()
+        before = self._report([person], self.day, self.day).rows[0]
+        self.assertEqual((before.code, before.effective), ("R", timedelta(hours=4)))
+        request_id = self.database.file_fix_lines(person["id"], self.day, [
+            {"kind": "flip", "target_fingerprint": "fp-NP0100-3", "direction": "entry"},
+            {"kind": "ignore", "target_fingerprint": "fp-NP0100-4"},
+            {"kind": "add_in", "event_time": self._at(hours=19)},
+            {"kind": "add_out", "event_time": self._at(hours=20)},
+        ], source="session")["request_id"]
+        self.database.upsert_employee(device_user_id="900", name="HR", email="hr@x.com")
+        hr = self.database.employee_by_device_user_id("900")
+        self.database.decide_fix_lines(request_id, [
+            {"line_id": l["id"], "status": "approved"}
+            for l in self.database.fix_request(request_id)["lines"]], actor_id=hr["id"])
+        after = self._report([person], self.day, self.day).rows[0]
+        self.assertEqual((after.code, after.status), ("P", "Met"))
+        self.assertEqual(after.effective, timedelta(hours=9))
+        self.assertEqual((after.first_in, after.last_out), (self._at(hours=9), self._at(hours=20)))
+        self.assertEqual(after.punches, 6)  # the ignored duplicate does not count
+        self.assertEqual(after.sites, ("s",))
+
 if __name__ == "__main__":
     unittest.main()

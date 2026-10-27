@@ -1,0 +1,32 @@
+{#- After a report (U7): what was sent and who decides, or the closing reply. -#}
+{% extends layout %}
+{% import "_ui.html" as ui %}
+{% block title %}{% if signed_in %}Report sent - eSSL Attendance Hub{% else %}Report sent{% endif %}{% endblock %}
+{% block card_class %} report-card{% endblock %}
+{% block card %}{{ self.report() }}{% endblock %}
+{% block content %}<div class="report-page">{{ self.report() }}</div>{% endblock %}
+
+{% block report %}
+<header class="report-head">
+  {% if state == 'closed' %}
+  <h1>Thanks — we won't send more reminders for this day</h1>
+  <p>{% if filed.status == 'closed_left' %}You told us you left for the day on {{ day_label }}.{% else %}You told us everything on {{ day_label }} was correct.{% endif %} Nothing goes to HR.</p>
+  {% elif state == 'pending' %}
+  <h1>Sent to HR</h1>
+  <p>HR will review your report for {{ day_label }} and email you their decision. Your hours update once they approve.</p>
+  {% else %}
+  <h1>Your report for {{ day_label }}</h1>
+  {% endif %}
+</header>
+{% if state == 'pending' %}
+<section class="report-status" aria-labelledby="report-sent-heading">
+  <h2 id="report-sent-heading">What you asked for</h2>
+  {% include "_fix_report_lines.html" %}
+</section>
+{% endif %}
+<p class="report-done-actions">
+  {% if signed_in %}{{ ui.button('Back to the day', 'secondary', href=url_for('me.day_view', date=day.isoformat())) }}{% endif %}
+  {{ ui.button('Report something else' if state == 'pending' else "Actually, something's wrong" if state == 'closed' else 'Open the report', 'tertiary', href=page_url ~ ('?report=1' if state == 'closed' else '')) }}
+</p>
+<p class="report-foot"><a href="{{ url_for('fixes.privacy') }}">How we use attendance data</a></p>
+{% endblock %}

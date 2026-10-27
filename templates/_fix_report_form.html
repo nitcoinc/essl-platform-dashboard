@@ -1,0 +1,75 @@
+{#- The fix report form (U7), shared by the emailed link and the signed-in
+    page. Needs: action_url, swipes, form, errors, allow_close, csrf_token
+    (signed-in only), day_start, max_lines, note_max. Works without JS. -#}
+{% import "_ui.html" as ui %}
+<form method="post" action="{{ action_url }}" class="report-form" novalidate>
+  {% if csrf_token %}<input type="hidden" name="csrf" value="{{ csrf_token }}">{% endif %}
+  {% if errors.form %}<div class="auth-error" role="alert">{{ ui.icon('circle-alert') }}<span>{{ errors.form }}</span></div>{% endif %}
+
+  <fieldset class="report-group"{% if errors.swipes %} aria-describedby="swipes-error"{% endif %}>
+    <legend>Swipes on this day</legend>
+    {% if swipes %}
+    <ol class="report-swipes">
+      {% for s in swipes %}
+      <li class="report-swipe{{ ' is-locked' if not s.actionable }}">
+        <div class="report-swipe-head">
+          <span class="punch-time num">{{ s.time.strftime('%H:%M:%S') }}{% if s.next_day %}<sup title="Next calendar day">+1</sup>{% endif %}</span>
+          <span class="punch-dir">{{ s.direction }}</span>
+          {% for label, tone in s.chips %}{{ ui.chip(label, tone) }}{% endfor %}
+        </div>
+        {% if s.actionable %}
+        <div class="report-swipe-actions">
+          <label class="report-check"><input type="checkbox" name="flip" value="{{ s.fingerprint }}"{{ ' checked' if s.fingerprint in form.flips }}><span>This was the other direction</span></label>
+          <label class="report-check"><input type="checkbox" name="ignore" value="{{ s.fingerprint }}"{{ ' checked' if s.fingerprint in form.ignores }}><span>Ignore this swipe</span></label>
+        </div>
+        {% endif %}
+      </li>
+      {% endfor %}
+    </ol>
+    {% else %}
+    <p class="muted">No swipes were recorded on this day.</p>
+    {% endif %}
+    {% if errors.swipes %}{{ ui.inline_error(errors.swipes, 'swipes-error') }}{% endif %}
+  </fieldset>
+
+  <fieldset class="report-group">
+    <legend>Add a missed swipe</legend>
+    <p class="field-hint">Leave a row empty if you don't need it. Times after midnight count for this work day, up to {{ day_start }} the next morning.</p>
+    {% for row in form.adds %}
+    {% set i = loop.index0 %}
+    <div class="report-add">
+      {{ ui.field('add-' ~ i ~ '-time', 'Time', row.time, type='time', error=row.error) }}
+      <fieldset class="report-dir"{% if row.dir_error %} aria-describedby="f-add-{{ i }}-dir-error"{% endif %}>
+        <legend>Direction</legend>
+        <div class="report-dir-options">
+          <label class="report-check"><input type="radio" name="add-{{ i }}-dir" value="in"{{ ' checked' if row.dir == 'in' }}{% if row.dir_error %} aria-invalid="true"{% endif %}><span>In</span></label>
+          <label class="report-check"><input type="radio" name="add-{{ i }}-dir" value="out"{{ ' checked' if row.dir == 'out' }}{% if row.dir_error %} aria-invalid="true"{% endif %}><span>Out</span></label>
+        </div>
+        {% if row.dir_error %}{{ ui.inline_error(row.dir_error, 'f-add-' ~ i ~ '-dir-error') }}{% endif %}
+      </fieldset>
+    </div>
+    {% endfor %}
+    <p class="field-hint">One report holds up to {{ max_lines }} changes.</p>
+  </fieldset>
+
+  <div class="field">
+    <label for="f-note">Note for HR <span class="muted">(optional)</span></label>
+    <textarea id="f-note" name="note" rows="3" maxlength="{{ note_max }}" aria-describedby="f-note-hint{% if errors.note %} f-note-error{% endif %}"{% if errors.note %} aria-invalid="true"{% endif %}>{{ form.note }}</textarea>
+    <p class="field-hint" id="f-note-hint">Up to {{ note_max }} characters.</p>
+    {% if errors.note %}{{ ui.inline_error(errors.note, 'f-note-error') }}{% endif %}
+  </div>
+
+  <div class="report-actions">
+    {{ ui.button('Send to HR', 'primary', type='submit', attrs='name="action" value="send"') }}
+  </div>
+
+  {% if allow_close %}
+  <div class="report-close">
+    <p>Nothing to fix? Tell us and we'll stop reminding you about this day.</p>
+    <div class="report-close-buttons">
+      {{ ui.button("Everything's correct", 'secondary', type='submit', attrs='name="action" value="correct"') }}
+      {{ ui.button('I left for the day', 'secondary', type='submit', attrs='name="action" value="left"') }}
+    </div>
+  </div>
+  {% endif %}
+</form>

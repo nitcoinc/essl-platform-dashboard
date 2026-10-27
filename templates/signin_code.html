@@ -7,12 +7,13 @@
 </div>
 {% if error_kind in ('expired', 'locked') %}
 <div class="auth-error" role="alert">{{ ui.icon('circle-alert') }}<span>{{ error }}</span></div>
-{{ ui.button('Request a new code', 'primary', href=url_for('auth.signin')) }}
+{{ ui.button('Request a new code', 'primary', href=url_for('auth.signin', next=next)) }}
 {% else %}
 <form method="post" action="{{ url_for('auth.signin_verify') }}">
+  {% if next %}<input type="hidden" name="next" value="{{ next }}">{% endif %}
   {{ ui.field('code', 'Code', '', required=True, error=error, attrs='inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" autofocus class="code-input" spellcheck="false"') }}
   {{ ui.button('Sign in', 'primary', type='submit') }}
 </form>
 {% endif %}
-<p class="auth-note">Nothing arrived? Check spam, or <a href="{{ url_for('auth.signin') }}">use a different email</a>.</p>
+<p class="auth-note">Nothing arrived? Check spam, or <a href="{{ url_for('auth.signin', next=next) }}">use a different email</a>.</p>
 {% endblock %}

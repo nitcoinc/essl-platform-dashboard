@@ -15,7 +15,15 @@ from werkzeug.local import LocalProxy
 from .. import config, roster
 from ..config import TIMEZONE_NAME
 from ..db import Database, device_ids_of
-from ..hours import DEFAULT_DAY_START_HOUR, DayResult, compute_day, punch_from_row, work_day, work_day_window
+from ..hours import (
+    DayResult,
+    compute_day,
+    counted_punches,
+    read_day_start_hour,
+    read_target_minutes,
+    work_day,
+    work_day_window,
+)
 
 
 _TZ = ZoneInfo(TIMEZONE_NAME)
@@ -98,10 +106,20 @@ def _login_required(view):
                 response = make_response("", 200)
                 response.headers["HX-Redirect"] = url_for("auth.signin")
                 return response
-            return redirect(url_for("auth.signin"))
+            return redirect(_signin_url())
         return view(*args, **kwargs)
 
     return wrapper
+
+
+def _signin_url() -> str:
+    """Sign-in for a signed-out visitor; a page they opened (a GET, e.g. the
+    "Review request" email button) rides along as ``next`` so they land back
+    on it once signed in. A POST is never replayed."""
+    if request.method != "GET":
+        return url_for("auth.signin")
+    target = request.full_path if request.query_string else request.path
+    return url_for("auth.signin", next=target)
 
 
 def _role_required(*roles: str):
@@ -109,7 +127,7 @@ def _role_required(*roles: str):
         @wraps(view)
         def wrapper(*args, **kwargs):
             if g.employee is None:
-                return redirect(url_for("auth.signin"))
+                return redirect(_signin_url())
             if g.employee["role"] not in roles:
                 abort(403)
             return view(*args, **kwargs)
@@ -143,16 +161,13 @@ def _home_for(employee: dict) -> str:
 
 
 def _target_minutes(database: Database) -> int:
-    return int(database.setting("daily_target_minutes", "480"))
+    # Like the day-start hour, a missing or corrupt value is the default.
+    return read_target_minutes(database)
 
 
 def _day_start_hour(database: Database) -> int:
     """The work-day start hour (R1); a missing or corrupt value falls back."""
-    try:
-        hour = int(database.setting("day_start_hour", str(DEFAULT_DAY_START_HOUR)))
-    except (TypeError, ValueError):
-        return DEFAULT_DAY_START_HOUR
-    return hour if 0 <= hour <= 23 else DEFAULT_DAY_START_HOUR
+    return read_day_start_hour(database)
 
 
 def _day_start_label(day_start_hour: int) -> str:
@@ -265,18 +280,21 @@ def _day_for_employee(
     *,
     day_start_hour: int | None = None,
     windows: dict[str, int] | None = None,
+    rows: list[dict] | None = None,
 ) -> DayResult:
     """Score one work day. Pass ``now`` to share one instant across a request,
     so every figure on a page is measured from the same second (R17/U11).
     Loop callers pass ``day_start_hour`` and ``windows`` (device -> quick-swipe
-    window, KTD3) so each is read once."""
+    window, KTD3) so each is read once; a caller that already holds the day's
+    punch ``rows`` passes them so they are not read twice."""
     if day_start_hour is None:
         day_start_hour = _day_start_hour(database)
     if windows is None:
         windows = database.device_windows()
-    start, end = work_day_window(day, day_start_hour)
-    rows = database.punches_for_employee_range(device_ids_of(employee), start, end)
-    punches = [punch_from_row(row, windows) for row in rows]
+    if rows is None:
+        start, end = work_day_window(day, day_start_hour)
+        rows = database.punches_for_employee_range(device_ids_of(employee), start, end)
+    punches = counted_punches(rows, windows)
     now = now or _now_naive()
     is_today = day == work_day(now, day_start_hour)
     now = now if is_today else None
@@ -293,6 +311,10 @@ def _safe_next(target: str | None, fallback: str) -> str:
     """A same-site path to return to; anything with a scheme or host (or a
     protocol-relative //host, or a backslash trick) falls back."""
     if not target or not target.startswith("/") or target.startswith("//") or "\\" in target:
+        return fallback
+    # Browsers drop tabs and newlines from URLs, so "/\t/host" would become
+    # "//host"; no real path here carries a control character or a space.
+    if any(ord(ch) <= 32 or ord(ch) == 127 for ch in target):
         return fallback
     return target
 

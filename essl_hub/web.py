@@ -9,6 +9,7 @@ from flask import Flask, Response, g, jsonify, render_template, request
 from . import access, auth, config, turnstile
 from .config import DEVICES
 from .db import SETUP_COMMANDS, BusyError, Database, DatabaseMissing, OfflineError
+from .log_hygiene import RedactReportTokens
 from .routes import BLUEPRINTS
 from .routes import people as people_routes
 from .routes.common import SESSION_COOKIE, _htmx_partial, _theme, current_sync_health
@@ -98,6 +99,14 @@ def create_app(database: Database | None = None) -> Flask:
         return {"nav_issue_count": people_routes.issue_count()}
 
     @app.context_processor
+    def fix_review_badge() -> dict:
+        # HR and admin see how many fix requests wait on the Fix requests entry.
+        employee = g.get("employee")
+        if not access.can_view_fix_reviews(employee) or _htmx_partial():
+            return {}
+        return {"nav_fix_count": database.pending_fix_request_count()}
+
+    @app.context_processor
     def sync_health_indicator() -> dict:
         # Admin only (R4); status files are re-read per page, which is cheap.
         employee = g.get("employee")
@@ -150,6 +159,12 @@ def create_app(database: Database | None = None) -> Flask:
         session = auth.resolve_session(database, token)
         g.employee = session["employee"] if session else None
         g.csrf_token = session["csrf_token"] if session else None
+
+    # KTD7: Flask logs an unhandled error as "Exception on <path>", so a
+    # crash on /fix/<token> would print the token; the access-log filter
+    # (log_hygiene) redacts it here too. Added once per logger.
+    if not any(isinstance(f, RedactReportTokens) for f in app.logger.filters):
+        app.logger.addFilter(RedactReportTokens())
 
     for blueprint in BLUEPRINTS:
         app.register_blueprint(blueprint)

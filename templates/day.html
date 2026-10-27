@@ -22,4 +22,7 @@
 
 {% if strip %}{% with drawer=false, strip_from=none %}{% include "_day_strip.html" %}{% endwith %}{% endif %}
 {% include "_day_live.html" %}
+{% if can_report %}
+<p class="day-report">{{ ui.button('Report a problem', 'secondary', href=url_for('fixes.report_view', day=day.isoformat())) }}<span class="muted">Missed swipe, or one read the wrong way? Tell HR.</span></p>
+{% endif %}
 {% endblock %}

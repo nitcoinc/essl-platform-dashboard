@@ -10,10 +10,10 @@ web
 
 Four roles:
 
-- **employee** checks their own punches, effective hours and progress against the daily target. Lands on Today.
-- **manager** does the same, plus sees and exports the hours of everyone who reports to them, directly or indirectly. Lands on Team.
-- **hr** sees and exports every employee, manages the Directory (roster file import, add, edit, archive and restore, managers, roles up to hr), and reads device health. Nobody takes backups by hand: a scrubbed snapshot of the database lands in R2 every 15 minutes, plus one kept per day. Lands on Employees.
-- **admin** has everything hr has, plus grants admin, adds, edits, retires and re-enables devices, and sets the daily target and HRMS API keys.
+- **employee** checks their own punches, effective hours and progress against the daily target, and reports a problem with one of their own last 7 days (from an alert email link or their Day view). Lands on Today.
+- **manager** does the same, plus sees and exports the hours of everyone who reports to them, directly or indirectly. Gets one FYI email when a report files a fix request; never approves and never gets alerts. Lands on Team.
+- **hr** sees and exports every employee, manages the Directory (roster file import, add, edit, archive and restore, managers, roles up to hr), approves or rejects fix requests (never their own), and reads device health. Nobody takes backups by hand: a scrubbed snapshot of the database lands in R2 every 15 minutes, plus one kept per day. Lands on Employees.
+- **admin** has everything hr has, plus grants admin, adds, edits, retires and re-enables devices, and sets the daily target, attendance alert mode and hours, and HRMS API keys. An admin approves fix requests only when no active HR user other than the requester exists.
 
 Vocabulary: **Employees** is the HR/admin hours list (managers see the same page as **Team**); **Directory** is the list of people under People. Never "Everyone" or "Roster" for either; "roster" means only the import file.
 
@@ -36,11 +36,12 @@ One Docker Compose stack on an office Linux host with routes to `192.168.1.201` 
 - Seeded devices: Uppal X990 (`192.168.1.201`) and Gachibowli C3-400 (`192.168.1.202`). The devices table is authoritative: an admin adds devices of either family on the Devices page, and retires or re-enables them. A retired device is not polled and keeps its punches. Two active devices never share an IP:port, and device ids are immutable and never reused.
 - X990 collection supports the standard ZK protocol with TCP and UDP fallback; its communication key is intentionally not assumed. As of 2026-09-10 the device refuses TCP 4370 while its port-80 web interface answers — the signature of ADMS/cloud-push mode — which needs an operator with device or web-console access to confirm; it cannot be diagnosed further from this codebase.
 - C3-400 collection uses the PullSDK protocol on port 4370; its communication password is intentionally not assumed. Its realtime event queue holds only about 30 records in memory and is consumed once read, so the collector must stay running continuously.
-- Punches originate only from these devices. No screen, role, or API creates, edits, or deletes a punch — a broken day is shown as incomplete, not corrected in the app.
+- Punches originate only from these devices. No screen, role, or API creates, edits, or deletes a punch. A broken day is shown as incomplete until HR approves a fix the employee asked for; HR never edits a day without a request.
+- An approved fix is an **overlay**: a correction row beside the punches (add a swipe, ignore a swipe, or set a swipe's direction) that every hours read path merges in, so views, exports and the hours API agree. Device punches stay untouched, and Frappe HR and `/api/v1/checkins` receive only raw punches, never fixes.
 - Hours are always recomputed from stored punches, never stored as a derived value.
 - Device deletion/clearing/reset operations are out of scope and must never be exposed. Retire is the only way to stop polling a device.
 - Communication passwords can be set by an admin on the Devices page; R2, tunnel and email credentials come only from the server's `.env` (mode 600), never browser fields or source code.
-- Only the backup service holds an R2 token, scoped to the one backup bucket (R2 has no write-only permission). The dashboard and the collector hold no cloud credentials. Snapshots never contain sessions or sign-in codes.
+- Only the backup service holds an R2 token, scoped to the one backup bucket (R2 has no write-only permission). The dashboard and the alerts service hold only mail-provider credentials; the collector holds none. Snapshots never contain sessions, sign-in codes, report links or queued emails.
 
 ## People, device IDs and archive
 
@@ -57,6 +58,16 @@ One Docker Compose stack on an office Linux host with routes to `192.168.1.201` 
 - The C3 records event 20 ("Too Short Punch Interval") when a swipe comes too soon after the previous one at the same door; the door does not open, but the person was there. The collector stores it as attendance with the note "interval too short". Recommend setting the C3 door **Punch Interval** to 1 second or less so real swipes are not denied; admins can change it from the Devices page.
 - Interlock and anti-passback denials count only when a C3's "Wait for door close" is unchecked, from that moment on, flagged "door denied" and kept out of Frappe.
 
+## Missed-punch alerts and fix requests
+
+- A separate **alerts** service learns each active person's normal day from their own last 8 weeks, rebuilt weekly: their longest break (limit at least 90 minutes, at most 4 hours) and when they usually leave. Days with unclear gaps, unpaired swipes or a fix request never train it. Deterministic rules and robust statistics only; no LLM, and no attendance data leaves the host for detection.
+- **Daytime email:** someone who came in today and has been out 15 minutes past their limit, before their usual leaving time and inside the alert hours (default 09:00-20:00). **Next-morning email:** yesterday ended on an In, had an Out with no In, two Ins, or an unclear gap. No email of any kind before 10 punched days; no daytime email before 10 clean days. At most one of each per person per day, never to someone who did not swipe.
+- Never alert on stale collector data; a burst over 5 people or 20% of those in is held as a likely outage. A day with an unconfirmed C3 direction guess waits for the history read.
+- **Modes:** off, shadow (record, send nothing; the default) and live, set by an admin. Live needs `ESSL_PUBLIC_URL` and at least one HR user.
+- Emails are warm and factual, assume the device missed a swipe, show only times and the out-stretch, and never reveal the person's limit or use words like violation, anomaly, flagged or suspicious.
+- **Fix requests:** at most one pending request per person per day, up to 10 lines and a 500-character note. "Everything's correct" and "I left for the day" close the day with no HR step. HR decides each line, may adjust its time or direction, and must give a note to reject. Every decision is audited. Report links are random, stored hashed, bound to one person and day, expire 7 days after it, and do nothing on GET.
+- A short public notice at `/privacy` explains what is used, why, who sees it, how long it is kept, and that alerts are never used for discipline.
+
 ## Evidence on Hand
 
 - Live network evidence on 2026-09-10: the X990 host answered ping and exposed HTTP on port 80, while TCP 4370 did not accept a connection; the C3-400 accepted TCP connections on port 4370 and, live-tested, correctly reported direction bytes matching the KTD4 alternation model.
@@ -65,7 +76,7 @@ One Docker Compose stack on an office Linux host with routes to `192.168.1.201` 
 
 ## Product Principles
 
-- Punches are the record; hours are derived, never hand-entered.
+- Punches are the record; hours are derived, never hand-entered. A correction is an approved, audited overlay, never an edited punch.
 - An incomplete day is shown honestly as incomplete, never guessed into a number.
 - Make device state and recovery actions obvious to the admin, without ever exposing a destructive control.
 - Treat credentials, network access, and employee punch data as operational secrets.

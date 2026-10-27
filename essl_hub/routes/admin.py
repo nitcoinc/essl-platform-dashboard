@@ -5,12 +5,20 @@ from __future__ import annotations
 import ipaddress
 import re
 import secrets
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from flask import Blueprint, Response, abort, g, redirect, render_template, request, url_for
 
-from .. import access, config, hashing
-from ..db import DUPLICATE_WINDOW_MAX
+from .. import access, alert_settings, config, hashing
+from ..db import (
+    ALERT_LIVE,
+    ALERT_MORNING,
+    DUPLICATE_WINDOW_MAX,
+    STATUS_BREAKER,
+    STATUS_FAILED,
+    STATUS_QUEUED,
+    STATUS_SENT,
+)
 from ..door_params import (
     DOOR_REQUEST_TTL,
     PANEL_WIDE,
@@ -27,9 +35,11 @@ from .common import (
     _day_start_hour,
     _login_required,
     _now_naive,
+    _parse_ts,
     _require_csrf,
     _role_required,
     _target_minutes,
+    _today,
     current_sync_health,
     database,
 )
@@ -331,9 +341,98 @@ def _render_settings(status: int = 200, **overrides):
         "day_start_hour": _day_start_hour(database),
         "day_start_saved": request.args.get("saved") == "day-start",
         "day_start_error": None,
+        "alerts": _alerts_panel(),
+        "alerts_saved": request.args.get("saved") == "alerts",
+        "alerts_form": None,
+        "alerts_errors": {},
+        "alert_mode_labels": ALERT_MODE_LABELS,
     }
     context.update(overrides)
     return render_template("settings.html", **context), status
+
+
+# --- Attendance alerts panel (U9, R15) ---------------------------------
+
+ALERT_MODE_LABELS = {
+    alert_settings.MODE_OFF: "Off",
+    alert_settings.MODE_SHADOW: "Shadow — log only",
+    alert_settings.MODE_LIVE: "Live — send emails",
+}
+# Would-have-sent counts cover this many work days, today included (KTD11).
+ALERT_COUNT_DAYS = 7
+# How an alert row reads in the counts table, in display order.
+ALERT_BUCKETS = ("would send", STATUS_SENT, STATUS_QUEUED, STATUS_FAILED, "not emailed", "held")
+
+
+def _alert_bucket(mode: str, status: str) -> str:
+    """"held" is a candidate the circuit breaker stopped (KTD9); shadow rows
+    are what live mode would have sent; live rows follow their outbox row,
+    and a live row with none (no email address) was "not emailed"."""
+    if status == STATUS_BREAKER:
+        return "held"
+    if mode == alert_settings.MODE_SHADOW:
+        return "would send"
+    return status if status in (STATUS_SENT, STATUS_QUEUED, STATUS_FAILED) else "not emailed"
+
+
+def _alert_count_rows(since) -> list[dict]:
+    """One row per site with (count, label) pairs for each alert kind."""
+    sites: dict[str, dict[str, dict[str, int]]] = {}
+    for row in database.alert_counts(since):
+        site = row.get("site") or "Unknown site"
+        cell = sites.setdefault(site, {}).setdefault(row["kind"], {})
+        bucket = _alert_bucket(row["mode"], row["status"])
+        cell[bucket] = cell.get(bucket, 0) + int(row["n"])
+    return [
+        {
+            "site": site,
+            **{
+                kind: [(kinds.get(kind, {})[b], b) for b in ALERT_BUCKETS if kinds.get(kind, {}).get(b)]
+                for kind in (ALERT_LIVE, ALERT_MORNING)
+            },
+        }
+        for site, kinds in sorted(sites.items())
+    ]
+
+
+def _baselines_rebuilt_at() -> datetime | None:
+    """The newest snapshot's time; the service's own run marker when there is
+    no snapshot (nobody to baseline yet)."""
+    return database.latest_baseline_at() or _parse_ts(database.setting(alert_settings.BASELINES_AT_KEY))
+
+
+def _alerts_panel() -> dict:
+    since = _today() - timedelta(days=ALERT_COUNT_DAYS - 1)
+    people = database.employees()
+    active_ids = {person["id"] for person in people}
+    baselines = database.latest_baselines()
+    rebuilt_at = _baselines_rebuilt_at()
+    return {
+        "settings": alert_settings.read(database),
+        "counts": _alert_count_rows(since),
+        "count_days": ALERT_COUNT_DAYS,
+        "people": len(people),
+        # A live limit needs enough clean workdays (R2); metrics is null until then.
+        "live_ready": sum(
+            1 for employee_id, row in baselines.items()
+            if employee_id in active_ids and row.get("metrics") is not None
+        ),
+        "rebuilt_at": rebuilt_at,
+    }
+
+
+def _live_mode_problem() -> str | None:
+    """Why live mode cannot be switched on now, or None (U9 live-mode guard):
+    emails need a link back to the dashboard and someone to approve fixes."""
+    try:
+        url = config.public_url()
+    except RuntimeError as exc:
+        return str(exc)
+    if url is None:
+        return "Set ESSL_PUBLIC_URL first so emails can link back to the dashboard."
+    if not database.active_hr_users():
+        return "Add at least one HR user first."
+    return None
 @bp.get("/admin")
 @_login_required
 def admin_view() -> Response:
@@ -700,6 +799,47 @@ def settings_set_day_start():
         )
     database.set_setting("day_start_hour", str(int(raw)))
     return redirect(url_for("admin.settings_view", saved="day-start"))
+
+
+@bp.post("/settings/alerts")
+@_role_required("admin")
+def settings_set_alerts():
+    _require_csrf()
+    form = {
+        name: (request.form.get(name) or "").strip()
+        for name in ("mode", "start_hour", "end_hour", "morning_hour")
+    }
+    errors: dict[str, str] = {}
+    checks = (
+        ("mode", alert_settings.validate_mode),
+        ("start_hour", lambda raw: alert_settings.validate_hour(raw, "Alert start hour")),
+        ("end_hour", lambda raw: alert_settings.validate_hour(raw, "Alert end hour")),
+        ("morning_hour", lambda raw: alert_settings.validate_hour(raw, "Morning email hour")),
+    )
+    values: dict[str, object] = {}
+    for name, check in checks:
+        try:
+            values[name] = check(form[name])
+        except alert_settings.SettingsError as exc:
+            errors[name] = str(exc)
+    if "start_hour" in values and "end_hour" in values:
+        try:
+            alert_settings.validate_hours_range(values["start_hour"], values["end_hour"])
+        except alert_settings.SettingsError as exc:
+            errors["end_hour"] = str(exc)
+    if not errors and values["mode"] == alert_settings.MODE_LIVE:
+        problem = _live_mode_problem()
+        if problem is not None:
+            errors["mode"] = problem
+    if errors:
+        return _render_settings(status=400, alerts_form=form, alerts_errors=errors)
+    alert_settings.write(
+        database,
+        alert_settings.parse(
+            values["mode"], values["start_hour"], values["end_hour"], values["morning_hour"]
+        ),
+    )
+    return redirect(url_for("admin.settings_view", saved="alerts"))
 
 
 @bp.post("/settings/keys")
