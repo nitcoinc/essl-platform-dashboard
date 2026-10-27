@@ -9,6 +9,7 @@ from unittest import mock
 
 from essl_hub.config import DeviceConfig
 from essl_hub import db as db_module
+from essl_hub import db_fixes
 from essl_hub.hashing import sha256_hex
 
 
@@ -1764,7 +1765,7 @@ class MissedPunchSchemaTest(unittest.TestCase):
     def test_a_failure_mid_decision_leaves_nothing_written(self) -> None:
         request_id = self._file(self._add_in(), self._add_in(18, 0))["request_id"]
         first, second = (l["id"] for l in self.database.fix_request(request_id)["lines"])
-        real = db_module._insert_fix_event
+        real = db_fixes._insert_fix_event
         calls = []
 
         def fail_on_second_line(connection, request_id, line_id, *args):
@@ -1773,7 +1774,7 @@ class MissedPunchSchemaTest(unittest.TestCase):
                 raise RuntimeError("disk full")
             return real(connection, request_id, line_id, *args)
 
-        with mock.patch.object(db_module, "_insert_fix_event", side_effect=fail_on_second_line):
+        with mock.patch.object(db_fixes, "_insert_fix_event", side_effect=fail_on_second_line):
             with self.assertRaises(RuntimeError):
                 self.database.decide_fix_lines(request_id, [
                     {"line_id": first, "status": "approved"},

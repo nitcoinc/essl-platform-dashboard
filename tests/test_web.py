@@ -686,11 +686,12 @@ class FakeDatabase:
 
     def file_fix_lines(self, employee_id, work_day, lines, *, source, punch_set_hash=None):
         from essl_hub import db as db_module
+        from essl_hub import db_fixes
 
         self._check_online()
         if source not in db_module.FIX_SOURCES:
             raise ValueError(f"unknown fix request source: {source}")
-        prepared = [db_module._fix_line_values(line) for line in lines]
+        prepared = [db_fixes._fix_line_values(line) for line in lines]
         if not prepared:
             raise ValueError("a fix request needs at least one line")
         latest = self.latest_fix_request(employee_id, work_day)
@@ -698,8 +699,8 @@ class FakeDatabase:
             request_id = latest["id"]
             held = self._request_lines(request_id)
             existing = len(held)
-            keys = {db_module._fix_line_key(line) for line in held}
-            prepared = [values for values in prepared if db_module._fix_line_key(values) not in keys]
+            keys = {db_fixes._fix_line_key(line) for line in held}
+            prepared = [values for values in prepared if db_fixes._fix_line_key(values) not in keys]
             if not prepared:
                 return {"request_id": request_id, "first_lines": False}
         else:
@@ -5259,11 +5260,11 @@ class FixReportTest(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
 
     def test_sliding_window_frees_hits_once_they_age_out(self) -> None:
-        from essl_hub.routes import fixes as fixes_module
+        from essl_hub import rate_limit
 
         clock = [1000.0]
-        window = fixes_module._SlidingWindow(2, 60)
-        with patch.object(fixes_module._clock, "monotonic", side_effect=lambda: clock[0]):
+        window = rate_limit.SlidingWindow(2, 60)
+        with patch.object(rate_limit._clock, "monotonic", side_effect=lambda: clock[0]):
             self.assertTrue(window.allow("k"))
             clock[0] += 30
             self.assertTrue(window.allow("k"))
