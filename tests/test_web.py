@@ -5072,6 +5072,80 @@ class PunchArchiveWebTest(unittest.TestCase):
         self.client.post(f"/people/{self.sita['id']}/edit", data={**data, "archived_ok": "9999"})
         self.assertEqual(self.database.employee_by_id(self.sita["id"])["device_user_id"], "9999")
 
+    def test_adding_a_person_with_an_archived_id_asks_once_more(self) -> None:
+        self.database.archive_punches("9999", from_ts=None, to_ts=None)
+        self._sign_in(self.admin)
+        data = {"csrf": self._csrf(), "name": "Temp Tester", "email": "tester@n.com",
+                "device_user_id": "9999", "manager_id": "", "role": "employee"}
+        first = self.client.post("/people/new", data=data)
+        self.assertIn("3 punches of this ID are archived and stay hidden.", first.text)
+        self.assertIsNone(self.database.employee_by_email("tester@n.com"))
+        self.client.post("/people/new", data={**data, "archived_ok": "9999"})
+        self.assertEqual(self.database.employee_by_email("tester@n.com")["device_user_id"], "9999")
+
+    def test_the_inline_device_id_edit_refuses_an_archived_id(self) -> None:
+        self.database.archive_punches("9999", from_ts=None, to_ts=None)
+        self._sign_in(self.admin)
+        response = self.client.post(f"/people/{self.sita['id']}/assign", data={
+            "csrf": self._csrf(), "device_user_id": "9999", "manager_id": "", "role": "employee"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("3 archived punches that would stay hidden", response.text)
+        self.assertEqual(self.database.employee_by_id(self.sita["id"])["device_user_id"], "3")
+
+    # --- bad input ----------------------------------------------------------
+
+    def _post_archive(self, **fields):
+        return self.client.post("/people/issues/archive", data={
+            "csrf": self._csrf(), "device_user_id": "9999", **fields})
+
+    def test_a_lost_or_malformed_range_is_refused_and_writes_nothing(self) -> None:
+        self._sign_in(self.admin)
+        for fields in ({}, {"to_ts": "garbage"}, {"from_ts": "2026-10-01T00:00:00", "to_ts": "garbage"}):
+            response = self._post_archive(**fields)
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("The archive range was lost", response.text)
+        self.assertEqual(self.database.punch_archives(), [])
+
+    def test_a_timezone_aware_range_is_a_400_not_a_500(self) -> None:
+        self._sign_in(self.admin)
+        response = self._post_archive(to_ts="2030-01-01T00:00:00+05:30")
+        self.assertEqual(response.status_code, 400)
+        response = self._post_archive(from_ts="2026-10-01T00:00:00Z", to_ts="2026-10-02 00:00:00")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.database.punch_archives(), [])
+
+    def test_a_reversed_range_is_refused(self) -> None:
+        self._sign_in(self.admin)
+        response = self._post_archive(from_ts="2026-10-09 00:00:00", to_ts="2026-10-02 00:00:00")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("The from date must be before the to date.", response.text)
+        self.assertEqual(self.database.punch_archives(), [])
+
+    def test_a_non_ascii_restore_parameter_is_ignored(self) -> None:
+        self.database.archive_punches("9999", from_ts=None, to_ts=None)
+        self._sign_in(self.admin)
+        page = self.client.get("/people/issues/archived?restore=%C2%B2")
+        self.assertEqual(page.status_code, 200)
+        self.assertNotIn("Restore the archive of 9999?", page.text)
+
+    def test_an_htmx_fragment_skips_the_device_health_and_unmapped_scans(self) -> None:
+        self._sign_in(self.admin)
+        with patch.object(self.database, "unreachable_device_details", return_value=[]) as devices, \
+                patch.object(self.database, "unmapped_device_user_ids", return_value=[]) as unmapped:
+            self.client.get("/team?q=sita", headers={"HX-Request": "true"})
+            devices.assert_not_called()
+            unmapped.assert_not_called()
+            self.client.get("/team")
+            devices.assert_called()
+            unmapped.assert_called()
+
+    def test_action_buttons_carry_a_well_formed_aria_label(self) -> None:
+        archive_id = self.database.archive_punches("9999", from_ts=None, to_ts=None)
+        self._sign_in(self.admin)
+        self.assertIn('aria-label="Restore the archive of 9999"', self.client.get("/people/issues/archived").text)
+        self.database.restore_punch_archive(archive_id)
+        self.assertIn('aria-label="Archive punches of 9999"', self.client.get("/people/issues").text)
+
 
 class ScreensTest(unittest.TestCase):
     """U11: devices split, settings, Today and sign-in screens."""

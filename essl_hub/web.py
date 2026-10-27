@@ -146,6 +146,9 @@ def create_app(database: Database | None = None) -> Flask:
         employee = g.get("employee")
         if not employee or employee["role"] != "admin":
             return {}
+        # An htmx fragment has no top bar or nav, so skip the file reads and devices query.
+        if _htmx_partial():
+            return {}
         health = current_sync_health(database)[0]
         # The Devices nav badge counts the same devices the health signal
         # names (KTD8), so the two never disagree and the table is read once.

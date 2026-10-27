@@ -1,9 +1,9 @@
 """Database methods for punch archives (v9, KTD1-KTD3): rules that hide one
 device user ID's punches over a range, their restore, and the archive list.
 ``Database`` (essl_hub.db) inherits ArchivesMixin; the mixin uses only
-``self.connect`` / ``self.transaction`` from it. The read-side filter itself
-(``_ACTIVE_PUNCH_SQL``) stays in essl_hub.db next to the punch reads it
-guards.
+``self.connect`` / ``self.transaction`` from it. The read-side filter
+(``_ACTIVE_PUNCH_SQL``) lives here beside the predicate it is built from and
+is imported by essl_hub.db for the punch reads it guards.
 
 A rule never edits a punch row: the collector's fingerprint dedupe still sees
 every row, so a re-poll inserts nothing, and restore is one field update.
@@ -23,6 +23,16 @@ _COVERED_SQL = (
     "p.device_user_id = a.device_user_id "
     "AND (a.from_ts IS NULL OR p.event_timestamp >= a.from_ts) "
     "AND p.event_timestamp < a.to_ts"
+)
+
+# A punch no active archive rule covers (v9, KTD1-KTD3): rules hide
+# from_ts <= event_timestamp < to_ts, a NULL from_ts meaning "from the start".
+# Needs the punch aliased ``p``. Every read that feeds hours, views, exports,
+# the API, Frappe, alerts and ID issues carries it; the collector's dedupe,
+# direction repair, device counts and backups read punches raw (KTD2).
+_ACTIVE_PUNCH_SQL = (
+    "NOT EXISTS (SELECT 1 FROM punch_archives a "
+    f"WHERE a.restored_at IS NULL AND {_COVERED_SQL})"
 )
 
 
@@ -67,7 +77,7 @@ class ArchivesMixin:
             "SELECT COUNT(*) AS n, MIN(p.event_timestamp) AS first_at, "
             "MAX(p.event_timestamp) AS last_at FROM punches p "
             "WHERE p.device_user_id = ? AND p.event_timestamp < ? "
-            f"AND {_core()._ACTIVE_PUNCH_SQL}"
+            f"AND {_ACTIVE_PUNCH_SQL}"
         )
         params: list[object] = [device_user_id, to_ts]
         if from_ts is not None:
@@ -81,8 +91,8 @@ class ArchivesMixin:
             "to_ts": to_ts,
             "count": int(row["n"] or 0),
             # MIN()/MAX() drop the column's declared type, so timestamps come back as text.
-            "first": _as_datetime(row["first_at"]),
-            "last": _as_datetime(row["last_at"]),
+            "first": _core()._parse_timestamp(row["first_at"]),
+            "last": _core()._parse_timestamp(row["last_at"]),
         }
 
     def archive_punches(
@@ -99,6 +109,14 @@ class ArchivesMixin:
         from_ts, to_ts = archive_range(from_ts, to_ts)
         reason = (reason or "").strip()[:ARCHIVE_REASON_MAX_CHARS] or None
         with self.transaction() as connection:
+            # A double submit of the same confirm step writes one rule, not twins.
+            twin = connection.execute(
+                "SELECT id FROM punch_archives WHERE device_user_id = ? AND restored_at IS NULL "
+                "AND to_ts = ? AND from_ts IS ?",
+                (device_user_id, to_ts, from_ts),
+            ).fetchone()
+            if twin is not None:
+                return int(twin["id"])
             cursor = connection.execute(
                 "INSERT INTO punch_archives (device_user_id, from_ts, to_ts, reason, created_by, "
                 "created_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -157,13 +175,8 @@ class ArchivesMixin:
                 return None
             hidden = connection.execute(
                 "SELECT COUNT(*) AS n FROM punches p WHERE p.device_user_id = ? "
-                f"AND NOT {_core()._ACTIVE_PUNCH_SQL}",
+                f"AND NOT {_ACTIVE_PUNCH_SQL}",
                 (device_user_id,),
             ).fetchone()["n"]
         return {"archives": int(rules), "hidden": int(hidden)}
 
-
-def _as_datetime(value: object) -> datetime | None:
-    if value is None or isinstance(value, datetime):
-        return value
-    return datetime.fromisoformat(str(value))

@@ -5,9 +5,9 @@
 {%- endmacro %}
 
 {# variant: primary | secondary | tertiary | danger. Renders <a> when href is given. #}
-{% macro button(label, variant='secondary', href=None, type='button', icon_name=None, size=None, attrs='') -%}
+{% macro button(label, variant='secondary', href=None, type='button', icon_name=None, size=None, attrs='', aria_label=None) -%}
 {% set cls = 'button button-' ~ variant ~ (' button-sm' if size == 'sm' else '') %}
-{% if href %}<a class="{{ cls }}" href="{{ href }}" {{ attrs|safe }}>{% else %}<button class="{{ cls }}" type="{{ type }}" {{ attrs|safe }}>{% endif %}
+{% if href %}<a class="{{ cls }}" href="{{ href }}"{% if aria_label %} aria-label="{{ aria_label }}"{% endif %} {{ attrs|safe }}>{% else %}<button class="{{ cls }}" type="{{ type }}"{% if aria_label %} aria-label="{{ aria_label }}"{% endif %} {{ attrs|safe }}>{% endif %}
 {%- if icon_name %}{{ icon(icon_name) }}{% endif %}<span>{{ label }}</span>
 {%- if href %}</a>{% else %}</button>{% endif %}
 {%- endmacro %}

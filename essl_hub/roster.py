@@ -102,6 +102,14 @@ def apply_rows(database, rows, actor: dict | None = None) -> list[RosterOutcome]
                 row, "rejected", f"matches archived person {archived['name']}; restore them first"
             )
             continue
+        if database.employee_by_device_user_id(row.device_user_id) is None and (
+            held := database.active_archive_for(row.device_user_id)
+        ) is not None:
+            outcomes[row.row_number] = _outcome(
+                row, "rejected",
+                f"device user ID has {held['hidden']} archived punches that would stay hidden; restore the archive first",
+            )
+            continue
         if actor is not None and _touches_protected_admin(database, actor, row):
             outcomes[row.row_number] = _outcome(row, "rejected", _ADMIN_ROW)
             continue

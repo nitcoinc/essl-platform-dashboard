@@ -12,7 +12,7 @@
   <div>
     <a class="back-link" href="{{ url_for('people.id_issues_view') }}">{{ ui.icon('arrow-left') }}<span>ID issues</span></a>
     <h1>Archived punches</h1>
-    <p>Punches of old, temporary or test cards, hidden from hours, Team, exports, the API, Frappe and ID issues. Nothing is deleted{% if can_restore %}; restore an archive and its punches show again everywhere{% endif %}.</p>
+    <p>Punches of old, temporary or test cards, hidden from hours, Team, exports, the API and ID issues, and not sent to Frappe from now on. Punches already pulled or sent stay where they are. Nothing is deleted{% if can_restore %}; restore an archive and its punches show again everywhere{% endif %}.</p>
   </div>
 </header>
 {% include "_people_tabs.html" %}
@@ -59,7 +59,7 @@
           <td data-label="Archived">{{ when(a.created_at) }}<br><span class="muted">{{ a.created_by_name or 'Unknown' }}</span></td>
           <td class="num" data-label="Hidden">{{ a.hidden_count }}</td>
           {% if can_restore %}
-          <td>{{ ui.button('Restore', 'secondary', href=url_for('people.punch_archives_view', restore=a.id), size='sm', attrs='aria-label="Restore the archive of ' ~ a.device_user_id|e ~ '"') }}</td>
+          <td>{{ ui.button('Restore', 'secondary', href=url_for('people.punch_archives_view', restore=a.id), size='sm', aria_label='Restore the archive of ' ~ a.device_user_id) }}</td>
           {% endif %}
         </tr>
         {% endfor %}

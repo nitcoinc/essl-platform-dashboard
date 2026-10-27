@@ -2142,6 +2142,58 @@ class PunchArchiveTest(unittest.TestCase):
         self.assertEqual(self.database.active_archive_for("9999"), {"archives": 1, "hidden": 3})
         self.assertIsNone(self.database.active_archive_for("118"))
 
+    def test_a_rule_includes_its_from_and_excludes_its_to(self) -> None:
+        self._archive(from_ts=datetime(2026, 10, 5, 9, 0), to_ts=datetime(2026, 10, 10, 9, 0))
+        self.assertEqual(self._visible()["summary"], 2)
+        (rule,) = self.database.punch_archives()
+        self.assertEqual(rule["hidden_count"], 1)
+
+    def test_submitting_the_same_range_twice_writes_one_rule(self) -> None:
+        first = self._archive(from_ts=datetime(2026, 10, 4), to_ts=datetime(2026, 10, 12))
+        again = self._archive(from_ts=datetime(2026, 10, 4), to_ts=datetime(2026, 10, 12))
+        whole = self._archive()
+        self.assertEqual(first, again)
+        self.assertNotEqual(first, whole)
+        self.assertEqual(self._archive(), whole)
+        self.assertEqual(len(self.database.punch_archives()), 2)
+        self.database.restore_punch_archive(first)
+        self.assertNotEqual(self._archive(from_ts=datetime(2026, 10, 4), to_ts=datetime(2026, 10, 12)), first)
+
+    def test_the_active_filter_probes_the_archive_index(self) -> None:
+        from essl_hub.db_archives import _ACTIVE_PUNCH_SQL
+
+        with self.database.connect() as connection:
+            plan = " ".join(
+                row["detail"] for row in connection.execute(
+                    f"EXPLAIN QUERY PLAN SELECT 1 FROM punches p WHERE {_ACTIVE_PUNCH_SQL}"
+                ).fetchall()
+            )
+        self.assertIn("idx_punch_archives_user", plan)
+
+
+class UnreachableDeviceDetailsTest(unittest.TestCase):
+    """The health signal and the Devices badge read this query (KTD8)."""
+
+    def test_only_active_devices_with_a_failed_poll_are_named_in_site_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database = db_module.Database(os.path.join(tmp, "essl.db"))
+            self.addCleanup(database.close)
+            devices = tuple(
+                DeviceConfig(id=f"{site.lower()}-{model.lower()}", site=site, model=model, ip="10.0.0.1",
+                             port=4370, protocol="zk-attendance", password_env="ESSL_X990_PASSWORD")
+                for site, model in (("Uppal", "X990"), ("Gachibowli", "C3"), ("Hitech", "K40"))
+            )
+            database.initialize(devices)
+            for device in devices:
+                database.record_poll(device.id, status="error", error="timed out")
+            database.set_device_retired("hitech-k40", True)
+            details = database.unreachable_device_details()
+            self.assertEqual([d["id"] for d in details], ["gachibowli-c3", "uppal-x990"])
+            self.assertEqual([d["name"] for d in details], ["Gachibowli C3", "Uppal X990"])
+            self.assertIsNone(details[0]["last_success"])
+            database.record_poll("uppal-x990", status="connected", transport="tcp")
+            self.assertEqual([d["id"] for d in database.unreachable_device_details()], ["gachibowli-c3"])
+
 
 class SharedLocalFileTest(unittest.TestCase):
     """Local-first U1 / KTD5, KTD6: two processes share one WAL file."""

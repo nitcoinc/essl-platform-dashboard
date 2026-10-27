@@ -33,7 +33,7 @@ from .db_alerts import (
     AlertsMixin,
     mail_retry_delay,
 )
-from .db_archives import ARCHIVE_REASON_MAX_CHARS, ArchivesMixin, archive_range
+from .db_archives import _ACTIVE_PUNCH_SQL, ARCHIVE_REASON_MAX_CHARS, ArchivesMixin, archive_range
 from .db_fixes import (
     DIRECTIONS,
     FIX_ADD_KINDS,
@@ -284,18 +284,6 @@ _MAIN_ID_SQL = (
     "COALESCE((SELECT e.device_user_id FROM employee_device_ids x "
     "JOIN employees e ON e.id = x.employee_id WHERE x.device_user_id = p.device_user_id), "
     "p.device_user_id)"
-)
-
-# A punch no active archive rule covers (v9, KTD1-KTD3): rules hide
-# from_ts <= event_timestamp < to_ts, a NULL from_ts meaning "from the start".
-# Needs the punch aliased ``p``. Every read that feeds hours, views, exports,
-# the API, Frappe, alerts and ID issues carries it; the collector's dedupe,
-# direction repair, device counts and backups read punches raw (KTD2).
-_ACTIVE_PUNCH_SQL = (
-    "NOT EXISTS (SELECT 1 FROM punch_archives a "
-    "WHERE a.device_user_id = p.device_user_id AND a.restored_at IS NULL "
-    "AND (a.from_ts IS NULL OR p.event_timestamp >= a.from_ts) "
-    "AND p.event_timestamp < a.to_ts)"
 )
 
 

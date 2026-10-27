@@ -105,7 +105,7 @@ def _render_team(export_error: str | None = None, status: int = 200):
         "show_manager": everyone_label,
         "title": "Employees" if everyone_label else "Team",
         "today": today,
-        "unmapped": database.unmapped_device_user_ids() if everyone_label else [],
+        "unmapped": database.unmapped_device_user_ids() if everyone_label and not _htmx_partial() else [],
         "presets": presets,
         "export_from": request.args.get("from") or presets["this_month"][0].isoformat(),
         "export_to": request.args.get("to") or presets["this_month"][1].isoformat(),

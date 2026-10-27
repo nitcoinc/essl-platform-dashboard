@@ -167,7 +167,7 @@ Everything is one `docker-compose.yml` on one x86_64 host that can reach both de
 | `collector` | Polls the devices every `ESSL_COLLECTOR_INTERVAL_SECONDS` and writes punches to `essl.db`. Polls even when the internet is down. A punch write that fails (database busy or not set up) goes to the local spool and is replayed in order later. |
 | `web` | Flask + gunicorn (`-w 1 --threads 4`). The screens and the read-only HRMS API. Owns the schema. Published on host loopback only (`127.0.0.1:ESSL_WEB_PORT`, default 8080). |
 | `backup` | Every `ESSL_BACKUP_MINUTES` (15) takes a snapshot with SQLite's backup API, deletes sessions, login codes, report links and queued emails, runs `VACUUM` and `integrity_check`, gzips it and uploads it to R2. Also the admin CLI (`python -m essl_hub.backup <command>`, see [Backups](#backups)). The only service with R2 credentials. |
-| `alerts` | Rebuilds each person's baseline weekly, runs the daytime check every 5 minutes and the next-morning check from the morning email hour, and sends every queued email (alerts, fix requests, decisions); the web only queues. Waits for schema v8 and never creates or migrates `essl.db`. Needs the mail variables and `ESSL_PUBLIC_URL`. See [Missed-punch alerts](#missed-punch-alerts-and-fix-requests). |
+| `alerts` | Rebuilds each person's baseline weekly, runs the daytime check every 5 minutes and the next-morning check from the morning email hour, and sends every queued email (alerts, fix requests, decisions); the web only queues. Waits for schema v9 and never creates or migrates `essl.db`. Needs the mail variables and `ESSL_PUBLIC_URL`. See [Missed-punch alerts](#missed-punch-alerts-and-fix-requests). |
 | `cloudflared` | *Optional* bundled Cloudflare Tunnel (compose profile `tunnel`). Skip it when the host already runs cloudflared. |
 
 All four app services mount the same data folder at `/data`, so `essl.db`, its `-wal` and `-shm`, the collector spool and the status files (`collector-status.json`, `backup-status.json`) sit side by side. Web, collector and alerts **never create** `essl.db`: until an admin runs `init`, `restore` or `import-turso`, the web app shows a "Database not set up" page with the three commands and the collector spools and waits. All containers run as UID/GID 10001.
@@ -352,7 +352,7 @@ Temporary, visitor and test cards leave **Not in Directory** issues whose punche
 - Swipes made after you archive always stay visible, so a card handed to a new person is never hidden.
 - Only **Not in Directory** and **Shared card** issues can be archived. An ID that belongs to someone is refused; use a fix request instead.
 
-Archiving never edits or deletes a punch. It stores a rule, and every read hides the punches it covers: hours, Team, People, exports, `/api/v1/hours`, `/api/v1/checkins`, Frappe pending sync, alerts and baselines, the history pager, ID issues and the unknown-ID notices. The collector still sees every row, so the devices' resent history is never inserted again. The device card's *Punches stored* still counts them.
+Archiving never edits or deletes a punch. It stores a rule, and every read hides the punches it covers: hours, Team, People, exports, `/api/v1/hours`, `/api/v1/checkins`, Frappe pending sync, alerts and baselines, the history pager, ID issues and the unknown-ID notices. The collector still sees every row, so the devices' resent history is never inserted again. The device card's *Punches stored* still counts them. Archiving is not retroactive for consumers: punches already sent to Frappe stay there, and an API client whose `since` cursor is past an archived or restored range does not see those punches change, so re-pull with an earlier `since` after a restore. A device ID with an active archive cannot be given to a person by CSV import or the inline Device ID edit; use the person's page, which asks first, or restore the archive.
 
 **People → ID issues → Archived punches** lists every archive: who, when, range, reason and how many punches it hides now. HR can see it; admins can **Restore**, which brings the punches back everywhere at once.
 
@@ -444,12 +444,13 @@ Then fix the Uppal row if it was migrated as `.42`.
 
 ### Sync-health indicator
 
-Admins see an indicator top right on every page. It links to **System health** (`/health`, admin only, 404 for everyone else) and shows the worst of two signals, each read from the data folder:
+Admins see an indicator top right on every page. It links to **System health** (`/health`, admin only, 404 for everyone else) and shows the worst of its signals, each read from the data folder:
 
 | Signal | Green | Amber | Red |
 | --- | --- | --- | --- |
 | Collector | polled within 10 min, spool empty | punches spooled | no poll for 10 min, a dead-lettered punch, or the oldest spooled punch older than 60 min |
 | Backups | last backup within 2 intervals (30 min) | within 6 intervals (90 min) | older, none yet, 3 failed cycles in a row, or blocked by a different database |
+| Devices | every active device answered its last poll | - | an active device failed its last poll (named, with the date it last connected); the Devices nav entry shows the same count |
 
 With no R2 configured, Backups shows a neutral **Off** chip that never colours the indicator. The page also lists the last 14 backup cycles and the recovery commands.
 

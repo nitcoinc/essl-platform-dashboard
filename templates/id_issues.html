@@ -45,7 +45,7 @@
 {% set n = archive.count or 0 %}
 <section class="issue-confirm" aria-labelledby="archive-heading">
   <h2 id="archive-heading">Archive punches of {{ archive.device_user_id }}?</h2>
-  <p>Archived punches are hidden from hours, Team, exports, the API, Frappe and this list. Nothing is deleted: restore them any time from <a href="{{ url_for('people.punch_archives_view') }}">Archived punches</a>.</p>
+  <p>Archived punches are hidden from hours, Team, exports, the API and this list, and not sent to Frappe from now on. Punches already pulled or sent stay where they are. Nothing is deleted: restore them any time from <a href="{{ url_for('people.punch_archives_view') }}">Archived punches</a>.</p>
   <form method="get" action="{{ url_for('people.id_issues_view') }}" class="archive-range">
     <input type="hidden" name="archive" value="{{ archive.device_user_id }}">
     <div class="field">
@@ -167,7 +167,7 @@
     {% if can_archive_punches and issue.kind in archivable_kinds %}
     <form method="get" action="{{ url_for('people.id_issues_view') }}" class="issue-archive">
       <input type="hidden" name="archive" value="{{ issue.device_user_id }}">
-      {{ ui.button('Archive punches', 'tertiary', type='submit', size='sm', attrs='aria-label="Archive punches of ' ~ issue.device_user_id|e ~ '"') }}
+      {{ ui.button('Archive punches', 'tertiary', type='submit', size='sm', aria_label='Archive punches of ' ~ issue.device_user_id) }}
     </form>
     {% endif %}
     {% if fix.action != 'none' %}

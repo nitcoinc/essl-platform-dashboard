@@ -220,6 +220,9 @@ def _device_id_change(target: dict, raw: str | None):
         return None, (f"{_who(holder)} already uses device ID {value}.", 400)
     if holder is not None:
         return None, (f"{value} is already one of {target['name']}'s other device IDs. Remove it there first.", 400)
+    if (held := database.active_archive_for(value)) is not None:
+        return None, (f"Device ID {value} has {held['hidden']} archived punches that would stay hidden. "
+                      "Change it on the person's page to confirm, or restore the archive first.", 400)
     return value, None
 
 
@@ -899,7 +902,12 @@ def _archive_preview(issues: list[id_issues.Issue], device_user_id: str) -> dict
 
 def _form_timestamp(name: str) -> datetime | None:
     raw = (request.form.get(name) or "").strip()
-    return datetime.fromisoformat(raw) if raw else None
+    if not raw:
+        return None
+    parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is not None:
+        raise ValueError("stored timestamps are naive local time")
+    return parsed
 
 
 @bp.post("/people/issues/archive")
@@ -914,7 +922,7 @@ def id_issues_archive():
     try:
         from_ts, to_ts = _form_timestamp("from_ts"), _form_timestamp("to_ts")
     except ValueError:
-        to_ts = None
+        from_ts = to_ts = None
     if to_ts is None:
         return _render_id_issues(error="The archive range was lost; open the preview again.", status=400)
     try:
@@ -938,8 +946,9 @@ def punch_archives_view():
     can_restore = access.can_archive_punches(g.employee)
     archives = database.punch_archives()
     confirm = None
-    if can_restore and request.args.get("restore", "").isdigit():
-        wanted = int(request.args["restore"])
+    restore = request.args.get("restore", "")
+    if can_restore and restore.isascii() and restore.isdigit():
+        wanted = int(restore)
         confirm = next((a for a in archives if a["id"] == wanted and a["restored_at"] is None), None)
     response = make_response(render_template(
         "punch_archives.html",
