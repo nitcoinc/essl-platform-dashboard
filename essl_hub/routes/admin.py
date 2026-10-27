@@ -18,6 +18,7 @@ from ..db import (
     STATUS_FAILED,
     STATUS_QUEUED,
     STATUS_SENT,
+    window_floor,
 )
 from ..door_params import (
     DOOR_REQUEST_TTL,
@@ -61,14 +62,18 @@ DEVICE_FAMILIES = {
 PICKUP_MINUTES = 2
 
 C3_PROTOCOL = config.C3_PROTOCOL
-# Quick-swipe window presets (U5); 0 counts every swipe.
-WINDOW_PRESETS = (0, 5, 10, 60)
-# Pre-implementation Check: the C3's directions are trusted after U3, the
-# X990 has none, so a double tap there needs a small window.
+# Quick-swipe window presets (U5) per protocol; 0 counts every swipe.
+WINDOW_PRESETS = {
+    C3_PROTOCOL: (0, 5, 10, 60),
+    config.X990_PROTOCOL: (30, 60, 120),
+}
+# The C3's directions are trusted, so a re-swipe can never flip them. The X990
+# has none: hours alternate, and a re-swipe the window lets through flips every
+# later swipe that day, so it needs a long window.
 WINDOW_ADVICE = {
     C3_PROTOCOL: "Recommended for this C3: 10 s.",
-    config.X990_PROTOCOL: "Recommended for the X990: 5-10 s. It records no direction, so a "
-    "double tap inside the window is not counted.",
+    config.X990_PROTOCOL: "Recommended for the X990: 60 s (minimum 30 s). It records no direction, so "
+    "a re-swipe outside the window counts as a swipe and flips In and Out for the rest of that day.",
 }
 _INTEGER = re.compile(r"-?\d+")
 # Door request outcomes as the card names them (door_params result JSON).
@@ -317,6 +322,7 @@ def _render_devices(status: int = 200, **overrides):
         "policy_form": None,
         "window_presets": WINDOW_PRESETS,
         "window_max": DUPLICATE_WINDOW_MAX,
+        "window_floors": {C3_PROTOCOL: window_floor(C3_PROTOCOL), config.X990_PROTOCOL: window_floor(config.X990_PROTOCOL)},
         "window_advice": WINDOW_ADVICE,
         "door_filed": request.args.get("door"),
         "door_dismissed": request.args.get("dismissed"),
@@ -596,10 +602,11 @@ def devices_policy(device_id: str):
         else True
     )
     window = _strict_int(raw)
-    if window is None or not 0 <= window <= DUPLICATE_WINDOW_MAX:
+    floor = window_floor(device["protocol"])
+    if window is None or not floor <= window <= DUPLICATE_WINDOW_MAX:
         return _render_devices(
             status=400,
-            policy_error=f"Enter whole seconds from 0 to {DUPLICATE_WINDOW_MAX}.",
+            policy_error=f"Enter whole seconds from {floor} to {DUPLICATE_WINDOW_MAX}.",
             policy_error_id=device_id,
             policy_form={"window_seconds": raw, "wait_for_door_close": wait},
         )

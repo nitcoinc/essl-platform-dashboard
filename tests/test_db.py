@@ -10,6 +10,7 @@ from unittest import mock
 
 from essl_hub.config import DeviceConfig
 from essl_hub import db as db_module
+from essl_hub.db import DIRECTIONLESS_WINDOW_MIN
 from essl_hub import db_fixes
 from essl_hub.hashing import sha256_hex
 
@@ -478,12 +479,34 @@ class DatabaseTest(unittest.TestCase):
                 self.database.set_device_policy(
                     "uppal-x990", window_seconds=bad, wait_for_door_close=True)
         self.assertEqual(self.database.device_windows()["uppal-x990"], 60)
-        for good in (0, 300):
+        for good in (DIRECTIONLESS_WINDOW_MIN, 300):
             self.assertTrue(self.database.set_device_policy(
                 "uppal-x990", window_seconds=good, wait_for_door_close=True))
             self.assertEqual(self.database.device_windows()["uppal-x990"], good)
         self.assertFalse(self.database.set_device_policy(
             "missing", window_seconds=10, wait_for_door_close=True))
+
+    def test_x990_window_has_a_floor_because_it_records_no_direction(self) -> None:
+        # Alternation is the X990's only direction, so a re-swipe the window lets
+        # through flips In/Out for the rest of the day.
+        for bad in (0, 2, DIRECTIONLESS_WINDOW_MIN - 1):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.database.set_device_policy(
+                    "uppal-x990", window_seconds=bad, wait_for_door_close=True)
+        self.assertEqual(self.database.device_windows()["uppal-x990"], 60)
+        self.assertTrue(self.database.set_device_policy(
+            "uppal-x990", window_seconds=DIRECTIONLESS_WINDOW_MIN, wait_for_door_close=True))
+        # The C3 records directions, so it keeps the full range.
+        self.assertTrue(self.database.set_device_policy(
+            "gachibowli-c3-400", window_seconds=0, wait_for_door_close=True))
+
+    def test_stored_x990_window_below_the_floor_scores_at_the_floor(self) -> None:
+        # A value saved before the floor existed must not keep flipping directions.
+        with self.database.transaction() as connection:
+            connection.execute("UPDATE devices SET duplicate_window_seconds = 2")
+        windows = self.database.device_windows()
+        self.assertEqual(windows["uppal-x990"], DIRECTIONLESS_WINDOW_MIN)
+        self.assertEqual(windows["gachibowli-c3-400"], 2)
 
     def test_device_policy_door_close_and_audit_row(self) -> None:
         admin = self._employee("1", "admin@x.com")
@@ -517,7 +540,7 @@ class DatabaseTest(unittest.TestCase):
         with mock.patch.object(db_module, "_insert_device_change", side_effect=RuntimeError("boom")):
             with self.assertRaises(RuntimeError):
                 self.database.set_device_policy(
-                    "uppal-x990", window_seconds=5, wait_for_door_close=True)
+                    "uppal-x990", window_seconds=45, wait_for_door_close=True)
         self.assertEqual(self.database.device_windows()["uppal-x990"], 60)
 
     def test_connection_info_carries_policy_and_request(self) -> None:

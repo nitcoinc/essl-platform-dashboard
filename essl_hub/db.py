@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 import libsql
 
-from .config import C3_PROTOCOL, DeviceConfig, TIMEZONE_NAME, db_path
+from .config import C3_PROTOCOL, X990_PROTOCOL, DeviceConfig, TIMEZONE_NAME, db_path
 from .db_alerts import (
     ALERT_KINDS,
     ALERT_LIVE,
@@ -60,7 +60,8 @@ from .hours import apply_corrections
 __all__ = [
     # Core.
     "BUSY_TIMEOUT_MS", "C3_UNDECODED_BYTE", "DATE_COLUMNS", "DEFAULT_DAY_START_HOUR",
-    "DEFAULT_TARGET_MINUTES", "DEVICE_CHANGE_KINDS", "DUPLICATE_WINDOW_MAX", "FRAPPE_GUESS_HOLD",
+    "DEFAULT_TARGET_MINUTES", "DEVICE_CHANGE_KINDS", "DIRECTIONLESS_WINDOW_MIN", "DUPLICATE_WINDOW_MAX",
+    "FRAPPE_GUESS_HOLD",
     "JSON_COLUMNS", "MIGRATIONS", "PUNCH_INSERT_BATCH", "PUNCH_TX_ROWS", "SCHEMA_STATEMENTS",
     "SCHEMA_VERSION", "SETUP_COMMANDS", "TIMESTAMP_COLUMNS", "TIMESTAMP_FORMAT",
     "BusyError", "Database", "DatabaseMissing", "FixLineLimit", "IntegrityError", "OfflineError",
@@ -761,6 +762,14 @@ _FRAPPE_HELD_SQL = (
 
 # Quick-swipe window bounds in seconds (KTD3); 0 counts every swipe.
 DUPLICATE_WINDOW_MAX = 300
+# The X990 records no direction, so hours alternate In/Out from its swipes and
+# one re-swipe the window lets through flips every later swipe that day. A
+# device with directions (the C3) keeps the full 0-max range.
+DIRECTIONLESS_WINDOW_MIN = 30
+
+
+def window_floor(protocol: str | None) -> int:
+    return DIRECTIONLESS_WINDOW_MIN if protocol == X990_PROTOCOL else 0
 DEVICE_CHANGE_KINDS = frozenset(
     {"policy", "door_write", "door_read", "door_restore", "door_dismiss"}
 )
@@ -1043,11 +1052,15 @@ class Database(AlertsMixin, FixesMixin, ArchivesMixin):
         now = _now()
         with self.transaction() as connection:
             row = connection.execute(
-                "SELECT duplicate_window_seconds, door_denied_since FROM devices WHERE id = ?",
+                "SELECT duplicate_window_seconds, door_denied_since, protocol FROM devices WHERE id = ?",
                 (device_id,),
             ).fetchone()
             if row is None:
                 return False
+            if window_seconds < window_floor(row["protocol"]):
+                raise ValueError(
+                    f"window must be {window_floor(row['protocol'])}-{DUPLICATE_WINDOW_MAX} seconds on this device"
+                )
             connection.execute(
                 "UPDATE devices SET duplicate_window_seconds = ?, "
                 "door_denied_since = CASE WHEN ? THEN NULL "
@@ -1188,12 +1201,16 @@ class Database(AlertsMixin, FixesMixin, ArchivesMixin):
             return cursor.rowcount > 0
 
     def device_windows(self) -> dict[str, int]:
-        """Quick-swipe window per device, retired ones included (KTD3)."""
+        """Quick-swipe window per device, retired ones included (KTD3). A
+        value stored below its device's floor scores at the floor."""
         with self.connect() as connection:
             rows = connection.execute(
-                "SELECT id, duplicate_window_seconds FROM devices"
+                "SELECT id, protocol, duplicate_window_seconds FROM devices"
             ).fetchall()
-        return {row["id"]: int(row["duplicate_window_seconds"]) for row in rows}
+        return {
+            row["id"]: max(int(row["duplicate_window_seconds"]), window_floor(row["protocol"]))
+            for row in rows
+        }
 
     def record_device_change(
         self,
