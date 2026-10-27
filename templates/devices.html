@@ -9,6 +9,7 @@
 {% set d = device.id %}
 {% set is_c3 = device.protocol == 'c3-pullsdk' %}
 {% set p_err = policy_error_id == d %}
+{% set floor = window_floors.get(device.protocol, 0) %}
 {% set waits = (policy_form.wait_for_door_close if p_err else device.door_denied_since is none) %}
 <details class="device-edit"{% if p_err %} open{% endif %}>
   <summary>Swipe policy <span class="summary-value">{{ device.duplicate_window_seconds }} s{% if is_c3 %}, {{ 'waits for door close' if device.door_denied_since is none else 'counts door denials' }}{% endif %}</span></summary>
@@ -18,14 +19,14 @@
     <div class="field">
       <label for="{{ d }}-window">Quick-swipe window (seconds)</label>
       <div class="policy-window">
-        <input id="{{ d }}-window" name="window_seconds" type="number" min="0" max="{{ window_max }}" step="1" inputmode="numeric" required list="window-presets"
+        <input id="{{ d }}-window" name="window_seconds" type="number" min="{{ floor }}" max="{{ window_max }}" step="1" inputmode="numeric" required list="window-presets-{{ device.protocol }}"
           value="{{ policy_form.window_seconds if p_err else device.duplicate_window_seconds }}"
           aria-describedby="{{ d }}-window-hint{% if p_err %} {{ d }}-window-error{% endif %}"{% if p_err %} aria-invalid="true"{% endif %}>
         <div class="policy-presets" role="group" aria-label="Presets" data-window-presets hidden>
-          {% for preset in window_presets %}<button class="button button-secondary button-sm" type="button" data-window-preset="{{ preset }}" aria-controls="{{ d }}-window">{{ 'Off' if preset == 0 else preset ~ ' s' }}</button>{% endfor %}
+          {% for preset in window_presets[device.protocol] %}<button class="button button-secondary button-sm" type="button" data-window-preset="{{ preset }}" aria-controls="{{ d }}-window">{{ 'Off' if preset == 0 else preset ~ ' s' }}</button>{% endfor %}
         </div>
       </div>
-      <p class="field-hint" id="{{ d }}-window-hint">0 = count every swipe. Applies to every past and future day for this device; reports recalculate. {{ window_advice.get(device.protocol, '') }}</p>
+      <p class="field-hint" id="{{ d }}-window-hint">{% if floor == 0 %}0 = count every swipe. {% endif %}Applies to every past and future day for this device; reports recalculate. {{ window_advice.get(device.protocol, '') }}{% if device.duplicate_window_seconds < floor %} Saved value {{ device.duplicate_window_seconds }} s is below the minimum, so hours use {{ floor }} s until you save.{% endif %}</p>
     </div>
     {% if is_c3 %}
     <div class="field">
@@ -304,7 +305,7 @@
 </details>
 {% endif %}
 
-<datalist id="window-presets">{% for preset in window_presets %}<option value="{{ preset }}">{{ 'Off' if preset == 0 else preset ~ ' s' }}</option>{% endfor %}</datalist>
+{% for protocol, presets in window_presets.items() %}<datalist id="window-presets-{{ protocol }}">{% for preset in presets %}<option value="{{ preset }}">{{ 'Off' if preset == 0 else preset ~ ' s' }}</option>{% endfor %}</datalist>{% endfor %}
 <script>
   // Progressive enhancement: preset buttons fill the window input. Without JS
   // the input's datalist offers the same values.

@@ -201,6 +201,8 @@ class FakeDatabase:
         device = self.devices_by_id.get(device_id)
         if device is None:
             return False
+        if device["protocol"] == "zk-attendance" and window_seconds < 30:
+            raise ValueError("window must be at least 30 seconds on this device")
         old = {"duplicate_window_seconds": device["duplicate_window_seconds"],
                "wait_for_door_close": device["door_denied_since"] is None}
         now = _ist_now()
@@ -2836,31 +2838,49 @@ class DevicePolicyTest(_DeviceSettingsBase):
         return self.client.post(f"/devices/{device_id}/policy", data=data)
 
     def test_admin_saves_window_with_one_audit_row(self) -> None:
-        response = self._policy(_X990, window_seconds="10")
+        response = self._policy(_X990, window_seconds="45")
         self.assertEqual(response.status_code, 302)
         self.assertIn(f"policy={_X990}", response.headers["Location"])
         device = self.database.device_by_id(_X990)
-        self.assertEqual(device["duplicate_window_seconds"], 10)
+        self.assertEqual(device["duplicate_window_seconds"], 45)
         self.assertIsNotNone(device["policy_updated_at"])
         rows = self.database.device_change_rows
         self.assertEqual(len(rows), 1)
         self.assertEqual((rows[0]["kind"], rows[0]["actor_employee_id"]), ("policy", self.admin["id"]))
-        self.assertEqual(rows[0]["new_value"]["duplicate_window_seconds"], 10)
+        self.assertEqual(rows[0]["new_value"]["duplicate_window_seconds"], 45)
         page = self.client.get(f"/devices?policy={_X990}").text
         self.assertIn("Swipe policy saved", self._card(_X990, page))
 
-    def test_window_zero_and_max_are_accepted(self) -> None:
-        for raw, expected in (("0", 0), (" 300 ", 300)):
+    def test_x990_floor_and_max_are_accepted_and_below_floor_is_refused(self) -> None:
+        for raw, expected in (("30", 30), (" 300 ", 300)):
             with self.subTest(raw=raw):
                 self.assertEqual(self._policy(_X990, window_seconds=raw).status_code, 302)
                 self.assertEqual(self.database.device_by_id(_X990)["duplicate_window_seconds"], expected)
+        for raw in ("0", "2", "29"):
+            with self.subTest(refused=raw):
+                response = self._policy(_X990, window_seconds=raw)
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("Enter whole seconds from 30 to 300.", self._card(_X990, response.text))
+                self.assertEqual(self.database.device_by_id(_X990)["duplicate_window_seconds"], 300)
+
+    def test_c3_window_zero_is_accepted(self) -> None:
+        # The C3 records its directions, so no re-swipe can flip them.
+        self.assertEqual(self._policy(_C3, window_seconds="0").status_code, 302)
+        self.assertEqual(self.database.device_by_id(_C3)["duplicate_window_seconds"], 0)
+
+    def test_x990_card_advises_a_long_window_and_offers_no_short_preset(self) -> None:
+        card = self._card(_X990, self.client.get("/devices").text)
+        self.assertIn('min="30"', card)
+        self.assertIn("flips", card)
+        self.assertNotIn('data-window-preset="5"', card)
+        self.assertNotIn('data-window-preset="0"', card)
 
     def test_invalid_window_rerenders_with_error_and_stores_nothing(self) -> None:
         for raw in ("abc", "1.5", "400", "-1", "", "10s"):
             with self.subTest(raw=raw):
                 response = self._policy(_X990, window_seconds=raw)
                 self.assertEqual(response.status_code, 400)
-                self.assertIn("Enter whole seconds from 0 to 300.", self._card(_X990, response.text))
+                self.assertIn("Enter whole seconds from 30 to 300.", self._card(_X990, response.text))
                 self.assertEqual(self.database.device_by_id(_X990)["duplicate_window_seconds"], 60)
         self.assertEqual(self.database.device_change_rows, [])
 
@@ -2869,12 +2889,12 @@ class DevicePolicyTest(_DeviceSettingsBase):
             with self.subTest(role=role):
                 self._sign_in_as(role)
                 response = self.client.post(
-                    f"/devices/{_X990}/policy", data={"csrf": "x", "window_seconds": "10"})
+                    f"/devices/{_X990}/policy", data={"csrf": "x", "window_seconds": "45"})
                 self.assertEqual(response.status_code, 403)
         self.assertEqual(self.database.device_by_id(_X990)["duplicate_window_seconds"], 60)
 
     def test_missing_csrf_is_rejected(self) -> None:
-        response = self.client.post(f"/devices/{_X990}/policy", data={"window_seconds": "10"})
+        response = self.client.post(f"/devices/{_X990}/policy", data={"window_seconds": "45"})
         self.assertEqual(response.status_code, 400)
         self.assertEqual(self.database.device_change_rows, [])
 
@@ -2884,14 +2904,15 @@ class DevicePolicyTest(_DeviceSettingsBase):
     def test_only_the_c3_card_has_the_door_close_checkbox(self) -> None:
         page = self.client.get("/devices").text
         self.assertIn("Swipe policy", self._card(_X990, page))
-        self.assertIn("0 = count every swipe", self._card(_X990, page))
+        self.assertNotIn("0 = count every swipe", self._card(_X990, page))
+        self.assertIn("0 = count every swipe", self._card(_C3, page))
         self.assertNotIn('name="wait_for_door_close"', self._card(_X990, page))
         self.assertIn('name="wait_for_door_close"', self._card(_C3, page))
         self.assertIn("Recommended for this C3: 10 s.", self._card(_C3, page))
-        self.assertIn("Recommended for the X990: 5-10 s.", self._card(_X990, page))
+        self.assertIn("Recommended for the X990: 60 s (minimum 30 s).", self._card(_X990, page))
 
     def test_x990_post_never_starts_door_denials(self) -> None:
-        self._policy(_X990, window_seconds="10")  # no checkbox posted
+        self._policy(_X990, window_seconds="45")  # no checkbox posted
         self.assertIsNone(self.database.device_by_id(_X990)["door_denied_since"])
 
     def test_unchecking_door_close_starts_denials_and_rechecking_clears(self) -> None:
@@ -4712,7 +4733,7 @@ class PeopleManagementTest(unittest.TestCase):
         kiran = self._person("NP0128", "Kiran Kumar")
         day = (_ist_now() - timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0)
         self._punches(*[("NP0128", "Kiran", day.replace(hour=h, minute=0, second=s), None)
-                        for h, s in ((9, 0), (9, 20), (12, 0), (17, 0))])
+                        for h, s in ((9, 0), (9, 45), (12, 0), (17, 0))])
         self.database.set_device_policy(DEVICES[0].id, window_seconds=window, wait_for_door_close=True)
         self._sign_in(self.hr)
         page = self.client.get(f"/day?date={day.date().isoformat()}&employee={kiran['id']}").text
@@ -4721,18 +4742,18 @@ class PeopleManagementTest(unittest.TestCase):
         return page, row[export.DAILY_HEADER.index("Effective")]
 
     def test_day_page_and_export_agree_under_device_window(self) -> None:
-        # KTD3: window 0 counts 09:00:20 as Out; 12:00 In, 17:00 Out -> 5h.
-        page, effective = self._quick_swipe_day(0)
+        # KTD3: the X990's 30 s floor counts 09:00:45 as Out; 12:00 In, 17:00 Out -> 5h.
+        page, effective = self._quick_swipe_day(30)
         self.assertIn("5h 00m", page)
         self.assertEqual(effective, "5:00")
         self.assertNotIn("not counted", page)
 
     def test_default_window_collapses_with_reason_on_day_page(self) -> None:
-        # 60 s: 09:00:20 is not counted; 09:00 In, 12:00 Out, 17:00 unpaired -> 3h.
+        # 60 s: 09:00:45 is not counted; 09:00 In, 12:00 Out, 17:00 unpaired -> 3h.
         page, effective = self._quick_swipe_day(60)
         self.assertIn("3h 00m", page)
         self.assertEqual(effective, "3:00")
-        self.assertIn("same as In 09:00:00, 20s earlier", page)
+        self.assertIn("same as In 09:00:00, 45s earlier", page)
 
     def test_twin_of_never_punched_id_replaces_the_main_id(self) -> None:
         kiran = self._person("128", "Kiran Kumar")
