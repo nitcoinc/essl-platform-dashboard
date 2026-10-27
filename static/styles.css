@@ -390,6 +390,8 @@ input[type="file"]::file-selector-button {
   font-size: var(--text-13); color: var(--text-secondary);
 }
 .notice strong { color: var(--text); }
+/* A notice leading the page, right under the header (Team, Devices). */
+.notice-lead { margin-top: 0; margin-bottom: var(--s5); }
 
 /* ---------- Chips ---------- */
 .chip, .status-chip {
@@ -712,8 +714,11 @@ input[type="file"]::file-selector-button {
   .ring-center .figure-value { font-size: 28px; letter-spacing: -0.03em; }
   .in-out-value { font-size: 22px; }
   .day-facts-quiet { justify-content: center; }
+  /* Centred with left: 50%, so its width is capped at half the viewport and
+     the wrapping .topbar-actions broke it into rows; one row at its own width. */
   .day-pager { position: fixed; left: 50%; bottom: calc(var(--s4) + env(safe-area-inset-bottom, 0px)); transform: translateX(-50%); z-index: 15;
-    padding: var(--s2); background: var(--surface); border: 1px solid var(--border-strong); border-radius: 999px; box-shadow: 0 6px 24px rgba(23, 23, 28, 0.16); }
+    flex-wrap: nowrap; width: max-content;
+    padding: var(--s2); background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius-lg); box-shadow: 0 6px 24px rgba(23, 23, 28, 0.16); }
   .main-content:has(.day-pager) { padding-bottom: 96px; }
   .device { padding: var(--s4); }
 }

@@ -151,6 +151,11 @@ class FakeDatabase:
             return None
         return min(values)
 
+    def unreachable_device_details(self) -> list[dict]:
+        rows = [d for d in self.devices_by_id.values() if d["retired_at"] is None and d["status"] == "error"]
+        return [{"id": d["id"], "name": f"{d['site']} {d['model']}", "last_success": d["last_success"]}
+                for d in sorted(rows, key=lambda d: (d["site"], d["id"]))]
+
     def update_device(self, device_id: str, *, ip: str, port: int, comm_password):
         device = self.devices_by_id[device_id]
         device["ip"] = ip
@@ -2984,6 +2989,12 @@ class DeviceDoorSettingsTest(_DeviceSettingsBase):
         self.assertIn(f"Requested {device['door_params_requested_at'].strftime('%H:%M')}", card)
         self.assertNotIn("Change door settings", card)
 
+    def test_door_confirm_page_keeps_devices_current(self) -> None:
+        self._read_c3()
+        response = self._door("", **self._form(Door1Intertime="0"))
+        self.assertIn("Punch interval, door 1: 1 → 0", response.text)
+        self.assertEqual(_current_nav(response.text), ["Devices"])
+
     def test_select_change_shows_option_labels(self) -> None:
         self._read_c3()
         response = self._door("", **self._form(Door2CloseAndLock="0"))
@@ -3691,6 +3702,135 @@ class AppShellTest(unittest.TestCase):
                 html = self._client_as(role).get("/week").text
                 self.assertEqual(self._sidebar_labels(html), labels)
                 self.assertIn('aria-current="page"', html)
+
+
+def _current_nav(html: str) -> list[str]:
+    """Labels of the main sidebar entries marked aria-current="page"."""
+    start = html.index('<nav aria-label="Main">')
+    nav = html[start : html.index("</nav>", start)]
+    return re.findall(r'<a class="nav-item" href="[^"]*" aria-current="page"[^>]*>.*?<span>([^<]+)</span>', nav, re.S)
+
+
+class NavSectionTest(unittest.TestCase):
+    """U4 (KTD7): the nav highlights the section, from the endpoint and whose
+    page it is, on sub-pages and other people's days too."""
+
+    def setUp(self) -> None:
+        self.app, self.database = _make_app()
+        self.client = self.app.test_client()
+        from essl_hub import mail as mail_module
+
+        self.captured = {}
+        original = mail_module.send_login_code
+        mail_module.send_login_code = lambda e, c: self.captured.update(code=c)
+        self.addCleanup(lambda: setattr(mail_module, "send_login_code", original))
+
+    def _person(self, uid: str, role: str = "employee") -> dict:
+        email = f"nav{uid}@example.com"
+        self.database.upsert_employee(device_user_id=uid, name=f"N{uid}", email=email)
+        person = self.database.employee_by_email(email)
+        self.database.set_employee_role(person["id"], role)
+        return person
+
+    def _sign_in(self, person: dict) -> None:
+        self.client.post("/signout")
+        self.client.post("/signin", data={"email": person["email"]})
+        self.client.post("/signin/verify", data={"code": self.captured["code"]})
+
+    def _csrf(self) -> str:
+        html = self.client.get("/day").text
+        marker = 'name="csrf-token" content="'
+        start = html.index(marker) + len(marker)
+        return html[start : html.index('"', start)]
+
+    def _current(self, path: str) -> list[str]:
+        response = self.client.get(path)
+        self.assertEqual(response.status_code, 200, path)
+        return _current_nav(response.text)
+
+    def test_rules_in_order(self) -> None:
+        from essl_hub.web import nav_section
+
+        cases = [
+            ("people.id_issues_view", True, "id_issues"),
+            ("people.id_issues_archive", True, "id_issues"),
+            ("people.punch_archives_view", True, "id_issues"),
+            ("people.punch_archive_restore", True, "id_issues"),
+            ("people.people_archive_view", True, "people"),
+            ("people.person_edit", False, "people"),  # an id in the path is not "someone else's day"
+            ("me.week_view", True, "week"),
+            ("me.day_view", True, "today"),
+            ("me.quick_view", True, "today"),
+            ("fixes.report_view", True, "today"),
+            ("fixes.report_submit", True, "today"),
+            ("me.day_view", False, "team"),
+            ("me.week_view", False, "team"),
+            ("me.quick_view", False, "team"),
+            ("team.team_view", True, "team"),
+            ("team.export_csv", True, "team"),
+            ("fixes.review_list", True, "fix_requests"),
+            ("fixes.review_detail", True, "fix_requests"),
+            ("fixes.review_confirm", True, "fix_requests"),
+            ("admin.devices_view", True, "devices"),
+            ("admin.devices_door", True, "devices"),
+            ("admin.settings_view", True, "settings"),
+            ("admin.settings_create_key", True, "settings"),
+            ("admin.health_view", True, "settings"),
+            ("fixes.link_view", True, None),
+            ("auth.signin", True, None),
+            ("admin.admin_view", True, None),
+            (None, True, None),
+        ]
+        for endpoint, own, section in cases:
+            with self.subTest(endpoint=endpoint, own=own):
+                self.assertEqual(nav_section(endpoint, own=own), section)
+
+    def test_people_sub_pages_keep_people_current(self) -> None:
+        hr = self._person("1", "hr")
+        self._sign_in(hr)
+        # The fake has no archived people; the page itself is covered in test_people_edit.
+        self.database.archived_employees = lambda: []
+        for path in ("/people", "/people/archive", "/people/new", f"/people/{hr['id']}/edit", "/people/import"):
+            with self.subTest(path=path):
+                self.assertEqual(self._current(path), ["People"])
+
+    def test_id_issues_and_archive_list_are_the_id_issues_tab_not_directory(self) -> None:
+        self._sign_in(self._person("1", "hr"))
+        for path in ("/people/issues", "/people/issues/archived"):
+            with self.subTest(path=path):
+                html = self.client.get(path).text
+                # ID issues has no sidebar entry; People hosts it as a sub-tab.
+                self.assertEqual(_current_nav(html), ["People"])
+                self.assertIn('href="/people/issues" aria-current="page">ID issues', html)
+                self.assertNotIn('href="/people" aria-current="page">Directory', html)
+                self.assertNotIn('href="/people/archive" aria-current="page">Archive', html)
+
+    def test_manager_viewing_a_report_is_team_and_own_pages_are_today_and_week(self) -> None:
+        boss = self._person("10", "manager")
+        report = self._person("11")
+        report["manager_id"] = boss["id"]
+        self._sign_in(boss)
+        self.assertEqual(self._current(f"/day?employee={report['id']}"), ["Team"])
+        self.assertEqual(self._current(f"/week?employee={report['id']}"), ["Team"])
+        self.assertEqual(self._current("/team"), ["Team"])
+        self.assertEqual(self._current("/day"), ["Today"])
+        self.assertEqual(self._current(f"/day?employee={boss['id']}"), ["Today"])
+        self.assertEqual(self._current("/week"), ["Week"])
+
+    def test_employee_own_day_and_week(self) -> None:
+        self._sign_in(self._person("20"))
+        self.assertEqual(self._current("/day"), ["Today"])
+        self.assertEqual(self._current("/week"), ["Week"])
+
+    def test_health_and_settings_re_render_are_settings(self) -> None:
+        self._sign_in(self._person("30", "admin"))
+        self.assertEqual(self._current("/settings"), ["Settings"])
+        self.assertEqual(self._current("/health"), ["Settings"])
+        self.assertEqual(self._current("/devices"), ["Devices"])
+        response = self.client.post("/settings/keys", data={"label": "HRMS", "csrf": self._csrf()})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('<div class="key-reveal">', response.text)
+        self.assertEqual(_current_nav(response.text), ["Settings"])
 
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
@@ -5142,6 +5282,221 @@ class SyncHealthTest(unittest.TestCase):
         self.assertEqual((health["tone"], health["signal"]), ("bad", "collector"))
         self.assertEqual(health["label"], "Collector: 2 dead punches")
 
+    def _devices(self, *names_and_last):
+        return [{"id": name.lower().replace(" ", "-"), "name": name, "last_success": last}
+                for name, last in names_and_last]
+
+    def test_one_unreachable_device_is_named_with_its_last_success(self) -> None:
+        health = self._health_devices(self._devices(("Uppal X990", datetime(2026, 10, 25, 12, 30))))
+        self.assertEqual((health["tone"], health["signal"]), ("bad", "devices"))
+        self.assertEqual(health["label"], "Uppal X990 unreachable since 25 Oct")
+        # No times on this signal: the title carries just its summary.
+        self.assertIn(" · Devices: Uppal X990 unreachable since 25 Oct", health["title"])
+        self.assertEqual(self._signal(health, "devices")["count"], 1)
+        never = self._health_devices(self._devices(("Uppal X990", None)))
+        self.assertEqual(never["label"], "Uppal X990 unreachable, never connected")
+
+    def test_two_unreachable_devices_are_one_signal(self) -> None:
+        health = self._health_devices(self._devices(
+            ("Gachibowli C3-400", datetime(2026, 10, 26, 8, 0)), ("Uppal X990", None)))
+        self.assertEqual([d["key"] for d in health["details"]], ["collector", "backup", "devices"])
+        self.assertEqual(health["label"], "2 devices unreachable")
+        self.assertEqual(self._signal(health, "devices")["summary"],
+                         "2 devices unreachable: Gachibowli C3-400 since 26 Oct; Uppal X990, never connected")
+
+    def test_no_unreachable_devices_adds_no_signal(self) -> None:
+        for devices in (None, []):
+            health = self._health_devices(devices)
+            self.assertEqual([d["key"] for d in health["details"]], ["collector", "backup"])
+            self.assertEqual(health["label"], "All systems healthy")
+
+    def _health_devices(self, devices):
+        from essl_hub.routes.common import sync_health
+
+        return sync_health(self._collector(), self._backup(timedelta(minutes=10)), self.NOW,
+                           backup_minutes=15, devices=devices)
+
+
+class TeamSummaryTest(unittest.TestCase):
+    """U5: the Team / Employees status line, Manager column and unknown-ID notice."""
+
+    NOW = datetime(2026, 10, 26, 18, 0)
+
+    def setUp(self) -> None:
+        self.app, self.database = _make_app()
+        self.client = self.app.test_client()
+        from essl_hub import mail as mail_module
+
+        self.captured = {}
+        original = mail_module.send_login_code
+        mail_module.send_login_code = lambda e, c: self.captured.update(code=c)
+        self.addCleanup(lambda: setattr(mail_module, "send_login_code", original))
+        for patcher in (*_fixed_now(self.NOW), patch("essl_hub.routes.team._now_naive", lambda: self.NOW)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        # A manager (no punches) with 4 reports inside and 2 who met the target.
+        self.boss = self._person("50", "Boss", "manager")
+        day = datetime(2026, 10, 26)
+        punches = []
+        for i in range(6):
+            person = self._person(str(60 + i), f"Report{i}")
+            self.database.set_employee_manager(person["id"], self.boss["id"])
+            punches.append(_punch_row(f"in-{i}", day.replace(hour=9), "entry", uid=str(60 + i)))
+            if i >= 4:
+                punches.append(_punch_row(f"out-{i}", day.replace(hour=17, minute=30), "exit", uid=str(60 + i)))
+        # A swipe from a card nobody owns.
+        punches.append(_punch_row("ghost", day.replace(hour=10), "entry", uid="9999"))
+        self.database.insert_punches(punches)
+        self.hr = self._person("70", "Hema", "hr")
+
+    def _person(self, uid: str, name: str, role: str = "employee") -> dict:
+        email = f"{name.lower()}@example.com"
+        self.database.upsert_employee(device_user_id=uid, name=name, email=email)
+        person = self.database.employee_by_email(email)
+        self.database.set_employee_role(person["id"], role)
+        return person
+
+    def _sign_in(self, person: dict) -> None:
+        self.client.post("/signout")
+        self.client.post("/signin", data={"email": person["email"]})
+        self.client.post("/signin/verify", data={"code": self.captured["code"]})
+
+    @staticmethod
+    def _count(html: str) -> str:
+        return re.search(r'<p id="team-count"[^>]*>([^<]*)</p>', html).group(1)
+
+    def test_summary_counts_each_person_once_by_todays_status(self) -> None:
+        from types import SimpleNamespace
+
+        from essl_hub.routes.team import _status_summary
+
+        self._sign_in(self.boss)
+        page = self.client.get("/team").text
+        self.assertEqual(self._count(page), "7 people: 4 inside · 2 met · 1 no punches")
+        rows = [{"result": SimpleNamespace(status=s)} for s in ("short", "incomplete", "met")]
+        self.assertEqual(_status_summary(rows), "3 people: 1 met · 1 short · 1 needs review")
+        self.assertEqual(_status_summary(rows[:1]), "1 person: 1 short")
+        self.assertEqual(_status_summary([]), "0 people")
+
+    def test_search_recounts_the_summary_out_of_band(self) -> None:
+        self._sign_in(self.boss)
+        fragment = self.client.get("/team?q=report", headers={"HX-Request": "true"}).text
+        self.assertIn('hx-swap-oob="true"', fragment)
+        self.assertEqual(self._count(fragment), "6 people: 4 inside · 2 met")
+        fragment = self.client.get("/team?q=report4", headers={"HX-Request": "true"}).text
+        self.assertEqual(self._count(fragment), "1 person: 1 met")
+
+    def test_manager_sees_no_manager_column_and_no_unknown_id_notice(self) -> None:
+        self._sign_in(self.boss)
+        page = self.client.get("/team").text
+        self.assertNotIn('<th scope="col">Manager</th>', page)
+        self.assertNotIn('data-label="Manager"', page)
+        self.assertNotIn("col-manager", page)
+        self.assertNotIn("no one in the Directory", page)
+
+    def test_hr_sees_manager_column_and_the_notice_above_the_table(self) -> None:
+        self._sign_in(self.hr)
+        page = self.client.get("/team").text
+        self.assertIn('<th scope="col">Manager</th>', page)
+        self.assertIn('data-label="Manager">Boss</td>', page)
+        notice = page.index("1 device ID has punches but no one in the Directory.")
+        self.assertLess(notice, page.index('id="team-count"'))
+        self.assertLess(notice, page.index("<table"))
+        self.assertIn('<a href="/people/issues">Review ID issues</a>', page)
+        self.database.archive_punches("9999", from_ts=None, to_ts=None, actor_id=self.hr["id"])
+        self.assertNotIn("no one in the Directory", self.client.get("/team").text)
+
+
+class DeviceHealthWebTest(unittest.TestCase):
+    """U5 (KTD8): an unreachable device in the health badge and on the Devices nav item."""
+
+    NOW = datetime(2026, 10, 26, 18, 0)
+
+    def setUp(self) -> None:
+        import json
+        import tempfile
+
+        self.app, self.database = _make_app()
+        self.client = self.app.test_client()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        # A healthy collector and backups off, so only the devices can set the tone.
+        collector = os.path.join(tmp.name, "collector.json")
+        backup = os.path.join(tmp.name, "backup.json")
+        with open(collector, "w", encoding="utf-8") as handle:
+            json.dump({"last_poll": (self.NOW - timedelta(minutes=1)).isoformat(sep=" "),
+                       "spool_depth": 0, "dead_count": 0}, handle)
+        with open(backup, "w", encoding="utf-8") as handle:
+            json.dump({"r2_configured": False}, handle)
+        env = {"ESSL_COLLECTOR_STATUS_PATH": collector, "ESSL_BACKUP_STATUS_PATH": backup}
+        for patcher in (*_fixed_now(self.NOW), patch.dict(os.environ, env)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        from essl_hub import mail as mail_module
+
+        captured = {}
+        original = mail_module.send_login_code
+        mail_module.send_login_code = lambda e, c: captured.update(code=c)
+        self.addCleanup(lambda: setattr(mail_module, "send_login_code", original))
+        self.database.upsert_employee(device_user_id="1", name="Ada Admin", email="ada@example.com")
+        self.database.set_employee_role(self.database.employee_by_email("ada@example.com")["id"], "admin")
+        self.client.post("/signin", data={"email": "ada@example.com"})
+        self.client.post("/signin/verify", data={"code": captured["code"]})
+        for device in self.database.devices_by_id.values():
+            device["status"] = "connected"
+
+    def _fail(self, device_id: str, last_success=datetime(2026, 10, 25, 12, 30)) -> None:
+        device = self.database.device_by_id(device_id)
+        device["status"] = "error"
+        device["last_success"] = last_success
+
+    @staticmethod
+    def _devices_entry(html: str) -> str:
+        start = html.index('<nav aria-label="Main">')
+        nav = html[start : html.index("</nav>", start)]
+        return re.search(r'<a class="nav-item" href="/devices".*?</a>', nav, re.S).group(0)
+
+    def test_all_connected_is_healthy_with_no_devices_badge(self) -> None:
+        page = self.client.get("/week").text
+        self.assertIn("<span>All systems healthy</span>", page)
+        self.assertNotIn("nav-count", self._devices_entry(page))
+
+    def test_one_device_in_error_names_it_and_badges_devices(self) -> None:
+        self._fail("uppal-x990")
+        page = self.client.get("/week").text
+        self.assertNotIn("All systems healthy", page)
+        self.assertIn("<span>Uppal X990 unreachable since 25 Oct</span>", page)
+        entry = self._devices_entry(page)
+        self.assertIn('aria-label="Devices, 1 device unreachable"', entry)
+        self.assertIn('<span class="nav-count" title="1 device unreachable" aria-hidden="true">1</span>', entry)
+        health = self.client.get("/health").text
+        self.assertIn('<h2 id="signal-devices">Devices</h2>', health)
+
+    def test_two_devices_are_one_signal_and_a_retired_one_is_ignored(self) -> None:
+        self._fail("uppal-x990")
+        self._fail(_C3)
+        page = self.client.get("/week").text
+        self.assertIn("<span>2 devices unreachable</span>", page)
+        self.assertIn('aria-label="Devices, 2 devices unreachable"', self._devices_entry(page))
+        self.database.set_device_retired(_C3, True)
+        page = self.client.get("/week").text
+        self.assertIn("<span>Uppal X990 unreachable since 25 Oct</span>", page)
+        self.assertIn('aria-label="Devices, 1 device unreachable"', self._devices_entry(page))
+
+    def test_id_issue_notice_is_at_the_top_of_devices(self) -> None:
+        from essl_hub.routes.people import forget_issue_count
+
+        # The admin's own swipe keeps "never punched" out of the count.
+        self.database.insert_punches([_punch_row("ghost", datetime(2026, 10, 26, 10), "entry", uid="9999"),
+                                      _punch_row("ada", datetime(2026, 10, 26, 9), "entry", uid="1")])
+        forget_issue_count()  # the badge count is cached across requests
+        page = self.client.get("/devices").text
+        notice = page.index("1 device ID issue to check.")
+        self.assertLess(notice, page.index('class="device-list"'))
+        self.database.archive_punches("9999", from_ts=None, to_ts=None)
+        forget_issue_count()
+        self.assertNotIn("device ID issue", self.client.get("/devices").text)
+
 
 class BrandIconsTest(unittest.TestCase):
     """U1: the NITCO favicon set on every page."""
@@ -5698,6 +6053,17 @@ class FixReviewTest(unittest.TestCase):
         return mails[0]
 
     # --- Approving ----------------------------------------------------------
+
+    def test_review_detail_has_fix_requests_current_and_report_form_today(self) -> None:
+        request_id = self._file()
+        self._sign_in(self.hari)
+        detail = self.client.get(f"/fixes/review/{request_id}")
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(_current_nav(detail.text), ["Fix requests"])
+        self._sign_in(self.asha)
+        report = self.client.get(f"/day/{self.DAY.isoformat()}/report")
+        self.assertEqual(report.status_code, 200)
+        self.assertEqual(_current_nav(report.text), ["Today"])
 
     def test_approving_a_missed_in_corrects_hours_audits_and_emails(self) -> None:
         request_id = self._file()

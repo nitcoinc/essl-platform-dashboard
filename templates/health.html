@@ -17,12 +17,15 @@
       <h2 id="signal-{{ signal.key }}">{{ signal.name }}</h2>
       {{ ui.chip(signal.summary, chip_tone[signal.tone]) }}
     </div>
+    {#- The devices signal has no times; its chip names the devices. -#}
+    {% if signal.times or signal.error %}
     <dl class="health-times">
       {% for label, value in signal.times %}
       <dt>{{ label }}</dt><dd>{{ value }}</dd>
       {% endfor %}
       {% if signal.error %}<dt>Last error</dt><dd>{{ signal.error }}</dd>{% endif %}
     </dl>
+    {% endif %}
   </section>
   {% endfor %}
 </div>

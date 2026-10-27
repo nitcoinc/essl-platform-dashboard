@@ -2063,6 +2063,16 @@ class Database(AlertsMixin, FixesMixin, ArchivesMixin):
             ).fetchall()
         return [row["id"] for row in rows]
 
+    def unreachable_device_details(self) -> list[dict]:
+        """The devices behind unreachable_devices(), for the health signal and
+        the Devices nav badge: id, display name and last good poll."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT id, site || ' ' || model AS name, last_success FROM devices "
+                "WHERE retired_at IS NULL AND status = 'error' ORDER BY site, id"
+            ).fetchall()
+        return list(rows)
+
     def checkins_since(self, *, since: datetime | None, limit: int) -> list[dict]:
         sql = (
             f"SELECT p.id, p.device_id, {_MAIN_ID_SQL} AS device_user_id, "

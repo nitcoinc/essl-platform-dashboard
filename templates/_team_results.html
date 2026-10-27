@@ -1,19 +1,19 @@
-{# The Team results region. On an htmx search the count is swapped out of band
-   so the persistent aria-live element announces it. #}
+{# The Team results region. On an htmx search the summary line ("7 people:
+   4 inside · 2 met") is recounted and swapped out of band, so the persistent
+   aria-live element announces it. #}
 {% import "_ui.html" as ui %}
 {% from "_status_chip.html" import status_chip %}
-{% set count_label = rows|length ~ (' person' if rows|length == 1 else ' people') %}
-{% if oob %}<p id="team-count" class="people-count" aria-live="polite" hx-swap-oob="true">{{ count_label }}</p>{% endif %}
+{% if oob %}<p id="team-count" class="people-count" aria-live="polite" hx-swap-oob="true">{{ summary }}</p>{% endif %}
 {% if rows %}
 <div class="table-scroll">
   <table class="table hours-table team-table">
     <caption class="visually-hidden">{{ title }}, with today's hours and status</caption>
     <colgroup>
-      <col class="col-select"><col class="col-person"><col class="col-manager"><col class="col-first"><col class="col-last"><col class="col-effective"><col class="col-today"><col class="col-actions">
+      <col class="col-select"><col class="col-person">{% if show_manager %}<col class="col-manager">{% endif %}<col class="col-first"><col class="col-last"><col class="col-effective"><col class="col-today"><col class="col-actions">
     </colgroup>
     <thead><tr>
       <th scope="col" class="select-cell"><span class="visually-hidden">Include in export</span></th>
-      <th scope="col">Name</th><th scope="col">Manager</th>
+      <th scope="col">Name</th>{% if show_manager %}<th scope="col">Manager</th>{% endif %}
       <th scope="col" class="num">First entry</th><th scope="col" class="num">Last exit</th>
       <th scope="col" class="num">Effective</th><th scope="col">Today</th>
       <th scope="col"><span class="visually-hidden">Actions</span></th>
@@ -27,7 +27,7 @@
           <a class="person-name" href="{{ url_for('me.day_view', employee=p.id) }}" data-quick-view="{{ url_for('me.quick_view', employee_id=p.id) }}">{{ p.name }}</a>
           <span class="person-email">{{ p.email }}</span>
         </td>
-        <td data-label="Manager">{% if row.manager_name %}{{ row.manager_name }}{% else %}<span class="muted">-</span>{% endif %}</td>
+        {% if show_manager %}<td data-label="Manager">{% if row.manager_name %}{{ row.manager_name }}{% else %}<span class="muted">-</span>{% endif %}</td>{% endif %}
         <td data-label="First entry" class="num">{% if r.segments %}{{ r.segments[0].start.strftime('%H:%M') }}{% else %}<span class="muted">-</span>{% endif %}</td>
         <td data-label="Last exit" class="num">{% if r.status == 'open' %}Inside{% elif r.segments and r.segments[-1].end %}{{ r.segments[-1].end.strftime('%H:%M') }}{% else %}<span class="muted">-</span>{% endif %}</td>
         <td data-label="Effective" class="num">{{ ui.hours(r.effective_minutes) }}</td>

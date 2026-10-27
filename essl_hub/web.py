@@ -38,6 +38,31 @@ def _prepare_database(database: Database) -> bool:
     return ok
 
 
+def nav_section(endpoint: str | None, *, own: bool) -> str | None:
+    """KTD7: the nav section a page belongs to, from its endpoint and whether
+    it shows the viewer's own data. Checked in order; the first match wins,
+    and any other endpoint highlights nothing."""
+    if not endpoint:
+        return None
+    if endpoint.startswith(("people.id_issues", "people.punch_archive")):
+        return "id_issues"
+    if endpoint.startswith("people."):
+        return "people"
+    if own and endpoint == "me.week_view":
+        return "week"
+    if (own and endpoint in ("me.day_view", "me.quick_view")) or endpoint.startswith("fixes.report_"):
+        return "today"
+    if (not own and endpoint.startswith("me.")) or endpoint.startswith("team."):
+        return "team"
+    if endpoint.startswith("fixes.review_"):
+        return "fix_requests"
+    if endpoint.startswith("admin.devices"):
+        return "devices"
+    if endpoint.startswith("admin.settings") or endpoint == "admin.health_view":
+        return "settings"
+    return None
+
+
 def create_app(database: Database | None = None) -> Flask:
     root = Path(__file__).resolve().parent.parent
     app = Flask(
@@ -88,6 +113,15 @@ def create_app(database: Database | None = None) -> Flask:
         return {"has_endpoint": lambda name: name in app.view_functions, "theme": _theme()}
 
     @app.context_processor
+    def active_nav_section() -> dict:
+        # Someone else's page is ?employee=<id> on Day and Week, or the id in
+        # the quick-view path; an unparseable id 404s in the view anyway.
+        employee = g.get("employee")
+        viewed = request.args.get("employee") or (request.view_args or {}).get("employee_id")
+        own = employee is None or viewed in (None, "") or str(viewed) == str(employee["id"])
+        return {"active_section": nav_section(request.endpoint, own=own)}
+
+    @app.context_processor
     def id_issue_badge() -> dict:
         # HR and admin see how many ID issues wait on the People nav entry.
         employee = g.get("employee")
@@ -112,7 +146,11 @@ def create_app(database: Database | None = None) -> Flask:
         employee = g.get("employee")
         if not employee or employee["role"] != "admin":
             return {}
-        return {"sync_health": current_sync_health(database)[0]}
+        health = current_sync_health(database)[0]
+        # The Devices nav badge counts the same devices the health signal
+        # names (KTD8), so the two never disagree and the table is read once.
+        devices = next((d for d in health["details"] if d["key"] == "devices"), None)
+        return {"sync_health": health, "nav_device_count": devices["count"] if devices else 0}
 
     def not_set_up() -> tuple[Response | str, int]:
         if request.path == "/api/health":

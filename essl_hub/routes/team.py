@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import date, timedelta
 
 from flask import Blueprint, Response, g, make_response, redirect, render_template, request, url_for
@@ -63,6 +64,20 @@ def _team_rows(query: str) -> list[dict]:
     return rows
 
 
+# Summary line buckets, one per today's DayStatus, in reading order.
+_SUMMARY_PARTS = (("open", "inside"), ("met", "met"), ("short", "short"),
+                  ("incomplete", "needs review"), ("empty", "no punches"))
+
+
+def _status_summary(rows: list[dict]) -> str:
+    """'7 people: 4 inside · 2 met · 1 no punches'. Each person counts once,
+    by today's status, so the parts add up to the total; zero parts are left out."""
+    total = f"{len(rows)} {'person' if len(rows) == 1 else 'people'}"
+    counts = Counter(row["result"].status for row in rows)
+    parts = [f"{counts[status]} {label}" for status, label in _SUMMARY_PARTS if counts[status]]
+    return f"{total}: {' · '.join(parts)}" if parts else total
+
+
 def _export_defaults(today: date) -> dict:
     month_start = today.replace(day=1)
     last_month_end = month_start - timedelta(days=1)
@@ -79,10 +94,15 @@ def _render_team(export_error: str | None = None, status: int = 200):
     day_start_hour = _day_start_hour(database)
     today = _today(day_start_hour)
     presets = _export_defaults(today)
+    rows = _team_rows(query)
     context = {
         "employee": g.employee,
         "query": query,
-        "rows": _team_rows(query),
+        "rows": rows,
+        "summary": _status_summary(rows),
+        # A manager's Manager column would only ever name the manager or a
+        # report in between, so it is shown to HR and admin only.
+        "show_manager": everyone_label,
         "title": "Employees" if everyone_label else "Team",
         "today": today,
         "unmapped": database.unmapped_device_user_ids() if everyone_label else [],

@@ -1,21 +1,25 @@
 {% import "_ui.html" as ui %}
 {%- set role = employee.role -%}
-{#- Navigation by role (plan): endpoint, label, icon, roles. Entries whose page
-    does not exist yet are skipped by has_endpoint(). -#}
+{#- Navigation by role (plan): endpoint, label, icon, roles, and the sections
+    (active_section, KTD7 in web.py) it is current for. ID issues has no entry
+    of its own; it is a People sub-tab. Entries whose page does not exist yet
+    are skipped by has_endpoint(). -#}
 {%- set nav = [
-  ('me.day_view', 'Today', 'clock', ('employee', 'manager', 'hr', 'admin')),
-  ('me.week_view', 'Week', 'calendar-days', ('employee', 'manager', 'hr', 'admin')),
-  ('team.team_view', 'Employees' if role in ('hr', 'admin') else 'Team', 'users', ('manager', 'hr', 'admin')),
-  ('people.people_view', 'People', 'user-round-cog', ('hr', 'admin')),
-  ('fixes.review_list', 'Fix requests', 'inbox', ('hr', 'admin')),
-  ('admin.devices_view', 'Devices', 'server', ('admin',)),
-  ('admin.settings_view', 'Settings', 'settings', ('admin',)),
+  ('me.day_view', 'Today', 'clock', ('employee', 'manager', 'hr', 'admin'), ('today',)),
+  ('me.week_view', 'Week', 'calendar-days', ('employee', 'manager', 'hr', 'admin'), ('week',)),
+  ('team.team_view', 'Employees' if role in ('hr', 'admin') else 'Team', 'users', ('manager', 'hr', 'admin'), ('team',)),
+  ('people.people_view', 'People', 'user-round-cog', ('hr', 'admin'), ('people', 'id_issues')),
+  ('fixes.review_list', 'Fix requests', 'inbox', ('hr', 'admin'), ('fix_requests',)),
+  ('admin.devices_view', 'Devices', 'server', ('admin',), ('devices',)),
+  ('admin.settings_view', 'Settings', 'settings', ('admin',), ('settings',)),
 ] -%}
 {%- macro nav_links() -%}
 <ul class="nav-list">
-  {%- for endpoint, label, icon_name, roles in nav if role in roles and has_endpoint(endpoint) %}
+  {%- for endpoint, label, icon_name, roles, sections in nav if role in roles and has_endpoint(endpoint) %}
   {%- set fix_badge = endpoint == 'fixes.review_list' and nav_fix_count %}
-  <li><a class="nav-item" href="{{ url_for(endpoint) }}"{% if request.endpoint == endpoint or (endpoint == 'people.people_view' and request.endpoint == 'people.id_issues_view') or (endpoint == 'fixes.review_list' and request.endpoint in ('fixes.review_detail', 'fixes.review_preview', 'fixes.review_confirm')) %} aria-current="page"{% endif %}{% if fix_badge %} aria-label="{{ label }}, {{ nav_fix_count }} pending"{% endif %}>{{ ui.icon(icon_name) }}<span>{{ label }}</span>{% if endpoint == 'people.people_view' and nav_issue_count %}<span class="nav-count" title="{{ nav_issue_count }} ID {{ 'issue' if nav_issue_count == 1 else 'issues' }} to check" aria-label="{{ nav_issue_count }} ID issues to check">{{ nav_issue_count }}</span>{% endif %}{% if fix_badge %}<span class="nav-count" title="{{ nav_fix_count }} fix {{ 'request' if nav_fix_count == 1 else 'requests' }} waiting" aria-hidden="true">{{ nav_fix_count }}</span>{% endif %}</a></li>
+  {%- set device_badge = endpoint == 'admin.devices_view' and nav_device_count %}
+  {%- set device_text = nav_device_count ~ (' device' if nav_device_count == 1 else ' devices') ~ ' unreachable' if device_badge else '' %}
+  <li><a class="nav-item" href="{{ url_for(endpoint) }}"{% if active_section in sections %} aria-current="page"{% endif %}{% if fix_badge %} aria-label="{{ label }}, {{ nav_fix_count }} pending"{% elif device_badge %} aria-label="{{ label }}, {{ device_text }}"{% endif %}>{{ ui.icon(icon_name) }}<span>{{ label }}</span>{% if endpoint == 'people.people_view' and nav_issue_count %}<span class="nav-count" title="{{ nav_issue_count }} ID {{ 'issue' if nav_issue_count == 1 else 'issues' }} to check" aria-label="{{ nav_issue_count }} ID issues to check">{{ nav_issue_count }}</span>{% endif %}{% if fix_badge %}<span class="nav-count" title="{{ nav_fix_count }} fix {{ 'request' if nav_fix_count == 1 else 'requests' }} waiting" aria-hidden="true">{{ nav_fix_count }}</span>{% endif %}{% if device_badge %}<span class="nav-count" title="{{ device_text }}" aria-hidden="true">{{ nav_device_count }}</span>{% endif %}</a></li>
   {%- endfor %}
 </ul>
 {%- endmacro -%}

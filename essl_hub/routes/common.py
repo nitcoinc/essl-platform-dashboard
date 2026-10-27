@@ -401,6 +401,28 @@ def _backup_signal(status: object, now: datetime, *, r2_configured: bool, minute
     return {"tone": tone, "summary": when, "label": f"Backup {_ago(age)}", "error": error}
 
 
+def _devices_signal(devices: list[dict]) -> dict:
+    """One signal for every active device whose last poll failed (KTD8):
+    the collector still polls on time, but those punches are missing."""
+    def since(device: dict) -> str:
+        last = _parse_ts(device.get("last_success"))
+        return f" since {last.day} {last:%b}" if last else ", never connected"
+
+    if len(devices) == 1:
+        text = f"{devices[0]['name']} unreachable{since(devices[0])}"
+        return {"tone": "bad", "summary": text, "label": text, "count": 1}
+    listed = "; ".join(f"{d['name']}{since(d)}" for d in devices)
+    return {"tone": "bad", "summary": f"{len(devices)} devices unreachable: {listed}",
+            "label": f"{len(devices)} devices unreachable", "count": len(devices)}
+
+
+def _title_part(signal: dict) -> str:
+    # A signal without times (devices) is just its summary.
+    times = signal.get("times")
+    when = f" ({times[0][0].lower()} {times[0][1]})" if times else ""
+    return f"{signal['name']}: {signal['summary']}{when}"
+
+
 def sync_health(
     collector_status: object,
     backup_status: object,
@@ -408,12 +430,14 @@ def sync_health(
     *,
     r2_configured: bool = True,
     backup_minutes: int = 15,
+    devices: list[dict] | None = None,
 ) -> dict:
-    """Summarise the collector and backups signals.
+    """Summarise the collector, backups and (when any) unreachable devices.
 
-    Pure: callers read the status files (missing/corrupt passed as None).
-    Each signal gets a tone; the worst wins and the label names it. A neutral
-    signal (backups Off) never sets the top-bar tone."""
+    Pure: callers read the status files (missing/corrupt passed as None) and
+    the devices in error (id, name, last_success). Each signal gets a tone;
+    the worst wins and the label names it. A neutral signal (backups Off)
+    never sets the top-bar tone."""
     collector = collector_status if isinstance(collector_status, dict) else None
     backup = backup_status if isinstance(backup_status, dict) else None
     collector_poll = _parse_ts(collector.get("last_poll")) if collector else None
@@ -429,12 +453,12 @@ def sync_health(
          **_backup_signal(backup, now, r2_configured=r2_configured, minutes=backup_minutes),
          "times": [("Last backup", _ist(_parse_ts(backup.get("last_ok_at")) if backup else None)),
                    ("Last upload", _ist(_parse_ts(backup.get("last_upload_at")) if backup else None))]})
+    if devices:
+        details.append({"key": "devices", "name": "Devices", **_devices_signal(devices)})
     ranked = [d for d in details if d["tone"] in _TONE_RANK]
     worst = max(ranked, key=lambda d: _TONE_RANK[d["tone"]])  # first worst wins ties
     label = "All systems healthy" if worst["tone"] == "ok" else worst["label"]
-    title = " · ".join(
-        f"{d['name']}: {d['summary']} ({d['times'][0][0].lower()} {d['times'][0][1]})" for d in details
-    )
+    title = " · ".join(_title_part(d) for d in details)
     return {"tone": worst["tone"], "label": label, "title": title, "signal": worst["key"], "details": details}
 
 
@@ -461,5 +485,6 @@ def current_sync_health(db: object) -> tuple[dict, list[dict]]:
         # No status file yet means the service hasn't run: "No backup yet", not Off.
         r2_configured=(status or {}).get("r2_configured", True) is not False,
         backup_minutes=int((status or {}).get("interval_minutes") or config.backup_minutes()),
+        devices=db.unreachable_device_details(),
     )
     return health, entries
