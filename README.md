@@ -561,6 +561,7 @@ Rolling back to the previous release after the cutover needs Turso, so keep the 
 | Daily target, attendance alerts, HRMS API keys (**Settings**) | - | - | - | yes |
 | Report a problem on own day (last 7 days) | yes | yes | yes | yes |
 | Approve or reject fix requests | - | - | yes, never their own | yes, never their own |
+| Fix punches directly (day page → **Fix punches**) | - | - | - | yes, never their own |
 
 | Role | Lands on | Sidebar |
 | --- | --- | --- |
@@ -570,6 +571,8 @@ Rolling back to the previous release after the cutover needs Turso, so keep the 
 | admin | Employees | Today, Week, Employees, People (Directory, ID issues, Archive), Devices, Settings (plus the sync-health indicator) |
 
 **Fix requests.** HR or an admin approves every fix request, on its own review page. Each approval records who decided it, their role at that moment and the note (the correction record cannot be edited afterwards). When an employee files one, their manager gets one FYI email listing the lines (no button, HR decides) and every HR user gets the same with a **Review request** link. If the requester is the only HR user, admins other than the requester are emailed instead; admins can open and decide any request from the review list either way. Nobody approves their own request.
+
+**Direct fixes (admin).** On another person's day, **Fix punches** lets an admin count a punch as In or Out, ignore it, or add a missed one, with a required reason and a before/after hours preview. Nothing in the device records changes: each fix is a correction stored with the admin's name and role at that moment, the time, the reason and the path (`direct`, or `request` when HR or an admin approved an employee's request). The correction record cannot be edited or deleted. An admin cannot fix their own punches this way; they file a report like anyone else and HR or another admin decides it. Frappe HR still receives the device's own direction, so a corrected day can differ from Frappe.
 
 Asking for someone you may not see returns 404, the same as an id that does not exist. `/admin` redirects to **Devices**; `/devices/ids` redirects to **People → ID issues**.
 

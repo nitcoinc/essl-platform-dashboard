@@ -238,6 +238,12 @@ def _proposed_rows(rows: list[dict], filed: dict, person: dict, decisions: list[
             if direction:
                 proposed.append({"kind": "set_direction", "employee_id": employee_id,
                                  "fingerprint": line["target_fingerprint"], "direction": direction})
+    return _merge_proposed(rows, proposed, employee_id, person)
+
+
+def _merge_proposed(rows: list[dict], proposed: list[dict], employee_id: int, person: dict) -> list[dict]:
+    """``rows`` with ``proposed`` corrections merged by apply_corrections;
+    markers the rows already carried are kept where a proposal adds none."""
     before = {row.get("fingerprint"): row.get("correction") for row in rows}
     merged = apply_corrections(rows, proposed, {employee_id: str(person["device_user_id"])})
     for row in merged:

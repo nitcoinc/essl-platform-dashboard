@@ -1579,6 +1579,81 @@ class MissedPunchSchemaTest(unittest.TestCase):
             [self.asha], datetime(2026, 10, 26, 6), datetime(2026, 10, 27, 6))
         self.assertEqual((read["created_by_name"], read["created_by_role"]), ("Adam", "admin"))
 
+    # --- direct admin corrections (v10) -------------------------------------------
+
+    def _direct(self, edits=None, *, actor=None, employee=None, reason="Door log shows an exit"):
+        edits = edits if edits is not None else [
+            {"kind": "set_direction", "fingerprint": "fp-out", "direction": "entry"}]
+        return self.database.record_direct_corrections(
+            employee or self.asha, DAY, edits, actor_id=actor or self.adam, reason=reason)
+
+    def test_direct_corrections_record_actor_role_path_reason_and_no_request(self) -> None:
+        count = self._direct([
+            {"kind": "add", "event_timestamp": datetime(2026, 10, 26, 13, 35), "direction": "entry"},
+            {"kind": "ignore", "fingerprint": "fp-dup"},
+            {"kind": "set_direction", "fingerprint": "fp-out", "direction": "entry"},
+        ])
+        self.assertEqual(count, 3)
+        rows = self._corrections(self.database)
+        self.assertEqual([r["kind"] for r in rows], ["add", "ignore", "set_direction"])
+        for row in rows:
+            self.assertEqual(
+                (row["created_by"], row["created_by_name"], row["created_by_role"], row["path"],
+                 row["reason"], row["request_line_id"], row["employee_id"], row["work_day"]),
+                (self.adam, "Adam", "admin", "direct", "Door log shows an exit", None, self.asha, DAY))
+        read = self.database.corrections_for(
+            [self.asha], datetime(2026, 10, 26, 6), datetime(2026, 10, 27, 6))
+        self.assertEqual(len(read), 3)
+
+    def test_direct_corrections_name_the_role_at_the_time(self) -> None:
+        self._person("105", "Bea", "admin")  # the last admin cannot be demoted
+        self._direct()
+        self.database.set_employee_role(self.adam, "employee")
+        [row] = self._corrections(self.database)
+        self.assertEqual(row["created_by_role"], "admin")
+
+    def test_direct_corrections_need_an_active_admin_who_is_not_the_employee(self) -> None:
+        for label, kwargs in (
+            ("hr", {"actor": self.hari}),
+            ("employee", {"actor": self.asha, "employee": self.hari}),
+            ("self", {"actor": self.adam, "employee": self.adam}),
+            ("unknown actor", {"actor": 9999}),
+            ("unknown employee", {"employee": 9999}),
+        ):
+            with self.subTest(label), self.assertRaises(db_module.RuleViolation):
+                self._direct(**kwargs)
+        self._person("105", "Bea", "admin")  # the last admin cannot be archived
+        self.database.archive_employee(self.adam)
+        with self.assertRaises(db_module.RuleViolation):
+            self._direct()
+        self.assertEqual(self._count("punch_corrections"), 0)
+
+    def test_direct_corrections_refuse_an_archived_employee(self) -> None:
+        self.database.archive_employee(self.asha)
+        with self.assertRaises(db_module.RuleViolation):
+            self._direct()
+        self.assertEqual(self._count("punch_corrections"), 0)
+
+    def test_direct_corrections_need_a_reason_and_valid_edits_and_write_all_or_nothing(self) -> None:
+        for reason in (None, "", "   ", "x" * (db_module.FIX_NOTE_MAX_CHARS + 1)):
+            with self.subTest(reason=reason), self.assertRaises(ValueError):
+                self._direct(reason=reason)
+        for edits in (
+            [],
+            [{"kind": "flip", "fingerprint": "fp"}],
+            [{"kind": "set_direction", "fingerprint": "fp", "direction": "sideways"}],
+            [{"kind": "set_direction", "direction": "entry"}],
+            [{"kind": "ignore"}],
+            [{"kind": "add", "direction": "entry"}],
+            [{"kind": "add", "event_timestamp": datetime(2026, 10, 26, 13, 35)}],
+        ):
+            with self.subTest(edits=edits), self.assertRaises(ValueError):
+                self._direct(edits)
+        # A bad edit after a good one writes nothing.
+        with self.assertRaises(ValueError):
+            self._direct([{"kind": "ignore", "fingerprint": "fp-dup"}, {"kind": "ignore"}])
+        self.assertEqual(self._count("punch_corrections"), 0)
+
     def test_work_day_round_trips_as_a_date_and_datetimes_still_bind_as_timestamps(self) -> None:
         self.assertTrue(self.database.record_alert(
             employee_id=self.asha, work_day=DAY, kind="live", mode="shadow", status="recorded"))

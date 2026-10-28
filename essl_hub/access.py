@@ -118,3 +118,16 @@ PUNCH_ARCHIVE_ROLES = ("admin",)
 def can_archive_punches(actor: dict | None) -> bool:
     """Archive and restore ID-issue punches (admins only)."""
     return actor is not None and actor["role"] in PUNCH_ARCHIVE_ROLES
+
+
+# --- Direct punch fixes (v10) -----------------------------------------------------
+
+# An admin may fix an employee's punches without a request, but never their
+# own: those go through a request someone else decides. Database.
+# record_direct_corrections re-checks both rules.
+DIRECT_FIX_ROLES = ("admin",)
+
+
+def can_fix_punches_directly(actor: dict | None, employee_id: int) -> bool:
+    """Fix ``employee_id``'s punches now (admins only, never their own)."""
+    return actor is not None and actor["role"] in DIRECT_FIX_ROLES and actor["id"] != employee_id

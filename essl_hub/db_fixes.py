@@ -372,6 +372,73 @@ class FixesMixin:
                     status = final
         return {"status": status, "decided": decided, "skipped": skipped}
 
+    def record_direct_corrections(
+        self,
+        employee_id: int,
+        work_day: date,
+        edits: Iterable[dict],
+        *,
+        actor_id: int,
+        reason: str,
+    ) -> int:
+        """An admin's own fixes to one employee's day, with no request: each
+        edit becomes a correction row stamped with the actor's name and role
+        as they are now, the path 'direct' and the reason. Authority is
+        decided here, not by the caller: the actor must be an active admin
+        and not the employee, and the employee must be active. ``edits`` carry
+        kind ('add', 'ignore' or 'set_direction'), fingerprint, event_timestamp
+        and direction as the kind needs. All edits are written, or none.
+        Raises RuleViolation for authority, ValueError for a missing or long
+        reason or a malformed edit. Returns the rows written."""
+        reason = (reason or "").strip()
+        if not reason:
+            raise ValueError("A reason is required.")
+        if len(reason) > FIX_NOTE_MAX_CHARS:
+            raise ValueError(f"reason is longer than {FIX_NOTE_MAX_CHARS} characters")
+        edits = list(edits)
+        if not edits:
+            raise ValueError("There is nothing to change.")
+        for edit in edits:
+            kind = edit.get("kind")
+            if kind not in ("add", "ignore", "set_direction"):
+                raise ValueError(f"bad correction kind: {kind}")
+            if kind in ("ignore", "set_direction") and not edit.get("fingerprint"):
+                raise ValueError(f"a {kind} correction needs a punch")
+            if kind in ("add", "set_direction") and edit.get("direction") not in DIRECTIONS:
+                raise ValueError(f"bad direction: {edit.get('direction')}")
+            if kind == "add" and not isinstance(edit.get("event_timestamp"), datetime):
+                raise ValueError("an added punch needs a time")
+        now = _now()
+        with self.transaction() as connection:
+            actor = connection.execute(
+                "SELECT name, role FROM employees WHERE id = ? AND archived_at IS NULL", (actor_id,)
+            ).fetchone()
+            if actor is None or actor["role"] != "admin":
+                raise _core().RuleViolation("Only an admin can fix punches directly.")
+            if actor_id == employee_id:
+                raise _core().RuleViolation(
+                    "Nobody fixes their own punches directly; file a fix request instead.")
+            target = connection.execute(
+                "SELECT 1 FROM employees WHERE id = ? AND archived_at IS NULL", (employee_id,)
+            ).fetchone()
+            if target is None:
+                raise _core().RuleViolation("No such active employee.")
+            for edit in edits:
+                connection.execute(
+                    "INSERT INTO punch_corrections (employee_id, work_day, kind, fingerprint, "
+                    "event_timestamp, direction, request_line_id, created_at, created_by, "
+                    "created_by_name, created_by_role, path, reason) "
+                    "VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 'direct', ?)",
+                    (
+                        employee_id, work_day, edit["kind"],
+                        edit.get("fingerprint") if edit["kind"] != "add" else None,
+                        edit.get("event_timestamp") if edit["kind"] == "add" else None,
+                        edit.get("direction") if edit["kind"] != "ignore" else None,
+                        now, actor_id, actor["name"], actor["role"], reason,
+                    ),
+                )
+        return len(edits)
+
     def corrections_for(
         self, employee_ids: Iterable[int], start: datetime, end: datetime
     ) -> list[dict[str, object]]:

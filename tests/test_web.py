@@ -923,9 +923,12 @@ class FakeDatabase:
                         raise ValueError(f"line {line['id']} needs a direction to flip to")
                     correction = {"kind": "set_direction", "fingerprint": line["target_fingerprint"],
                                   "event_timestamp": None, "direction": direction}
+                actor = self.employees_by_id[actor_id]
                 corrections.append({
                     **correction, "employee_id": request["employee_id"],
                     "work_day": request["work_day"], "request_line_id": line["id"], "created_at": now,
+                    "created_by": actor_id, "created_by_name": actor["name"],
+                    "created_by_role": actor["role"], "path": "request", "reason": note,
                 })
             updates[line["id"]] = {"status": decision["status"], "hr_event_time": hr_time,
                                    "hr_direction": hr_direction, "decided_by": actor_id,
@@ -954,6 +957,38 @@ class FakeDatabase:
             self._fix_event(request_id, None, actor_id, "decided", {"status": "pending"},
                             {"status": final, "note": note})
         return {"status": request["status"], "decided": decided, "skipped": skipped}
+
+    def record_direct_corrections(self, employee_id, work_day, edits, *, actor_id, reason):
+        from essl_hub import db as db_module
+
+        self._check_online()
+        reason = (reason or "").strip()
+        if not reason:
+            raise ValueError("A reason is required.")
+        if len(reason) > db_module.FIX_NOTE_MAX_CHARS:
+            raise ValueError(f"reason is longer than {db_module.FIX_NOTE_MAX_CHARS} characters")
+        edits = list(edits)
+        if not edits:
+            raise ValueError("There is nothing to change.")
+        actor = self.employees_by_id.get(actor_id)
+        if actor is None or actor.get("archived_at") or actor["role"] != "admin":
+            raise db_module.RuleViolation("Only an admin can fix punches directly.")
+        if actor_id == employee_id:
+            raise db_module.RuleViolation("Nobody fixes their own punches directly; file a fix request instead.")
+        target = self.employees_by_id.get(employee_id)
+        if target is None or target.get("archived_at"):
+            raise db_module.RuleViolation("No such active employee.")
+        now = _ist_now()
+        for edit in edits:
+            self.corrections.append({
+                "id": len(self.corrections) + 1, "employee_id": employee_id, "work_day": work_day,
+                "kind": edit["kind"], "fingerprint": edit.get("fingerprint"),
+                "event_timestamp": edit.get("event_timestamp"), "direction": edit.get("direction"),
+                "request_line_id": None, "created_at": now, "created_by": actor_id,
+                "created_by_name": actor["name"], "created_by_role": actor["role"],
+                "path": "direct", "reason": reason,
+            })
+        return len(edits)
 
     def corrections_for(self, employee_ids, start: datetime, end: datetime) -> list[dict]:
         wanted = set(employee_ids)
@@ -6489,6 +6524,149 @@ class FixReviewTest(unittest.TestCase):
         self.assertTrue(response.headers["Location"].endswith("/fixes/review"))
         self.assertEqual(self.database.fix_request(request_id)["status"], "approved")
         self.assertIn("Saved. 1 line approved, 0 rejected.", self._flash())
+
+    # --- Admin direct fixes (v10): the form, confirm-then-apply, who may use them -----
+
+    def _url(self, person=None, step: str = "", day=None) -> str:
+        return f"/fixes/direct/{(person or self.asha)['id']}/{(day or self.DAY).isoformat()}{step}"
+
+    def _form(self, **extra) -> dict:
+        return {"reason": "Badge log shows he arrived at 13:40", **extra}
+
+    def _fp(self, uid: str, name: str) -> str:
+        return next(p["fingerprint"] for p in self.database.punches if p["fingerprint"] == name)
+
+    def _fix(self, step: str, form: dict, client=None, person=None):
+        client = client or self.client
+        return client.post(self._url(person, step), data={"csrf": self._csrf(client), **form})
+
+    def test_admin_sees_a_form_listing_the_punches_and_a_button_on_their_day(self) -> None:
+        self._sign_in(self.admin)
+        page = self.client.get(self._url())
+        self.assertEqual(page.status_code, 200)
+        for name in ("act-a-in", "act-a-out", "act-a-last"):
+            self.assertIn(f'name="{name}"', page.text)
+        self.assertIn('name="reason"', page.text)
+        self.assertIn('name="add-0-time"', page.text)
+        day = self.client.get(f"/day?employee={self.asha['id']}&date=2026-10-26")
+        self.assertIn("Fix punches", day.text)
+        self.assertIn(self._url(), day.text)
+
+    def test_only_an_admin_may_open_it_and_never_for_their_own_day(self) -> None:
+        # Three sign-ins at most per test: the code limiter blocks a fourth.
+        for person in (self.hari, self.boss):
+            with self.subTest(person=person["name"]):
+                self._sign_in(person)
+                self.assertEqual(self.client.get(self._url()).status_code, 403)
+                self.assertEqual(self._fix("", self._form()).status_code, 403)
+                self.assertNotIn("Fix punches", self.client.get(f"/day?employee={self.asha['id']}&date=2026-10-26").text)
+        self._sign_in(self.admin)
+        self.assertEqual(self.client.get(self._url(self.admin)).status_code, 403)
+        self.assertEqual(self._fix("/confirm", self._form(), person=self.admin).status_code, 403)
+        self.assertNotIn("Fix punches", self.client.get("/day?date=2026-10-26").text)
+        self.assertEqual(self.database.corrections, [])
+
+    def test_unknown_future_and_archived_targets_are_not_found(self) -> None:
+        self._sign_in(self.admin)
+        self.assertEqual(self.client.get("/fixes/direct/9999/2026-10-26").status_code, 404)
+        self.assertEqual(self.client.get(self._url(day=self.DAY + timedelta(days=3))).status_code, 404)
+        self.assertEqual(self.client.get("/fixes/direct/%d/not-a-day" % self.asha["id"]).status_code, 404)
+        self.database.employees_by_id[self.asha["id"]]["archived_at"] = datetime(2026, 10, 26, 12, 0)
+        self.assertEqual(self.client.get(self._url()).status_code, 404)
+
+    def test_preview_shows_hours_before_and_after_and_writes_nothing(self) -> None:
+        self._sign_in(self.admin)
+        # 09:00 In, 13:00 Out, 17:00 Out (orphan): 4h 00m. Counting 17:00 as In adds nothing, but a
+        # missed In at 13:40 makes 13:40-17:00 a stretch: 7h 20m.
+        preview = self._fix("", self._form(**{"add-0-time": "13:40", "add-0-dir": "in"}))
+        self.assertEqual(preview.status_code, 200)
+        self.assertIn("Confirm fix", preview.text)
+        self.assertIn("4h 00m", preview.text)
+        self.assertIn("7h 20m", preview.text)
+        self.assertIn("Add a missed punch: In at 13:40", preview.text)
+        self.assertIn("Badge log shows he arrived at 13:40", preview.text)
+        self.assertEqual(self.database.corrections, [])
+
+    def test_confirm_records_the_admin_the_reason_and_the_path(self) -> None:
+        self._sign_in(self.admin)
+        form = self._form(**{"act-a-last": "ignore", "add-0-time": "13:40", "add-0-dir": "in"})
+        preview = self._fix("", form)
+        hidden = {"punch_set_hash": self._hash_of(preview.text)}
+        response = self._fix("/confirm", {**form, **hidden})
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(f"/day?employee={self.asha['id']}&date=2026-10-26", response.headers["Location"])
+        kinds = sorted((c["kind"], c["fingerprint"], c["direction"]) for c in self.database.corrections)
+        self.assertEqual(kinds, [("add", None, "entry"), ("ignore", "a-last", None)])
+        for correction in self.database.corrections:
+            self.assertEqual(
+                (correction["created_by"], correction["created_by_name"], correction["created_by_role"],
+                 correction["path"], correction["request_line_id"], correction["reason"]),
+                (self.admin["id"], "Ada Admin", "admin", "direct", None,
+                 "Badge log shows he arrived at 13:40"))
+        day = self.client.get(f"/day?employee={self.asha['id']}&date=2026-10-26").text
+        # 09:00-13:00 (4h) plus the added In at 13:40, open until 18:00 now: 8h 20m.
+        self.assertIn("8h 20m", day)
+
+    def test_a_flip_sets_an_absolute_direction_even_on_a_direction_less_punch(self) -> None:
+        self.database.insert_punches([{**_punch_row("x-1", datetime(2026, 10, 26, 18, 0), None, uid="118")}])
+        self._sign_in(self.admin)
+        form = self._form(**{"act-x-1": "out"})
+        response = self._fix("/confirm", {**form, "punch_set_hash": self._hash_of(self._fix("", form).text)})
+        self.assertEqual(response.status_code, 302)
+        [correction] = self.database.corrections
+        self.assertEqual((correction["kind"], correction["fingerprint"], correction["direction"]),
+                         ("set_direction", "x-1", "exit"))
+
+    def test_validation_refuses_without_writing(self) -> None:
+        self._sign_in(self.admin)
+        cases = {
+            "no reason": ({"reason": "", "act-a-last": "ignore"}, "Say why you are changing"),
+            "no change": (self._form(), "Choose at least one change"),
+            "add without a direction": (self._form(**{"add-0-time": "13:40"}), "Choose In or Out"),
+            "add without a time": (self._form(**{"add-0-dir": "in"}), "Enter the time"),
+            "add in the future": (self._form(**{"add-0-time": "23:00", "add-0-dir": "in"}), "happened yet"),
+            "a punch that is not on the day": (self._form(**{"act-nope": "ignore"}), "no longer on the day"),
+            "a bad action": (self._form(**{"act-a-in": "explode"}), "Choose In, Out or Ignore"),
+        }
+        for label, (form, message) in cases.items():
+            with self.subTest(label):
+                for step in ("", "/confirm"):
+                    response = self._fix(step, form)
+                    self.assertEqual(response.status_code, 400)
+                    self.assertIn(message, response.text)
+        self.assertEqual(self.database.corrections, [])
+
+    def test_a_day_that_changed_since_the_preview_is_refused(self) -> None:
+        self._sign_in(self.admin)
+        form = self._form(**{"act-a-last": "ignore"})
+        stale = self._hash_of(self._fix("", form).text)
+        self.database.insert_punches([_punch_row("late", datetime(2026, 10, 26, 17, 30), "entry", uid="118")])
+        response = self._fix("/confirm", {**form, "punch_set_hash": stale})
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("changed after you opened this page", response.text)
+        self.assertEqual(self.database.corrections, [])
+
+    def test_forged_actor_fields_in_the_form_are_ignored(self) -> None:
+        self._sign_in(self.admin)
+        form = self._form(**{"act-a-last": "ignore", "created_by": str(self.hari["id"]),
+                             "created_by_role": "hr", "path": "request", "created_by_name": "Hari HR"})
+        self._fix("/confirm", {**form, "punch_set_hash": self._hash_of(self._fix("", form).text)})
+        [correction] = self.database.corrections
+        self.assertEqual((correction["created_by"], correction["created_by_role"], correction["path"]),
+                         (self.admin["id"], "admin", "direct"))
+
+    def test_bad_csrf_is_refused(self) -> None:
+        self._sign_in(self.admin)
+        response = self.client.post(self._url(), data={"csrf": "wrong", **self._form(**{"act-a-last": "ignore"})})
+        self.assertIn(response.status_code, (400, 403))
+        self.assertEqual(self.database.corrections, [])
+
+    @staticmethod
+    def _hash_of(html: str) -> str:
+        marker = 'name="punch_set_hash" value="'
+        start = html.index(marker) + len(marker)
+        return html[start: html.index('"', start)]
+
 
 
 class CopyAndPhoneLayoutTest(unittest.TestCase):

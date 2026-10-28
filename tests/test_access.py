@@ -176,5 +176,16 @@ class AccessTest(unittest.TestCase):
         self.assertTrue(access.can_approve_fix(self.admin, self._request_by(self.c), self.db))
 
 
+    # direct punch fixes (v10) ---------------------------------------------
+
+    def test_only_an_admin_fixes_punches_directly_and_never_their_own(self) -> None:
+        self.assertTrue(access.can_fix_punches_directly(self.admin, self.c["id"]))
+        self.assertTrue(access.can_fix_punches_directly(self.admin, self.hr["id"]))
+        self.assertFalse(access.can_fix_punches_directly(self.admin, self.admin["id"]))
+        for person in (self.hr, self.a, self.c):
+            self.assertFalse(access.can_fix_punches_directly(person, self.c["id"] + 100))
+        self.assertFalse(access.can_fix_punches_directly(None, self.c["id"]))
+
+
 if __name__ == "__main__":
     unittest.main()
