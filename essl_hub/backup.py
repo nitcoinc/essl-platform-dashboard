@@ -409,8 +409,11 @@ def _open_source(source_path: str) -> sqlite3.Connection:
         return sqlite3.connect(f"file:{source_path}?mode=rw", uri=True, timeout=5)
 
 
-def _build_snapshot(source_path: str, work_dir: Path) -> Snapshot:
-    """Backup-API copy, scrub, VACUUM, integrity_check, deterministic gzip."""
+def _build_snapshot(source_path: str, work_dir: Path, *, allow_older: bool = False) -> Snapshot:
+    """Backup-API copy, scrub, VACUUM, integrity_check, deterministic gzip.
+    A database behind this code's schema is refused, unless ``allow_older``
+    (the pre-update snapshot, taken by the new image before it migrates):
+    that copy scrubs only the tables the older file has."""
     work_dir = Path(work_dir)
     raw = work_dir / "export.db"
     src = _open_source(source_path)
@@ -426,12 +429,14 @@ def _build_snapshot(source_path: str, work_dir: Path) -> Snapshot:
     copy = sqlite3.connect(raw, isolation_level=None)
     try:
         version = _schema_version(copy)
-        if version < SCHEMA_VERSION:
+        if version < SCHEMA_VERSION and not allow_older:
             raise BackupError(
                 f"schema version {version} is behind {SCHEMA_VERSION}; skipping backup"
             )
+        present = {r[0] for r in copy.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         for table in SCRUBBED_TABLES:
-            copy.execute(f"DELETE FROM {table}")
+            if table in present:
+                copy.execute(f"DELETE FROM {table}")
         copy.execute("PRAGMA journal_mode=DELETE")
         copy.execute("VACUUM")
         result = copy.execute("PRAGMA integrity_check").fetchone()[0]
@@ -486,9 +491,11 @@ def run_cycle(
     keep_hours: int | None = None,
     keep_days: int | None = None,
     export_hour: int | None = None,
+    allow_older: bool = False,
 ) -> str:
     """One backup cycle. Returns ok, skipped, blocked, failed or not_set_up.
-    Never deletes or modifies local database files."""
+    Never deletes or modifies local database files. ``allow_older`` lets the
+    install script snapshot a database that is one update behind."""
     status_path = status_path or backup_status_path(database_path)
     keep_hours = keep_hours if keep_hours is not None else config.backup_keep_hours()
     keep_days = keep_days if keep_days is not None else config.backup_keep_days()
@@ -508,7 +515,7 @@ def run_cycle(
                 result = "not_set_up"
                 raise BackupError(SETUP_HINT)
             with _work_dir(database_path, ".backup-") as work:
-                snap = _build_snapshot(database_path, work)
+                snap = _build_snapshot(database_path, work, allow_older=allow_older)
                 if not snap.database_id:
                     result, blocked = "blocked", True
                     raise BackupError(
@@ -892,7 +899,9 @@ def main(argv: list[str] | None = None) -> int:
                          help="restore drill: give the copy a new database_id (never uploads)")
     sub.add_parser("list", help="list snapshots in R2")
     sub.add_parser("has-backups", help="exit 0 if R2 has latest.json, 3 if not")
-    sub.add_parser("now", help="run one backup cycle now")
+    now_parser = sub.add_parser("now", help="run one backup cycle now")
+    now_parser.add_argument("--allow-older-schema", action="store_true",
+                            help="also snapshot a database behind this code's schema (pre-update)")
     sub.add_parser("status", help="show backup status")
     adopt = sub.add_parser("adopt", help="make this database the backups' owner")
     adopt.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
@@ -913,7 +922,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "list":
             cmd_list(make_client())
         elif args.command == "now":
-            result = run_cycle(path, make_client())
+            result = run_cycle(path, make_client(), allow_older=args.allow_older_schema)
             print(f"backup: {result}")
             return 0 if result in ("ok", "skipped") else 1
         elif args.command == "status":

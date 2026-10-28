@@ -84,7 +84,7 @@ Run the same command: `./deploy/install.sh`. On an existing install it:
 
 1. Fast-forwards to the latest `main`, then re-runs the new installer. It refuses to pull over local edits to tracked files.
 2. Backs up `.env` to `.env.bak.<time>` (keeps the last 5) and adds any settings the new release introduced, with their defaults.
-3. Uploads a fresh database snapshot to R2 before the schema can change (`backup now`). If that fails it asks before continuing. On an install still on Turso it stops here and prints the [upgrade steps](#upgrading-from-turso).
+3. Uploads a fresh database snapshot to R2 before the schema can change (`backup now --allow-older-schema`: the new image is built by then, so the database may be one schema step behind). If that fails it asks before continuing. On an install still on Turso it stops here and prints the [upgrade steps](#upgrading-from-turso).
 4. Builds, restarts only changed containers, waits for the web app, and prunes old images. If the web app does not come up, it prints the `git checkout <previous>` command to roll back and exits non-zero.
 
 A lock file stops two runs overlapping. The very first time you move to this installer from an older checkout, run `git pull` once by hand.

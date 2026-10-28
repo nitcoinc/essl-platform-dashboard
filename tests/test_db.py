@@ -1419,7 +1419,8 @@ class MissedPunchSchemaTest(unittest.TestCase):
         )
         with mock.patch.object(db_module, "SCHEMA_VERSION", 7), \
                 mock.patch.dict(db_module.MIGRATIONS, {}, clear=False):
-            db_module.MIGRATIONS.pop(8)
+            for later in (8, 9, 10):  # a v7 file has none of the later steps
+                db_module.MIGRATIONS.pop(later)
             old.initialize((device,))
             old.insert_punches([{
                 "fingerprint": "fp-v7", "device_id": "uppal-x990", "site": "Uppal",
@@ -1447,6 +1448,136 @@ class MissedPunchSchemaTest(unittest.TestCase):
         self.assertEqual(fingerprints, ["fp-v7"])
         self.assertEqual(old.setting("daily_target_minutes"), "450")
         self.assertEqual(old.device_windows(), {"uppal-x990": 60})
+
+    def _v9_database(self, name: str = "v9.db") -> db_module.Database:
+        """A database at schema v9 with Asha's request decided by Hari, written
+        the way v9 code did (no audit columns)."""
+        path = os.path.join(self._tmp.name, name)
+        old = db_module.Database(path)
+        self.addCleanup(old.close)
+        with mock.patch.object(db_module, "SCHEMA_VERSION", 9), \
+                mock.patch.dict(db_module.MIGRATIONS, {}, clear=False):
+            db_module.MIGRATIONS.pop(10)
+            old.initialize(())
+        for uid, person, role in (("101", "Asha", "employee"), ("102", "Hari", "hr")):
+            old.upsert_employee(device_user_id=uid, name=person, email=f"{person.lower()}@x.com")
+            old.set_employee_role(old.employee_by_device_user_id(uid)["id"], role)
+        return old
+
+    def _v9_correction(self, old: db_module.Database, *, decider: int | None, note: str | None) -> int:
+        asha = old.employee_by_device_user_id("101")["id"]
+        request = old.file_fix_lines(
+            asha, DAY, [self._add_in()], source="link", punch_set_hash="h1")["request_id"]
+        line = old.fix_request(request)["lines"][0]["id"]
+        with old.transaction() as connection:
+            connection.execute(
+                "UPDATE fix_request_lines SET status='approved', decided_by=?, decided_at=? WHERE id=?",
+                (decider, datetime(2026, 10, 27, 9, 0), line))
+            connection.execute("UPDATE fix_requests SET decision_note=? WHERE id=?", (note, request))
+            connection.execute(
+                "INSERT INTO punch_corrections (employee_id, work_day, kind, event_timestamp, direction, "
+                "request_line_id, created_at) VALUES (?, ?, 'add', ?, 'entry', ?, ?)",
+                (asha, DAY, datetime(2026, 10, 26, 13, 40), line, datetime(2026, 10, 27, 9, 0)))
+        return asha
+
+    def _corrections(self, database: db_module.Database) -> list[dict]:
+        with database.connect() as connection:
+            return connection.execute("SELECT * FROM punch_corrections ORDER BY id").fetchall()
+
+    def test_v9_to_v10_keeps_corrections_and_names_the_old_decider(self) -> None:
+        old = self._v9_database()
+        hari = old.employee_by_device_user_id("102")["id"]
+        asha = self._v9_correction(old, decider=hari, note="Badge log agrees")
+        before = [(c["id"], c["employee_id"], c["kind"], c["event_timestamp"], c["direction"],
+                   c["request_line_id"]) for c in self._corrections(old)]
+        old.migrate_schema()
+        old.migrate_schema()  # a re-run is a no-op
+        [row] = self._corrections(old)
+        self.assertEqual(
+            [(row["id"], row["employee_id"], row["kind"], row["event_timestamp"], row["direction"],
+              row["request_line_id"])], before)
+        self.assertEqual(
+            (row["created_by"], row["created_by_name"], row["created_by_role"], row["path"], row["reason"]),
+            (hari, "Hari", None, "request", "Badge log agrees"))
+        self.assertEqual(row["employee_id"], asha)
+        # The overlay still reads it.
+        [read] = old.corrections_for([asha], datetime(2026, 10, 26, 6), datetime(2026, 10, 27, 6))
+        self.assertEqual(read["id"], row["id"])
+        with old.connect() as connection:
+            seq = connection.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name='punch_corrections'").fetchone()
+        self.assertGreaterEqual(seq["seq"], row["id"])
+
+    def test_correction_whose_decider_is_gone_migrates_as_before_the_audit_trail(self) -> None:
+        old = self._v9_database()
+        self._v9_correction(old, decider=None, note=None)
+        old.migrate_schema()
+        [row] = self._corrections(old)
+        self.assertEqual((row["created_by"], row["created_by_name"], row["created_by_role"], row["reason"]),
+                         (None, "before audit trail", None, None))
+
+    def test_v9_code_can_still_insert_a_correction_into_a_v10_file(self) -> None:
+        old = self._v9_database("rollback.db")
+        old.migrate_schema()
+        request = old.file_fix_lines(
+            old.employee_by_device_user_id("101")["id"], DAY, [self._add_in()],
+            source="link", punch_set_hash="h1")["request_id"]
+        line = old.fix_request(request)["lines"][0]["id"]
+        with old.transaction() as connection:  # the exact v9 statement
+            connection.execute(
+                "INSERT INTO punch_corrections (employee_id, work_day, kind, fingerprint, "
+                "event_timestamp, direction, request_line_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (old.employee_by_device_user_id("101")["id"], DAY, "add", None,
+                 datetime(2026, 10, 26, 13, 40), "entry", line, datetime(2026, 10, 27, 9, 0)))
+        [row] = self._corrections(old)
+        self.assertEqual((row["created_by_name"], row["path"]), ("before audit trail", "request"))
+
+    def test_audit_columns_cannot_be_updated_or_deleted_but_an_employee_delete_still_cascades(self) -> None:
+        request_id = self._file(self._add_in())["request_id"]
+        line = self.database.fix_request(request_id)["lines"][0]["id"]
+        self.database.decide_fix_lines(request_id, [{"line_id": line, "status": "approved"}],
+                                       actor_id=self.hari, note="ok")
+        for statement in (
+            "UPDATE punch_corrections SET created_by_name = 'Someone else'",
+            "UPDATE punch_corrections SET created_by_role = 'admin'",
+            "UPDATE punch_corrections SET reason = 'changed'",
+            "UPDATE punch_corrections SET direction = 'exit'",
+            "DELETE FROM punch_corrections",
+        ):
+            with self.subTest(statement=statement), self.assertRaises(Exception) as caught:
+                with self.database.transaction() as connection:
+                    connection.execute(statement)
+            self.assertIn("append-only", str(caught.exception))
+        self.assertEqual(self._count("punch_corrections"), 1)
+        with self.database.transaction() as connection:  # employee removal still cascades
+            connection.execute("DELETE FROM employees WHERE id = ?", (self.asha,))
+        self.assertEqual(self._count("punch_corrections"), 0)
+
+    def test_deleting_the_decider_keeps_the_name_that_was_recorded(self) -> None:
+        request_id = self._file(self._add_in())["request_id"]
+        line = self.database.fix_request(request_id)["lines"][0]["id"]
+        self.database.decide_fix_lines(request_id, [{"line_id": line, "status": "approved"}],
+                                       actor_id=self.hema)
+        with self.database.transaction() as connection:
+            connection.execute("UPDATE fix_request_lines SET decided_by = NULL WHERE decided_by = ?", (self.hema,))
+            connection.execute("UPDATE fix_requests SET decided_by = NULL WHERE decided_by = ?", (self.hema,))
+            connection.execute("DELETE FROM employees WHERE id = ?", (self.hema,))
+        [row] = self._corrections(self.database)
+        self.assertEqual((row["created_by"], row["created_by_name"], row["created_by_role"]),
+                         (None, "Hema", "hr"))
+
+    def test_a_request_decision_stamps_who_when_role_path_and_reason(self) -> None:
+        request_id = self._file(self._add_in())["request_id"]
+        line = self.database.fix_request(request_id)["lines"][0]["id"]
+        self.database.decide_fix_lines(request_id, [{"line_id": line, "status": "approved"}],
+                                       actor_id=self.adam, note="Door log confirms")
+        [row] = self._corrections(self.database)
+        self.assertEqual(
+            (row["created_by"], row["created_by_name"], row["created_by_role"], row["path"], row["reason"]),
+            (self.adam, "Adam", "admin", "request", "Door log confirms"))
+        [read] = self.database.corrections_for(
+            [self.asha], datetime(2026, 10, 26, 6), datetime(2026, 10, 27, 6))
+        self.assertEqual((read["created_by_name"], read["created_by_role"]), ("Adam", "admin"))
 
     def test_work_day_round_trips_as_a_date_and_datetimes_still_bind_as_timestamps(self) -> None:
         self.assertTrue(self.database.record_alert(
@@ -2024,7 +2155,8 @@ class PunchArchiveTest(unittest.TestCase):
         self.addCleanup(old.close)
         with mock.patch.object(db_module, "SCHEMA_VERSION", 8), \
                 mock.patch.dict(db_module.MIGRATIONS, {}, clear=False):
-            db_module.MIGRATIONS.pop(9)
+            for later in (9, 10):  # a v8 file has neither later step
+                db_module.MIGRATIONS.pop(later)
             old.initialize((self.device,))
             old.insert_punches([self._punch("fp-v8", "7", datetime(2026, 10, 20, 9, 0))])
         with old.connect() as connection:
@@ -2037,7 +2169,7 @@ class PunchArchiveTest(unittest.TestCase):
             connection.execute("PRAGMA user_version=8")
         old.migrate_schema()
         old.migrate_schema()
-        self.assertEqual(old.schema_version(), 9)
+        self.assertEqual(old.schema_version(), db_module.SCHEMA_VERSION)
         self.assertEqual(old.punch_archives(), [])
         self.assertEqual([p["fingerprint"] for p in old.punches_for_employee_range(
             "7", datetime(2026, 10, 20), datetime(2026, 10, 21))], ["fp-v8"])

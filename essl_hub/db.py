@@ -83,7 +83,7 @@ _TZ = ZoneInfo(TIMEZONE_NAME)
 _logger = logging.getLogger(__name__)
 
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # libsql exposes no declared column types (U8), so read-side conversion is by
 # column name. Every TIMESTAMP column in the schema is listed here (a test
@@ -743,6 +743,65 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         )
         """,
         "CREATE INDEX IF NOT EXISTS idx_punch_archives_user ON punch_archives(device_user_id)",
+    ),
+    # v10: an audit trail for corrections. A direct admin fix has no request
+    # line, so request_line_id becomes nullable (SQLite cannot relax a NOT NULL
+    # in place: rebuild, copying ids). Each row keeps who made it, their name
+    # and role at that moment, the path and the reason. The new columns are
+    # defaulted, so v9 code still inserts into a v10 file (a rollback). The
+    # backfill names the old decider but not a role, which was never recorded;
+    # a decider who is gone shows as "before audit trail".
+    10: (
+        """
+        CREATE TABLE IF NOT EXISTS punch_corrections_v10 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+            work_day TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('add', 'ignore', 'set_direction')),
+            fingerprint TEXT,
+            event_timestamp TIMESTAMP,
+            direction TEXT CHECK (direction IN ('entry', 'exit')),
+            request_line_id INTEGER UNIQUE REFERENCES fix_request_lines(id),
+            created_at TIMESTAMP NOT NULL,
+            created_by INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            created_by_name TEXT NOT NULL DEFAULT 'before audit trail',
+            created_by_role TEXT,
+            path TEXT NOT NULL DEFAULT 'request' CHECK (path IN ('request', 'direct')),
+            reason TEXT
+        )
+        """,
+        """
+        INSERT INTO punch_corrections_v10 (id, employee_id, work_day, kind, fingerprint,
+            event_timestamp, direction, request_line_id, created_at, created_by,
+            created_by_name, created_by_role, path, reason)
+        SELECT c.id, c.employee_id, c.work_day, c.kind, c.fingerprint, c.event_timestamp,
+            c.direction, c.request_line_id, c.created_at, l.decided_by,
+            COALESCE(e.name, 'before audit trail'), NULL, 'request', r.decision_note
+        FROM punch_corrections c
+        LEFT JOIN fix_request_lines l ON l.id = c.request_line_id
+        LEFT JOIN employees e ON e.id = l.decided_by
+        LEFT JOIN fix_requests r ON r.id = l.request_id
+        ORDER BY c.id
+        """,
+        "DROP TABLE punch_corrections",
+        "ALTER TABLE punch_corrections_v10 RENAME TO punch_corrections",
+        "CREATE INDEX IF NOT EXISTS idx_punch_corrections_employee "
+        "ON punch_corrections(employee_id, work_day)",
+        # Append-only: a correction is never edited, and only leaves with its
+        # employee (the cascade runs once the employee row is gone).
+        """
+        CREATE TRIGGER IF NOT EXISTS punch_corrections_no_update
+        BEFORE UPDATE OF employee_id, work_day, kind, fingerprint, event_timestamp, direction,
+            request_line_id, created_at, created_by_name, created_by_role, path, reason
+        ON punch_corrections
+        BEGIN SELECT RAISE(ABORT, 'punch corrections are append-only'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS punch_corrections_no_delete
+        BEFORE DELETE ON punch_corrections
+        WHEN EXISTS (SELECT 1 FROM employees WHERE id = OLD.employee_id)
+        BEGIN SELECT RAISE(ABORT, 'punch corrections are append-only'); END
+        """,
     ),
 }
 

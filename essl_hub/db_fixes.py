@@ -297,6 +297,12 @@ class FixesMixin:
                 raise _core().RuleViolation("No such fix request.")
             if actor_id == request["employee_id"]:
                 raise _core().RuleViolation("Nobody decides their own fix request.")
+            # The audit row keeps the actor's name and role as they are now.
+            actor = connection.execute(
+                "SELECT name, role FROM employees WHERE id = ?", (actor_id,)
+            ).fetchone()
+            if actor is None:
+                raise _core().RuleViolation("Unknown approver.")
             for decision in decisions:
                 line = connection.execute(
                     "SELECT l.*, d.name AS decided_by_name FROM fix_request_lines l "
@@ -325,12 +331,14 @@ class FixesMixin:
                     correction = _correction_values(connection, line, hr_time, hr_direction)
                     connection.execute(
                         "INSERT INTO punch_corrections (employee_id, work_day, kind, fingerprint, "
-                        "event_timestamp, direction, request_line_id, created_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        "event_timestamp, direction, request_line_id, created_at, created_by, "
+                        "created_by_name, created_by_role, path, reason) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'request', ?)",
                         (
                             request["employee_id"], request["work_day"], correction["kind"],
                             correction["fingerprint"], correction["event_timestamp"],
-                            correction["direction"], line["id"], now,
+                            correction["direction"], line["id"], now, actor_id,
+                            actor["name"], actor["role"], note,
                         ),
                     )
                 _insert_fix_event(

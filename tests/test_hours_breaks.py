@@ -351,6 +351,29 @@ class CorrectionOverlayTest(unittest.TestCase):
         real = self._score(self._rows((_t(9), "entry"), (_t(13), "exit"), (_t(13, 0, 30), "exit")))
         self.assertEqual(len(real.collapsed), 1)
 
+    def test_corrected_rows_carry_who_fixed_them_and_why(self) -> None:
+        rows = self._rows((_t(9), "entry"), (_t(13), "exit"), (_t(18), "exit"), device="c3")
+        by_hari = {**self._fix("set_direction", cid=4, fingerprint="fp-1", direction="entry"),
+                   "created_by_name": "Hari", "created_by_role": "hr", "created_at": _t(20),
+                   "reason": "Badge log", "path": "request"}
+        by_adam = {**self._fix("ignore", cid=7, fingerprint="fp-1"),
+                   "created_by_name": "Adam", "created_by_role": "admin", "created_at": _t(21),
+                   "reason": "Duplicate", "path": "direct"}
+        added = {**self._fix("add", cid=9, at=_t(13, 40), direction="entry"),
+                 "created_by_name": "Adam", "created_by_role": "admin", "created_at": _t(21, 5),
+                 "reason": "Forgot to tap", "path": "direct"}
+        merged = apply_corrections(rows, [by_hari, by_adam, added], self.MAIN_IDS)
+        info = {r["fingerprint"]: r["correction_info"] for r in merged}
+        self.assertIsNone(info["fp-0"])
+        # The later correction on one punch names the fixer shown.
+        self.assertEqual(info["fp-1"], {"id": 7, "by": "Adam", "role": "admin", "at": _t(21),
+                                        "reason": "Duplicate", "path": "direct"})
+        self.assertEqual(info["correction:9"], {"id": 9, "by": "Adam", "role": "admin", "at": _t(21, 5),
+                                                "reason": "Forgot to tap", "path": "direct"})
+        # A correction row from before the audit trail still merges.
+        [legacy] = apply_corrections(rows[:1], [self._fix("ignore", fingerprint="fp-0")], self.MAIN_IDS)
+        self.assertEqual(legacy["correction_info"]["by"], "before audit trail")
+
     def test_dangling_or_foreign_fingerprint_is_inert(self) -> None:
         rows = self._rows((_t(9), "entry"), (_t(18), "exit"), device="c3")
         corrections = [self._fix("ignore", fingerprint="fp-gone"),

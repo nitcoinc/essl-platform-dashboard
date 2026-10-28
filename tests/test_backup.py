@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest import mock
 
 from essl_hub import backup as bk
+from essl_hub import db as db_module
 from essl_hub.db import SCHEMA_VERSION, Database
 
 NOW = datetime(2026, 10, 14, 10, 0, 0)
@@ -212,7 +213,7 @@ class PruneTest(Base):
         self.init_db()
         counter = iter(range(10_000))
 
-        def fake_snapshot(source_path, work_dir):
+        def fake_snapshot(source_path, work_dir, **kwargs):
             packed = Path(work_dir) / "export.db.gz"
             packed.write_bytes(f"snap-{next(counter)}".encode())
             return bk.Snapshot(packed, _setting(self.db_path, "database_id"), 0)
@@ -315,6 +316,34 @@ class CycleTest(Base):
         conn.close()
         self.assertEqual(self.cycle(), "failed")
         self.assertIn("schema version", self.status()["last_error"])
+
+    def _v9_database(self) -> None:
+        """A database one schema step behind the code (the state during an update)."""
+        with mock.patch.object(db_module, "SCHEMA_VERSION", 9), \
+                mock.patch.object(bk, "SCHEMA_VERSION", 9), \
+                mock.patch.dict(db_module.MIGRATIONS, {}, clear=False):
+            db_module.MIGRATIONS.pop(10)
+            self.init_db()
+
+    def test_pre_update_snapshot_of_an_older_schema_needs_the_flag(self) -> None:
+        self._v9_database()
+        self.assertEqual(self.cycle(), "failed")  # the scheduled loop stays strict
+        self.assertEqual(self.r2.puts, [])
+        self.assertEqual(self.cycle(allow_older=True), "ok")
+        [key] = [k for k in self.r2.objects if k.startswith("recent/")]
+        raw = self.dir / "older.db"
+        raw.write_bytes(gzip.decompress(self.r2.objects[key]))
+        self.assertEqual(bk._schema_version(sqlite3.connect(raw)), 9)
+
+    def test_older_schema_snapshot_scrubs_only_the_tables_it_has(self) -> None:
+        self.init_db()
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("DROP TABLE mail_outbox")  # an older file has no such table
+        conn.execute("PRAGMA user_version=7")
+        conn.execute("DELETE FROM settings WHERE key='schema_version'")
+        conn.commit()
+        conn.close()
+        self.assertEqual(self.cycle(allow_older=True), "ok")
 
     def test_nightly_once_per_day_after_hour_and_across_restart(self) -> None:
         self.init_db()
@@ -478,6 +507,26 @@ class RestoreTest(Base):
         conn.close()
         self.assertEqual(_setting(self.db_path, "database_id"), db_id)
         self.assertEqual(self.leftovers(), [])
+
+    def test_restored_v9_snapshot_opens_and_migrates_to_the_current_schema(self) -> None:
+        with mock.patch.object(db_module, "SCHEMA_VERSION", 9), \
+                mock.patch.object(bk, "SCHEMA_VERSION", 9), \
+                mock.patch.dict(db_module.MIGRATIONS, {}, clear=False):
+            db_module.MIGRATIONS.pop(10)
+            self.init_db()
+            self.cycle()
+        for suffix in ("", "-wal", "-shm"):
+            if os.path.exists(self.db_path + suffix):
+                os.unlink(self.db_path + suffix)
+        self._restore()
+        database = Database(self.db_path, must_exist=True)
+        self.addCleanup(database.close)
+        self.assertEqual(database.schema_version(), 9)
+        database.migrate_schema()
+        self.assertEqual(database.schema_version(), SCHEMA_VERSION)
+        with database.connect() as connection:
+            columns = {r["name"] for r in connection.execute("PRAGMA table_info(punch_corrections)").fetchall()}
+        self.assertIn("created_by_name", columns)
 
     def test_restore_key(self) -> None:
         _, older = self._snapshots()

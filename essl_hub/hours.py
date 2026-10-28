@@ -274,6 +274,19 @@ def counted_punches(rows, windows: dict[str, int]) -> list[Punch]:
     return [punch_from_row(row, windows) for row in rows if row.get("correction") != CORRECTION_IGNORED]
 
 
+def correction_info(correction: dict) -> dict:
+    """Who made a correction and why, as the day view shows it. A row from
+    before the audit trail has no name of its own."""
+    return {
+        "id": correction.get("id"),
+        "by": correction.get("created_by_name") or "before audit trail",
+        "role": correction.get("created_by_role"),
+        "at": correction.get("created_at"),
+        "reason": correction.get("reason"),
+        "path": correction.get("path") or "request",
+    }
+
+
 def apply_corrections(rows, corrections, main_ids: dict[int, str]) -> list[dict]:
     """Merge approved fixes (KTD4) into punch rows, in time order. Pure, so
     the HR preview can merge proposed lines the same way.
@@ -281,7 +294,8 @@ def apply_corrections(rows, corrections, main_ids: dict[int, str]) -> list[dict]
     ``rows`` carry ``fingerprint`` and their owner's ``employee_id`` (None for
     an unmapped ID); ``corrections`` are ``punch_corrections`` rows, oldest
     first; ``main_ids`` maps each owner to their main device user ID. Inputs
-    are never mutated; every returned row has a ``correction`` key:
+    are never mutated; every returned row has a ``correction`` key and a
+    ``correction_info`` (who fixed it and why, None when untouched):
 
     - ``set_direction`` overrides the direction of its fingerprint's row;
     - ``ignore`` keeps its row, marked, for the raw list;
@@ -297,7 +311,7 @@ def apply_corrections(rows, corrections, main_ids: dict[int, str]) -> list[dict]
             targeted.setdefault(correction["fingerprint"], []).append(correction)
     merged = []
     for row in rows:
-        out = {**row, "correction": None}
+        out = {**row, "correction": None, "correction_info": None}
         for correction in targeted.get(row.get("fingerprint"), ()):
             if correction["employee_id"] != row.get("employee_id"):
                 continue
@@ -307,6 +321,7 @@ def apply_corrections(rows, corrections, main_ids: dict[int, str]) -> list[dict]
                 out["trusted_direction"] = correction["direction"]
                 if out["correction"] != CORRECTION_IGNORED:
                     out["correction"] = CORRECTION_DIRECTION
+            out["correction_info"] = correction_info(correction)  # the latest one is shown
         merged.append(out)
     for correction in corrections:
         owner = correction["employee_id"]
@@ -323,6 +338,7 @@ def apply_corrections(rows, corrections, main_ids: dict[int, str]) -> list[dict]
             "site": None,
             "device_id": None,
             "correction": CORRECTION_ADDED,
+            "correction_info": correction_info(correction),
         })
     merged.sort(key=lambda r: r["event_timestamp"])
     return merged
