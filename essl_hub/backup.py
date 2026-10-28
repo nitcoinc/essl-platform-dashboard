@@ -2,7 +2,7 @@
 
     python -m essl_hub.backup                 # loop: snapshot every ESSL_BACKUP_MINUTES
     python -m essl_hub.backup init            # new empty database
-    python -m essl_hub.backup restore [--key KEY] [--drill]
+    python -m essl_hub.backup restore [--key KEY] [--drill] [--replace --yes [--skip-pre-snapshot]]
     python -m essl_hub.backup fetch --out DIR [--key KEY]
     python -m essl_hub.backup list | now | status | has-backups | adopt [--yes] | import-turso
 
@@ -671,11 +671,139 @@ def _download_verified(client: R2Client, key: str, work: Path) -> tuple[str, str
     return plain, _verify_restored(plain)
 
 
+# SQLite marks every open WAL connection with a shared lock on this byte of
+# the -shm file (the "dead man switch"), idle or not.
+_SHM_DMS_OFFSET = 128
+
+
+def _another_process_has_it_open(database_path: str) -> bool:
+    """True when some other process holds a connection to the WAL database,
+    even an idle one: a lock on the -shm marker byte is refused. (A POSIX lock
+    is per process, so connections of this process are not seen here.)"""
+    shm = database_path + "-shm"
+    if not os.path.exists(shm):
+        return False
+    fd = os.open(shm, os.O_RDWR)
+    try:
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, _SHM_DMS_OFFSET, os.SEEK_SET)
+        except OSError:
+            return True
+        fcntl.lockf(fd, fcntl.LOCK_UN, 1, _SHM_DMS_OFFSET, os.SEEK_SET)
+        return False
+    finally:
+        os.close(fd)
+
+
+def _require_exclusive(database_path: str) -> None:
+    """Prove nothing else has the live database open, or raise. Another
+    process (even an idle one) shows on the -shm marker; an active reader or
+    writer stops SQLite leaving WAL mode. Leaving WAL also folds any leftover
+    WAL into the main file, so the file to move aside is complete on its own."""
+    message = ("another process still has the database open: stop web, collector and alerts "
+               "(docker compose stop web collector alerts), then run this again")
+    if _another_process_has_it_open(database_path):
+        raise CommandError(message)
+    try:
+        conn = sqlite3.connect(f"file:{database_path}?mode=rw", uri=True, timeout=2, isolation_level=None)
+    except sqlite3.Error as exc:
+        raise CommandError(f"cannot open {database_path}: {exc}") from None
+    try:
+        try:
+            mode = conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+        except sqlite3.OperationalError:
+            raise CommandError(message) from None
+        if str(mode).lower() != "delete":
+            raise CommandError(message)
+    finally:
+        conn.close()
+
+
+def _restore_replace(
+    database_path: str, client: R2Client | None, key: str | None, *, drill: bool, yes: bool,
+    skip_pre_snapshot: bool,
+) -> str:
+    """Swap the live database for a snapshot. The old files are moved aside to
+    ``.pre-restore-<time>`` names (never deleted, never overwritten), after
+    proof that nothing else has the database open and a snapshot of the live
+    state went to R2 (unless skipped, for a live file the bucket will not
+    take). A failed install puts the old files back."""
+    if not yes:
+        raise CommandError("--replace moves the live database aside and installs the snapshot; "
+                           "add --yes to confirm")
+    if client is None:
+        raise CommandError("R2 credentials are not configured (R2_* variables)")
+    if not os.path.exists(database_path):
+        raise CommandError(f"nothing to replace: no database at {database_path}; "
+                           "use restore without --replace")
+    key = _pick_key(client, key)
+    with _work_dir(database_path, ".restore-") as work:
+        # Download first: the pre-restore snapshot below runs a normal cycle,
+        # whose pruning could delete the very snapshot being restored.
+        plain, database_id = _download_verified(client, key, work)
+        if drill:
+            database_id = uuid.uuid4().hex
+            conn = sqlite3.connect(plain)
+            try:
+                with conn:
+                    _write_setting(conn, DATABASE_ID_KEY, database_id)
+            finally:
+                conn.close()
+        _require_exclusive(database_path)
+        if not skip_pre_snapshot:
+            result = run_cycle(database_path, client, allow_older=True)
+            if result not in ("ok", "skipped"):
+                raise CommandError(
+                    f"the pre-restore snapshot did not complete ({result}); nothing was changed. "
+                    "Fix R2 and retry, or add --skip-pre-snapshot (the old files are still kept aside)")
+        with backup_lock(database_path):
+            stamp = _now().strftime("%Y%m%dT%H%M%S")
+            plan = [(database_path + suffix, f"{database_path}{suffix}.pre-restore-{stamp}")
+                    for suffix in ("-shm", "-wal", "")
+                    if os.path.exists(database_path + suffix)]
+            for _, aside in plan:
+                if os.path.exists(aside):
+                    raise CommandError(f"{aside} already exists; move it away and run this again")
+            moved: list[tuple[str, str]] = []
+            try:
+                for live, aside in plan:
+                    os.rename(live, aside)
+                    moved.append((live, aside))
+                    os.chmod(aside, 0o600)
+                os.rename(plain, database_path)
+            except OSError as exc:
+                for live, aside in reversed(moved):
+                    os.rename(aside, live)
+                raise CommandError(
+                    f"could not install the snapshot ({exc}); the previous database was put back"
+                ) from None
+    print(f"Replaced {database_path} with {key}.")
+    for _, aside in plan:
+        print(f"Old file kept: {aside}")
+    print("Keep these files until you are sure; they hold anything written after the snapshot "
+          "(roles, archives and fixes made since are rolled back).")
+    if drill:
+        print(f"Drill: new database_id {database_id}; this copy can never upload to R2.")
+    elif database_id:
+        print(f"database_id {database_id} kept; start web, collector and alerts, and backups continue.")
+    else:
+        print("This snapshot has no database_id: run `python -m essl_hub.backup adopt` "
+              "before backups resume.")
+    print("Note: everyone signs in again. A snapshot from an older schema migrates when web or "
+          "collector starts; backups fail with 'behind' until then.")
+    return key
+
+
 def cmd_restore(
-    database_path: str, client: R2Client | None, key: str | None = None, *, drill: bool = False
+    database_path: str, client: R2Client | None, key: str | None = None, *, drill: bool = False,
+    replace: bool = False, yes: bool = False, skip_pre_snapshot: bool = False,
 ) -> str:
     """drill=True gives the restored file a fresh random database_id so it can
-    never pass the bucket guard and upload over production backups."""
+    never pass the bucket guard and upload over production backups.
+    replace=True swaps a live database (see _restore_replace)."""
+    if replace:
+        return _restore_replace(database_path, client, key, drill=drill, yes=yes,
+                                skip_pre_snapshot=skip_pre_snapshot)
     with backup_lock(database_path):
         _refuse_existing(database_path)
         if client is None:
@@ -988,6 +1116,11 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("init", help="create a new empty database")
     restore = sub.add_parser("restore", help="restore the latest (or --key) snapshot")
     restore.add_argument("--key", help="exact R2 key, e.g. recent/20261014T101500.db.gz")
+    restore.add_argument("--replace", action="store_true",
+                         help="swap the live database for the snapshot (old files kept aside)")
+    restore.add_argument("--yes", action="store_true", help="confirm --replace")
+    restore.add_argument("--skip-pre-snapshot", action="store_true",
+                         help="with --replace: do not snapshot the live database to R2 first")
     restore.add_argument("--drill", action="store_true",
                          help="restore drill: give the copy a new database_id (never uploads)")
     fetch = sub.add_parser("fetch", help="write a scrubbed, inert local copy of a snapshot")
@@ -1012,7 +1145,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "init":
             cmd_init(path)
         elif args.command == "restore":
-            cmd_restore(path, make_client(), key=args.key, drill=args.drill)
+            cmd_restore(path, make_client(), key=args.key, drill=args.drill, replace=args.replace,
+                        yes=args.yes, skip_pre_snapshot=args.skip_pre_snapshot)
         elif args.command == "fetch":
             cmd_fetch(args.out, make_client(), key=args.key)
         elif args.command == "has-backups":

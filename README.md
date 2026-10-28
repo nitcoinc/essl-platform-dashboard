@@ -205,7 +205,7 @@ docker compose run --rm backup python -m essl_hub.backup <command>
 | Command | What it does |
 | --- | --- |
 | `init` | Creates a new empty database with a new `database_id`. New installs only (the installer runs it). |
-| `restore [--key <key>]` | Downloads the latest snapshot (or the exact R2 key, e.g. `recent/20261014T101500.db.gz`), verifies it and moves it into place. |
+| `restore [--key <key>]` | Downloads the latest snapshot (or the exact R2 key, e.g. `recent/20261014T101500.db.gz`), verifies it and moves it into place. Onto an empty data folder only; to swap a live database use `--replace --yes` ([below](#restoring-over-a-live-database)). |
 | `fetch --out <folder> [--key <key>]` | Writes a scrubbed, inert copy of a snapshot into `<folder>` for looking at production data elsewhere ([below](#looking-at-production-data-on-a-dev-box)). Never touches the live data folder. |
 | `list` | Lists snapshots in R2. |
 | `now` | Runs one backup cycle now (e.g. before a large roster import). Exit 0 on success. |
@@ -213,7 +213,22 @@ docker compose run --rm backup python -m essl_hub.backup <command>
 | `adopt [--yes]` | Makes this database the bucket's owner (asks you to type `adopt`). |
 | `import-turso` | One-time copy from Turso during the upgrade ([Upgrading from Turso](#upgrading-from-turso)). |
 
-`init`, `restore` and `import-turso` refuse while `essl.db`, `essl.db-wal` or `essl.db-shm` exists: a leftover WAL would replay another database's pages onto the new file. Stop the stack and move all three aside first. Every command and cycle holds a lock on `/data/backup.lock`, so `now` cannot collide with the running loop.
+`init`, `restore` (without `--replace`) and `import-turso` refuse while `essl.db`, `essl.db-wal` or `essl.db-shm` exists: a leftover WAL would replay another database's pages onto the new file. Stop the stack and move all three aside first. Every command and cycle holds a lock on `/data/backup.lock`, so `now` cannot collide with the running loop.
+
+### Restoring over a live database
+
+`restore` refuses to touch an existing database. To roll production back to a snapshot (a bad import, wrong fixes, a corrupted file), use `--replace --yes` with the stack stopped:
+
+```bash
+docker compose stop web collector alerts
+docker compose run --rm backup python -m essl_hub.backup list                 # pick a key
+docker compose run --rm backup python -m essl_hub.backup restore --key recent/<ts>.db.gz --replace --yes
+docker compose up -d web collector alerts
+```
+
+What it does, in order: downloads and verifies the snapshot (it must not be from a newer schema); proves nothing else has the database open (it refuses if web, collector or alerts, or anything else, still holds it, even idle); takes a snapshot of the **live** state to R2; moves `essl.db`, `-wal` and `-shm` aside to `essl.db.pre-restore-<time>` (mode 0600, never deleted or overwritten); installs the snapshot. If the install fails, the old files are put back. If the live file cannot be snapshotted (R2 down, or it belongs to a different database than the bucket), the command stops and changes nothing; `--skip-pre-snapshot` goes ahead anyway, with the old files still kept aside.
+
+After it: everyone signs in again; **roles, archives, fix requests and corrections made after the snapshot are rolled back**, so re-check departed or demoted accounts and any approved fixes. The punches themselves come back from the devices (each returns its whole log on every poll). Keep the `pre-restore` files until you are sure: they hold everything written after the snapshot, including the audit trail of fixes. A snapshot from an older schema migrates when web or collector starts; `backup now` fails with "behind" until then. To roll back the other way, restore the snapshot the command just took of the live state.
 
 ### Looking at production data on a dev box
 

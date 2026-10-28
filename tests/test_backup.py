@@ -187,6 +187,131 @@ class GuardTest(Base):
 # --- U3: pruning (written first) ----------------------------------------------
 
 
+class ReplaceRestoreTest(Base):
+    """`restore --replace --yes`: swap a live database for a snapshot, proving nothing else has it open."""
+
+    def _live(self) -> str:
+        """A live database that owns the bucket: the newest snapshot holds one
+        punch; the live file has since taken two more."""
+        db_id = self.init_db()
+        self.cycle()
+        _insert_punch(self.db_path, 1)
+        self.cycle(NOW + timedelta(minutes=15))
+        _insert_punch(self.db_path, 2)
+        _insert_punch(self.db_path, 3)
+        return db_id
+
+    def _count(self, path: str) -> int:
+        conn = sqlite3.connect(path)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM punches").fetchone()[0]
+        finally:
+            conn.close()
+
+    def _replace(self, **kw) -> None:
+        kw.setdefault("replace", True)
+        kw.setdefault("yes", True)
+        with redirect_stdout(io.StringIO()):
+            bk.cmd_restore(self.db_path, self.r2, key="recent/20261014T101500.db.gz", **kw)
+
+    def _aside(self) -> list[Path]:
+        return sorted(p for p in self.dir.iterdir() if ".pre-restore-" in p.name)
+
+    def test_replace_installs_the_snapshot_keeps_the_old_file_and_the_database_id(self) -> None:
+        db_id = self._live()
+        self._replace()
+        self.assertEqual(self._count(self.db_path), 1)
+        [aside] = self._aside()
+        self.assertEqual(self._count(str(aside)), 3)
+        self.assertEqual(aside.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(_setting(self.db_path, "database_id"), db_id)
+        database = Database(self.db_path, must_exist=True)
+        self.addCleanup(database.close)
+        self.assertEqual(database.schema_version(), SCHEMA_VERSION)
+        # The pre-restore snapshot of the live state went to R2 first.
+        self.assertTrue(any(k.startswith("recent/") and k != "recent/20261014T101500.db.gz"
+                            and k != "recent/20261014T100000.db.gz" for k in self.r2.objects))
+        self.assertEqual(self.leftovers(), [])
+
+    def test_replace_needs_yes_and_an_existing_database(self) -> None:
+        self._live()
+        with self.assertRaisesRegex(bk.CommandError, "--yes"):
+            self._replace(yes=False)
+        self.assertEqual(self._count(self.db_path), 3)
+        self.assertEqual(self._aside(), [])
+        os.unlink(self.db_path)
+        for suffix in ("-wal", "-shm"):
+            if os.path.exists(self.db_path + suffix):
+                os.unlink(self.db_path + suffix)
+        with self.assertRaisesRegex(bk.CommandError, "nothing to replace"):
+            self._replace()
+
+    def test_replace_refuses_while_another_process_has_the_database_open(self) -> None:
+        self._live()
+        holder = subprocess.Popen(
+            [sys.executable, "-c",
+             "import sqlite3,sys,time\n"
+             "c=sqlite3.connect(sys.argv[1],isolation_level=None)\n"
+             "c.execute('PRAGMA journal_mode=WAL'); c.execute('SELECT COUNT(*) FROM punches').fetchall()\n"
+             "print('ready',flush=True); time.sleep(60)", self.db_path],
+            stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (holder.kill(), holder.wait()))
+        self.assertEqual(holder.stdout.readline().strip(), "ready")
+        puts = list(self.r2.puts)
+        with self.assertRaisesRegex(bk.CommandError, "still has the database open"):
+            self._replace()
+        self.assertEqual(self._count(self.db_path), 3)
+        self.assertEqual((self._aside(), self.r2.puts), ([], puts))
+
+    def test_replace_refuses_while_a_reader_is_active_in_this_process(self) -> None:
+        self._live()
+        reader = sqlite3.connect(self.db_path, isolation_level=None)
+        self.addCleanup(reader.close)
+        reader.execute("PRAGMA journal_mode=WAL")
+        reader.execute("BEGIN")
+        reader.execute("SELECT COUNT(*) FROM punches").fetchall()
+        with self.assertRaisesRegex(bk.CommandError, "still has the database open"):
+            self._replace()
+        self.assertEqual(self._aside(), [])
+
+    def test_a_failed_pre_restore_snapshot_changes_nothing_unless_skipped(self) -> None:
+        self._live()
+        self.r2.fail_put = RuntimeError("R2 down")
+        with self.assertRaisesRegex(bk.CommandError, "pre-restore snapshot"):
+            self._replace()
+        self.assertEqual((self._count(self.db_path), self._aside()), (3, []))
+        self._replace(skip_pre_snapshot=True)
+        self.assertEqual(self._count(self.db_path), 1)
+        self.assertEqual(len(self._aside()), 1)
+
+    def test_a_second_replace_in_the_same_second_never_overwrites_the_first_aside_copy(self) -> None:
+        self._live()
+        with mock.patch.object(bk, "_now", return_value=NOW):
+            self._replace(skip_pre_snapshot=True)
+            [first] = self._aside()
+            _insert_punch(self.db_path, 9)
+            with self.assertRaisesRegex(bk.CommandError, "already exists"):
+                self._replace(skip_pre_snapshot=True)
+        self.assertEqual(self._count(str(first)), 3)
+        self.assertEqual(self._count(self.db_path), 2)  # the restored punch plus the one just added
+
+    def test_a_failed_install_puts_the_previous_database_back(self) -> None:
+        self._live()
+        real_rename = os.rename
+
+        def fail_install(src, dst, *a, **kw):
+            if str(dst) == self.db_path and os.path.basename(str(src)).startswith("restore-"):
+                raise OSError("disk full")
+            return real_rename(src, dst, *a, **kw)
+
+        with mock.patch.object(bk.os, "rename", side_effect=fail_install):
+            with self.assertRaisesRegex(bk.CommandError, "put back"):
+                self._replace(skip_pre_snapshot=True)
+        self.assertEqual(self._count(self.db_path), 3)
+        self.assertEqual(self._aside(), [])
+        self.assertEqual(self.leftovers(), [])
+
+
 class FetchTest(Base):
     """`fetch`: a scrubbed, inert local copy of an R2 snapshot, written outside the live data folder."""
 
