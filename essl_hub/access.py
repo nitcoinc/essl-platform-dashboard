@@ -78,7 +78,7 @@ def can_archive(actor: dict, target: dict) -> tuple[str, int] | None:
     return None
 
 
-# --- Fix requests (KTD6) ------------------------------------------------------
+# --- Fix requests (KTD6, v10: admins decide like HR) -------------------------
 
 FIX_REVIEW_ROLES = ("hr", "admin")
 
@@ -89,24 +89,19 @@ def can_view_fix_reviews(actor: dict | None) -> bool:
 
 
 def can_approve_fix(actor: dict | None, request: dict, database) -> bool:
-    """KTD6: HR decides, never the requester. An admin who is not the
-    requester decides only while no active HR user other than the requester
-    exists. Database.decide_fix_lines re-checks the requester rule."""
+    """HR and admins decide a fix request; nobody decides their own.
+    Database.decide_fix_lines re-checks the requester rule."""
     if actor is None or request is None:
         return False
-    requester = request["employee_id"]
-    if actor["id"] == requester:
+    if actor["id"] == request["employee_id"]:
         return False
-    if actor["role"] == "hr":
-        return True
-    if actor["role"] == "admin":
-        return not database.has_active_hr_other_than(requester)
-    return False
+    return actor["role"] in FIX_REVIEW_ROLES
 
 
 def fix_approvers(requester_id: int, database) -> list[dict]:
-    """Who decides a person's fix request, by the can_approve_fix rule: every
-    active HR user but the requester, else every active admin but them."""
+    """Who is emailed about a person's fix request: every active HR user but
+    the requester, else every active admin but them. Admins can decide a
+    request either way (can_approve_fix)."""
     approvers = [p for p in database.active_hr_users() if p["id"] != requester_id]
     if approvers:
         return approvers

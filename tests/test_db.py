@@ -1993,12 +1993,6 @@ class MissedPunchSchemaTest(unittest.TestCase):
         self.assertEqual([p["name"] for p in self.database.active_admins()], ["Adam"])
         self.assertEqual(self.database.active_admins()[0]["device_ids"], ["104"])
 
-    def test_has_active_hr_other_than_skips_the_person_and_archived_hr(self) -> None:
-        self.assertTrue(self.database.has_active_hr_other_than(self.hari))
-        self.database.archive_employee(self.hema)
-        self.assertFalse(self.database.has_active_hr_other_than(self.hari))
-        self.assertTrue(self.database.has_active_hr_other_than(self.asha))
-
     # --- correction overlay (U2) ------------------------------------------------
 
     def _overlay_day(self) -> None:

@@ -560,7 +560,7 @@ Rolling back to the previous release after the cutover needs Turso, so keep the 
 | Sync health (`/health`) | - | - | - | yes |
 | Daily target, attendance alerts, HRMS API keys (**Settings**) | - | - | - | yes |
 | Report a problem on own day (last 7 days) | yes | yes | yes | yes |
-| Approve or reject fix requests | - | - | yes, never their own | only when no HR user other than the requester exists, never their own |
+| Approve or reject fix requests | - | - | yes, never their own | yes, never their own |
 
 | Role | Lands on | Sidebar |
 | --- | --- | --- |
@@ -569,7 +569,7 @@ Rolling back to the previous release after the cutover needs Turso, so keep the 
 | hr | Employees | Today, Week, Employees, People (Directory, ID issues, Archive) |
 | admin | Employees | Today, Week, Employees, People (Directory, ID issues, Archive), Devices, Settings (plus the sync-health indicator) |
 
-**Fix requests.** HR approves every fix request, on its own review page. When an employee files one, their manager gets one FYI email listing the lines (no button, HR decides) and every HR user gets the same with a **Review request** link. If the requester is the only HR user, admins other than the requester are emailed and may approve instead. Nobody approves their own request.
+**Fix requests.** HR or an admin approves every fix request, on its own review page. Each approval records who decided it, their role at that moment and the note (the correction record cannot be edited afterwards). When an employee files one, their manager gets one FYI email listing the lines (no button, HR decides) and every HR user gets the same with a **Review request** link. If the requester is the only HR user, admins other than the requester are emailed instead; admins can open and decide any request from the review list either way. Nobody approves their own request.
 
 Asking for someone you may not see returns 404, the same as an id that does not exist. `/admin` redirects to **Devices**; `/devices/ids` redirects to **People → ID issues**.
 

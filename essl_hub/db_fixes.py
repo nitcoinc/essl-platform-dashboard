@@ -55,18 +55,8 @@ class FixesMixin:
         """Active role-hr people: the approvers (KTD6) and request recipients."""
         return self._active_with_role("hr")
 
-    def has_active_hr_other_than(self, employee_id: int) -> bool:
-        """True when some active HR user other than ``employee_id`` exists:
-        the check that keeps admins out of deciding fixes (KTD6)."""
-        with self.connect() as connection:
-            row = connection.execute(
-                "SELECT 1 FROM employees WHERE role = 'hr' AND archived_at IS NULL AND id <> ? LIMIT 1",
-                (employee_id,),
-            ).fetchone()
-        return row is not None
-
     def active_admins(self) -> list[dict[str, object]]:
-        """Active admins: the fallback approvers when no other HR user exists (KTD6)."""
+        """Active admins: the fallback recipients when no other HR user exists (KTD6)."""
         return self._active_with_role("admin")
 
     def _active_with_role(self, role: str) -> list[dict[str, object]]:

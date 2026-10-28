@@ -44,12 +44,9 @@ def _review_request(request_id: int) -> tuple[dict, dict, date]:
 
 
 def _readonly_reason(filed: dict) -> str | None:
-    """Why the viewer may look but not decide (KTD6), or None."""
+    """Why the viewer may look but not decide, or None."""
     if filed["employee_id"] == g.employee["id"]:
-        return "This is your own request. Another HR user decides it; nobody approves their own fixes."
-    if g.employee["role"] == "admin":
-        return ("An HR user decides fix requests. Admins approve only when no HR user "
-                "other than the requester exists.")
+        return "This is your own request. Another HR user or an admin decides it; nobody approves their own fixes."
     return None
 
 

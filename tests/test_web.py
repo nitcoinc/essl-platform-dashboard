@@ -667,9 +667,6 @@ class FakeDatabase:
     def active_hr_users(self) -> list[dict]:
         return self._with_role("hr")
 
-    def has_active_hr_other_than(self, employee_id) -> bool:
-        return any(p["id"] != employee_id for p in self._with_role("hr"))
-
     def active_admins(self) -> list[dict]:
         return self._with_role("admin")
 
@@ -6328,15 +6325,18 @@ class FixReviewTest(unittest.TestCase):
         self.assertEqual(self._post(request_id, form, "/confirm").status_code, 302)
         self.assertEqual(self.database.fix_request(request_id)["status"], "approved")
 
-    def test_admin_cannot_approve_while_another_hr_user_exists(self) -> None:
+    def test_admin_approves_while_an_hr_user_exists_and_is_recorded_as_the_decider(self) -> None:
         request_id = self._file()
         self._sign_in(self.admin)
         page = self.client.get(f"/fixes/review/{request_id}")
         self.assertEqual(page.status_code, 200)
-        self.assertIn("Admins approve only when no HR user", page.text)
-        self.assertNotIn('name="line-', page.text)
-        self.assertEqual(self._post(request_id, self._approve_all(request_id), "/confirm").status_code, 403)
-        self.assertEqual(self.database.fix_request(request_id)["status"], "pending")
+        self.assertNotIn("View only", page.text)
+        self.assertIn('name="line-', page.text)
+        form = self._approve_all(request_id)
+        self.assertEqual(self._post(request_id, form, "/confirm").status_code, 302)
+        filed = self.database.fix_request(request_id)
+        self.assertEqual(filed["status"], "approved")
+        self.assertEqual(filed["decided_by"], self.admin["id"])
 
     def test_admin_never_approves_their_own_request(self) -> None:
         self.database.set_employee_role(self.hari["id"], "employee")
