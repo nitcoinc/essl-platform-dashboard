@@ -131,3 +131,15 @@ DIRECT_FIX_ROLES = ("admin",)
 def can_fix_punches_directly(actor: dict | None, employee_id: int) -> bool:
     """Fix ``employee_id``'s punches now (admins only, never their own)."""
     return actor is not None and actor["role"] in DIRECT_FIX_ROLES and actor["id"] != employee_id
+
+
+# --- Raw device facts on a punch (v10) --------------------------------------------
+
+# Device, door, reader and the raw in/out byte behind a punch: what HR and
+# admins need to check a direction against the device. Employees and managers
+# see the plain reason only.
+PUNCH_FACT_ROLES = ("hr", "admin")
+
+
+def can_see_punch_facts(actor: dict | None) -> bool:
+    return actor is not None and actor["role"] in PUNCH_FACT_ROLES

@@ -28,6 +28,8 @@
       <span class="punch-dir">{{ s.direction }}</span>
       {% for label, tone in s.chips %}{{ ui.chip(label, tone) }}{% endfor %}
     </div>
+    {% if s.basis %}<p class="review-line-note muted">{{ s.basis }}</p>{% endif %}
+    {% if s.unconfirmed %}<p class="review-flag">{{ ui.icon('triangle-alert') }}<span>Not confirmed yet: the device history may still change this direction. Check it before fixing.</span></p>{% endif %}
     {% if s.actionable %}
     {% set chosen = values.act.get(s.fingerprint, '') %}
     <div class="report-dir-options">

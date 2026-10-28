@@ -2191,7 +2191,8 @@ def _overlaid_punches(
     rows = connection.execute(
         f"""
         SELECT device_user_id, fingerprint, event_timestamp, trusted_direction,
-            raw_direction_byte, raw_state, site, device_id
+            raw_direction_byte, raw_state, site, device_id, door, reader,
+            json_extract(raw_json, '$.source') AS source
         FROM punches p
         WHERE device_user_id IN (SELECT value FROM json_each(?))
           AND event_timestamp >= ? AND event_timestamp < ?

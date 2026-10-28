@@ -374,6 +374,14 @@ class CorrectionOverlayTest(unittest.TestCase):
         [legacy] = apply_corrections(rows[:1], [self._fix("ignore", fingerprint="fp-0")], self.MAIN_IDS)
         self.assertEqual(legacy["correction_info"]["by"], "before audit trail")
 
+    def test_a_direction_fix_keeps_what_the_device_said(self) -> None:
+        rows = self._rows((_t(9), "entry"), (_t(13), "exit"), device="c3")
+        merged = apply_corrections(
+            rows, [self._fix("set_direction", fingerprint="fp-1", direction="entry")], self.MAIN_IDS)
+        self.assertEqual([(r["trusted_direction"], r["device_direction"]) for r in merged],
+                         [("entry", "entry"), ("entry", "exit")])
+        self.assertEqual(self._rows((_t(9), None))[0].get("device_direction", "absent"), "absent")
+
     def test_dangling_or_foreign_fingerprint_is_inert(self) -> None:
         rows = self._rows((_t(9), "entry"), (_t(18), "exit"), device="c3")
         corrections = [self._fix("ignore", fingerprint="fp-gone"),

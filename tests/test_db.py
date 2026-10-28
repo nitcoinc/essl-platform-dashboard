@@ -1579,6 +1579,24 @@ class MissedPunchSchemaTest(unittest.TestCase):
             [self.asha], datetime(2026, 10, 26, 6), datetime(2026, 10, 27, 6))
         self.assertEqual((read["created_by_name"], read["created_by_role"]), ("Adam", "admin"))
 
+    def test_day_punches_carry_door_reader_and_the_collector_source(self) -> None:
+        with self.database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO devices (id, site, model, ip, port, protocol) "
+                "VALUES ('c3', 'Gachibowli', 'C3-400', '10.0.0.2', 4370, 'c3-pullsdk')")
+        self.database.insert_punches([
+            {"fingerprint": "fp-live", "device_id": "c3", "site": "Gachibowli", "device_user_id": "101",
+             "event_timestamp": datetime(2026, 10, 26, 17, 51), "trusted_direction": "exit",
+             "raw_direction_byte": 15, "door": "1", "reader": "", "raw": {"source": "realtime_fallback"}},
+            {"fingerprint": "fp-hist", "device_id": "c3", "site": "Gachibowli", "device_user_id": "101",
+             "event_timestamp": datetime(2026, 10, 26, 18, 30), "trusted_direction": "entry",
+             "raw_direction_byte": 0, "door": "1", "reader": "2", "raw": {"pin": "101"}},
+        ])
+        live, hist = self.database.punches_for_employee_range(
+            "101", datetime(2026, 10, 26, 6), datetime(2026, 10, 27, 6))
+        self.assertEqual((live["door"], live["source"], live["raw_direction_byte"]), ("1", "realtime_fallback", 15))
+        self.assertEqual((hist["door"], hist["reader"], hist["source"]), ("1", "2", None))
+
     # --- direct admin corrections (v10) -------------------------------------------
 
     def _direct(self, edits=None, *, actor=None, employee=None, reason="Door log shows an exit"):

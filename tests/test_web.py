@@ -301,6 +301,9 @@ class FakeDatabase:
                 "raw_state": p.get("raw_state", ""),
                 "site": p.get("site"),
                 "device_id": p.get("device_id"),
+                "door": p.get("door"),
+                "reader": p.get("reader"),
+                "source": p.get("source"),
             }
             for p in self.punches
             if p.get("device_user_id") in wanted and start <= p["event_timestamp"] < end
@@ -2156,7 +2159,7 @@ class CorrectionOverlayWebTest(_QuickViewBase):
         screens = self._screens()
         self.assertIn("3h 55m", screens["team"])
         self.assertEqual(screens["csv"], "3:55")
-        self.assertNotIn("added by HR", screens["day"])
+        self.assertNotIn(">added<", screens["day"])
 
     def test_approved_fixes_show_the_same_corrected_hours_everywhere(self) -> None:
         self._decide("approved")
@@ -2170,8 +2173,8 @@ class CorrectionOverlayWebTest(_QuickViewBase):
             self.assertIn('<h3 class="raw-punches-title">All punches (7)</h3>', page)
             self.assertIn('<span class="chip chip-neutral">ignored</span>', page)
             self.assertIn('<span class="chip chip-info">direction fixed</span>', page)
-            self.assertEqual(page.count('<span class="chip chip-info">added by HR</span>'), 2)
-            self.assertIn("2 punches added by HR, 1 punch ignored", page)
+            self.assertEqual(page.count('<span class="chip chip-info">added</span>'), 2)
+            self.assertIn("2 punches added, 1 punch ignored", page)
             self.assertNotIn("Fix pending", page)
         self.assertIn('status-chip status-met">Met</span>', screens["people"])
         # The device rows are untouched.
@@ -6244,7 +6247,7 @@ class FixReviewTest(unittest.TestCase):
         self.assertIn("https://hub.example.com/day?date=2026-10-26", mail["text_body"])
         day = self.client.get(f"/day?employee={self.asha['id']}&date=2026-10-26").text
         self.assertIn("7h 20m", day)
-        self.assertIn("added by HR", day)
+        self.assertIn('<span class="chip chip-info">added</span>', day)
 
     def test_hr_edit_of_the_time_is_applied_and_audited_with_both_values(self) -> None:
         request_id = self._file()
@@ -6525,6 +6528,49 @@ class FixReviewTest(unittest.TestCase):
         self.assertEqual(self.database.fix_request(request_id)["status"], "approved")
         self.assertIn("Saved. 1 line approved, 0 rejected.", self._flash())
 
+    # --- Why each punch counted the way it did (v10) ----------------------------------------
+
+    def _reported_day(self) -> None:
+        """The shape the user reported on 2026-10-28: two guessed exits, then three entries."""
+        live = {"door": "1", "reader": "", "source": "realtime_fallback", "device_id": DEVICES[1].id}
+        day = datetime(2026, 10, 25)
+        self.database.insert_punches([
+            {**_punch_row("r-1", day.replace(hour=17, minute=51), "exit", uid="118"), **live,
+             "raw_direction_byte": 15},
+            {**_punch_row("r-2", day.replace(hour=19, minute=53), "exit", uid="118"), **live,
+             "raw_direction_byte": 15},
+            {**_punch_row("r-3", day.replace(hour=19, minute=55), "entry", uid="118"), **live,
+             "raw_direction_byte": 0},
+            {**_punch_row("r-4", day.replace(hour=20, minute=7), "entry", uid="118"), **live,
+             "raw_direction_byte": 0},
+            {**_punch_row("r-5", day.replace(hour=20, minute=22), "entry", uid="118"), **live,
+             "raw_direction_byte": 0},
+        ])
+
+    def test_the_reported_day_says_why_each_punch_is_in_or_out_and_admins_see_the_raw_facts(self) -> None:
+        self._reported_day()
+        self._sign_in(self.admin)
+        page = self.client.get(f"/day?employee={self.asha['id']}&date=2026-10-25").text
+        self.assertEqual(page.count("Guessed Out from the live log; the device history confirms it later"), 2)
+        self.assertEqual(page.count("Device said In"), 3)
+        self.assertIn("gachibowli-c3-400 · door 1 · in/out byte 15 · live log", page)
+        self.assertIn("gachibowli-c3-400 · door 1 · in/out byte 0 · live log", page)
+
+    def test_the_employee_sees_the_reason_but_not_device_door_reader_or_byte(self) -> None:
+        self._reported_day()
+        self._sign_in(self.asha)
+        page = self.client.get("/day?date=2026-10-25").text
+        self.assertEqual(page.count("Guessed Out from the live log; the device history confirms it later"), 2)
+        for hidden in ("gachibowli-c3-400 ·", "door 1", "in/out byte", "live log</span>"):
+            self.assertNotIn(hidden, page)
+
+    def test_hr_sees_the_raw_facts_and_a_manager_does_not(self) -> None:
+        self._reported_day()
+        self._sign_in(self.hari)
+        self.assertIn("in/out byte 15", self.client.get(f"/day?employee={self.asha['id']}&date=2026-10-25").text)
+        self._sign_in(self.boss)
+        self.assertNotIn("in/out byte", self.client.get(f"/day?employee={self.asha['id']}&date=2026-10-25").text)
+
     # --- Admin direct fixes (v10): the form, confirm-then-apply, who may use them -----
 
     def _url(self, person=None, step: str = "", day=None) -> str:
@@ -6616,6 +6662,16 @@ class FixReviewTest(unittest.TestCase):
         [correction] = self.database.corrections
         self.assertEqual((correction["kind"], correction["fingerprint"], correction["direction"]),
                          ("set_direction", "x-1", "exit"))
+
+    def test_the_fix_form_says_why_each_punch_counts_and_warns_on_an_unconfirmed_guess(self) -> None:
+        self.database.insert_punches([{
+            **_punch_row("g-1", datetime(2026, 10, 26, 18, 0), "exit", uid="118"),
+            "raw_direction_byte": 15, "door": "1", "source": "realtime_fallback"}])
+        self._sign_in(self.admin)
+        page = self.client.get(self._url()).text
+        self.assertIn("Device said In", page)
+        self.assertEqual(page.count("Not confirmed yet"), 1)
+        self.assertIn("Guessed Out from the live log", page)
 
     def test_validation_refuses_without_writing(self) -> None:
         self._sign_in(self.admin)

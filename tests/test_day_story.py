@@ -253,8 +253,85 @@ class BreakViewTest(unittest.TestCase):
         view = day_story.break_view(self._day(*swipes), None, rows)
         self.assertEqual([(p.direction, p.flags) for p in view.punches], [
             ("entry", ()), ("entry", ("ignored",)), ("exit", ()),
-            ("entry", ("added by HR",)), ("exit", ("direction fixed",))])
-        self.assertTrue(view.bar_label.endswith(", 1 punch added by HR, 1 punch ignored"))
+            ("entry", ("added",)), ("exit", ("direction fixed",))])
+        self.assertTrue(view.bar_label.endswith(", 1 punch added, 1 punch ignored"))
+
+    # --- U1: why each punch counted the way it did -------------------------------------
+
+    def _basis(self, swipes, rows, *, show_facts=False):
+        view = day_story.break_view(self._day(*swipes), None, rows, show_facts=show_facts)
+        return [(p.basis, p.facts) for p in view.punches]
+
+    def test_basis_says_whether_the_device_or_the_hub_decided(self) -> None:
+        swipes = [(_at(9), "entry"), (_at(13), "exit"), (_at(14), "entry"), (_at(18), "exit")]
+        rows = self._rows(*swipes)
+        rows[0].update(raw_direction_byte=0, source="realtime_fallback")
+        rows[1].update(raw_direction_byte=1)  # a history row: the device's own byte
+        rows[2].update(raw_direction_byte=0)
+        rows[3].update(raw_direction_byte=15, source="realtime_fallback")
+        got = [b for b, _ in self._basis(swipes, rows)]
+        self.assertEqual(got, [
+            "Device said In",
+            "Device said Out",
+            "Device said In",
+            "Guessed Out from the live log; the device history confirms it later"])
+
+    def test_x990_swipes_with_no_stored_direction_say_the_hub_alternated(self) -> None:
+        swipes = [(_at(9), None), (_at(13), None), (_at(14), None), (_at(18), None)]
+        got = [b for b, _ in self._basis(swipes, self._rows(*swipes))]
+        self.assertEqual(got, [
+            "Counted as In by alternating from the first swipe",
+            "Counted as Out by alternating from the first swipe",
+            "Counted as In by alternating from the first swipe",
+            "Counted as Out by alternating from the first swipe"])
+
+    def test_a_quick_reswipe_and_a_filled_in_swipe_are_named(self) -> None:
+        from essl_hub.hours import Punch, compute_day
+        again = D.replace(hour=9, second=20)
+        swipes = [(_at(9), None), (again, None), (_at(18), None)]
+        result = compute_day([Punch(t, d, 60) for t, d in swipes], target_minutes=480)
+        view = day_story.break_view(result, None, self._rows(*swipes))
+        self.assertEqual(view.punches[1].basis, "Quick re-swipe: not counted")
+        inferred = [(_at(9), "exit"), (_at(13), None), (_at(14), "exit")]
+        view = day_story.break_view(self._day(*inferred), None, self._rows(*inferred))
+        self.assertEqual(view.punches[1].basis, "Filled in as In between the swipes around it")
+
+    def test_a_correction_names_who_made_it_their_role_and_why(self) -> None:
+        swipes = [(_at(9), "entry"), (_at(13), "exit"), (_at(13, 40), "entry"), (_at(18), "exit")]
+        rows = self._rows(*swipes)
+        info = {"id": 3, "by": "Ada Admin", "role": "admin", "at": _at(20), "reason": "Badge log", "path": "direct"}
+        rows[1].update(correction="direction_fixed", correction_info=info)
+        rows[2].update(correction="added", correction_info={**info, "role": None, "reason": None})
+        rows[3].update(correction="ignored", correction_info={**info, "by": "before audit trail"})
+        got = [b for b, _ in self._basis(swipes, rows)]
+        self.assertEqual(got[0], "Device said In")
+        self.assertEqual(got[1], "Direction fixed by Ada Admin (admin): Badge log")
+        self.assertEqual(got[2], "Added by Ada Admin")
+        self.assertEqual(got[3], "Ignored before the audit trail")
+
+    def test_a_fix_that_overrides_the_device_says_what_the_device_said(self) -> None:
+        swipes = [(_at(9), "entry"), (_at(13), "entry")]
+        rows = self._rows(*swipes)
+        info = {"by": "Ada Admin", "role": "admin", "reason": "Left for lunch", "path": "direct"}
+        rows[1].update(correction="direction_fixed", correction_info=info, device_direction="exit")
+        self.assertEqual(self._basis(swipes, rows)[1][0],
+                         "Direction fixed by Ada Admin (admin): Left for lunch (the device said Out)")
+        rows[1]["device_direction"] = "entry"  # the fix agrees with the device: nothing to add
+        self.assertEqual(self._basis(swipes, rows)[1][0], "Direction fixed by Ada Admin (admin): Left for lunch")
+        rows[1]["device_direction"] = None  # a direction-less punch: the hub had only guessed
+        self.assertEqual(self._basis(swipes, rows)[1][0], "Direction fixed by Ada Admin (admin): Left for lunch")
+
+    def test_raw_facts_appear_only_when_asked_for(self) -> None:
+        swipes = [(_at(9), "entry"), (_at(18), "exit")]
+        rows = self._rows(*swipes)
+        rows[0].update(device_id="gachibowli-c3-400", door="1", reader="", raw_direction_byte=0,
+                       source="realtime_fallback")
+        rows[1].update(device_id="uppal-x990", raw_direction_byte=1)
+        hidden = self._basis(swipes, rows)
+        self.assertEqual([f for _, f in hidden], ["", ""])
+        shown = self._basis(swipes, rows, show_facts=True)
+        self.assertEqual([f for _, f in shown], [
+            "gachibowli-c3-400 · door 1 · in/out byte 0 · live log", "uppal-x990 · in/out byte 1"])
 
     def test_day_level_fix_chip_follows_the_latest_request(self) -> None:
         swipes = [(_at(9), "entry"), (_at(18), "exit")]

@@ -294,8 +294,9 @@ def apply_corrections(rows, corrections, main_ids: dict[int, str]) -> list[dict]
     ``rows`` carry ``fingerprint`` and their owner's ``employee_id`` (None for
     an unmapped ID); ``corrections`` are ``punch_corrections`` rows, oldest
     first; ``main_ids`` maps each owner to their main device user ID. Inputs
-    are never mutated; every returned row has a ``correction`` key and a
-    ``correction_info`` (who fixed it and why, None when untouched):
+    are never mutated; every returned row has a ``correction`` key, a
+    ``correction_info`` (who fixed it and why, None when untouched) and the
+    ``device_direction`` the fix may have overridden:
 
     - ``set_direction`` overrides the direction of its fingerprint's row;
     - ``ignore`` keeps its row, marked, for the raw list;
@@ -312,6 +313,8 @@ def apply_corrections(rows, corrections, main_ids: dict[int, str]) -> list[dict]
     merged = []
     for row in rows:
         out = {**row, "correction": None, "correction_info": None}
+        if "trusted_direction" in row:
+            out["device_direction"] = row["trusted_direction"]  # before any fix overrides it
         for correction in targeted.get(row.get("fingerprint"), ()):
             if correction["employee_id"] != row.get("employee_id"):
                 continue
