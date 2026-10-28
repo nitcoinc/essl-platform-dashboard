@@ -851,6 +851,35 @@ class DoorStepDatabaseTest(unittest.TestCase):
         self.assertEqual(self.panel.instances, [])
 
 
+class FetchedCopyTest(unittest.TestCase):
+    def test_collector_main_refuses_a_fetched_copy_but_not_a_normal_database(self) -> None:
+        import tempfile
+
+        from essl_hub.db import FETCHED_COPY_KEY, Database
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "essl.db")
+            database = Database(path)
+            database.initialize(())
+            database.set_setting(FETCHED_COPY_KEY, "2026-10-28 from recent/x")
+            database.close()
+            with patch.dict(os.environ, {"ESSL_DB_PATH": path}), \
+                    patch.object(collector_main, "run_forever") as run:
+                with self.assertRaisesRegex(SystemExit, "fetched copy"):
+                    collector_main.main()
+                run.assert_not_called()
+                with self.assertRaises(SystemExit):
+                    collector_main.main()  # still refused on a second start
+            normal = os.path.join(tmp, "normal.db")
+            fresh = Database(normal)
+            fresh.initialize(())
+            fresh.close()
+            with patch.dict(os.environ, {"ESSL_DB_PATH": normal}), \
+                    patch.object(collector_main, "run_forever") as run:
+                collector_main.main()
+                run.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
 

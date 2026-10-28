@@ -3,6 +3,7 @@
     python -m essl_hub.backup                 # loop: snapshot every ESSL_BACKUP_MINUTES
     python -m essl_hub.backup init            # new empty database
     python -m essl_hub.backup restore [--key KEY] [--drill]
+    python -m essl_hub.backup fetch --out DIR [--key KEY]
     python -m essl_hub.backup list | now | status | has-backups | adopt [--yes] | import-turso
 
 Only this module holds R2 credentials. It never talks to devices. Every cycle
@@ -35,7 +36,7 @@ from zoneinfo import ZoneInfo
 
 from . import config
 from .config import TIMEZONE_NAME, db_path
-from .db import SCHEMA_VERSION, Database
+from .db import FETCHED_COPY_KEY, SCHEMA_VERSION, Database
 
 _TZ = ZoneInfo(TIMEZONE_NAME)
 _logger = logging.getLogger(__name__)
@@ -514,6 +515,9 @@ def run_cycle(
             if not os.path.exists(database_path):
                 result = "not_set_up"
                 raise BackupError(SETUP_HINT)
+            if _is_fetched_copy(database_path):
+                result, blocked = "blocked", True
+                raise BackupError("this database is a fetched copy; it never backs up")
             with _work_dir(database_path, ".backup-") as work:
                 snap = _build_snapshot(database_path, work, allow_older=allow_older)
                 if not snap.database_id:
@@ -638,6 +642,35 @@ def _verify_restored(path: str) -> str | None:
         conn.close()
 
 
+def _pick_key(client: R2Client, key: str | None) -> str:
+    """``key``, or the newest snapshot (recent/, else nightly/)."""
+    if key is not None:
+        return key
+    recent = [o for o in client.list(RECENT_PREFIX) if key_time(o.key)]
+    pool = recent or [o for o in client.list(NIGHTLY_PREFIX) if key_time(o.key)]
+    if not pool:
+        raise CommandError("no snapshots found in R2")
+    return max(pool, key=lambda o: (key_time(o.key), o.key)).key
+
+
+def _download_verified(client: R2Client, key: str, work: Path) -> tuple[str, str | None]:
+    """Download ``key`` into ``work`` (a 0600 file), unpack and verify it.
+    Returns the unpacked path and the snapshot's database_id (None if it has
+    none)."""
+    packed = work / "download.db.gz"
+    fd, plain = tempfile.mkstemp(prefix="restore-", suffix=".db", dir=work)
+    os.fchmod(fd, 0o600)
+    try:
+        client.download(key, str(packed))
+        with os.fdopen(fd, "wb") as out, gzip.open(packed, "rb") as gz:
+            shutil.copyfileobj(gz, out)
+            out.flush()
+            os.fsync(out.fileno())
+    except (OSError, EOFError, gzip.BadGzipFile) as exc:
+        raise CommandError(f"could not unpack {key}: {exc}") from None
+    return plain, _verify_restored(plain)
+
+
 def cmd_restore(
     database_path: str, client: R2Client | None, key: str | None = None, *, drill: bool = False
 ) -> str:
@@ -647,25 +680,9 @@ def cmd_restore(
         _refuse_existing(database_path)
         if client is None:
             raise CommandError("R2 credentials are not configured (R2_* variables)")
-        if key is None:
-            recent = [o for o in client.list(RECENT_PREFIX) if key_time(o.key)]
-            pool = recent or [o for o in client.list(NIGHTLY_PREFIX) if key_time(o.key)]
-            if not pool:
-                raise CommandError("no snapshots found in R2")
-            key = max(pool, key=lambda o: (key_time(o.key), o.key)).key
+        key = _pick_key(client, key)
         with _work_dir(database_path, ".restore-") as work:
-            packed = work / "download.db.gz"
-            fd, plain = tempfile.mkstemp(prefix="restore-", suffix=".db", dir=work)
-            os.fchmod(fd, 0o600)
-            try:
-                client.download(key, str(packed))
-                with os.fdopen(fd, "wb") as out, gzip.open(packed, "rb") as gz:
-                    shutil.copyfileobj(gz, out)
-                    out.flush()
-                    os.fsync(out.fileno())
-            except (OSError, EOFError, gzip.BadGzipFile) as exc:
-                raise CommandError(f"could not unpack {key}: {exc}") from None
-            database_id = _verify_restored(plain)
+            plain, database_id = _download_verified(client, key, work)
             if drill:
                 database_id = uuid.uuid4().hex
                 conn = sqlite3.connect(plain)
@@ -686,6 +703,80 @@ def cmd_restore(
               "before backups resume.")
     print("Note: everyone signs in again (sessions are not in snapshots).")
     return key
+
+
+def _fetched_name(key: str) -> str:
+    stem = key.rsplit("/", 1)[-1].removesuffix(SUFFIX)
+    return f"essl-fetched-{stem}.db"
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _scrub_fetched(path: str, key: str) -> None:
+    """Make an unpacked snapshot safe to open on a dev box: device comm
+    passwords, queued door-parameter writes, API keys and the usual session
+    and mail tables gone, a new database_id and the fetched-copy marker set,
+    then secure_delete, VACUUM and a re-check so no old page keeps a secret."""
+    conn = sqlite3.connect(path, isolation_level=None)
+    try:
+        conn.execute("PRAGMA secure_delete=ON")
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "devices" in tables:
+            have = _table_columns(conn, "devices")
+            wipe = [c for c in ("comm_password", "door_params_request", "door_params_requested_at",
+                                "door_params_result") if c in have]
+            if wipe:
+                conn.execute("UPDATE devices SET " + ", ".join(f"{c} = NULL" for c in wipe))
+        for table in ("api_keys", *SCRUBBED_TABLES):
+            if table in tables:
+                conn.execute(f"DELETE FROM {table}")
+        _write_setting(conn, DATABASE_ID_KEY, uuid.uuid4().hex)
+        _write_setting(conn, FETCHED_COPY_KEY, f"{_ts(_now())} from {key}")
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute("VACUUM")
+        if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise CommandError("the scrubbed copy failed integrity_check")
+    finally:
+        conn.close()
+
+
+def cmd_fetch(out_dir: str, client: R2Client | None, key: str | None = None) -> Path:
+    """Write a scrubbed, inert copy of a snapshot into ``out_dir`` (created
+    0700). Never touches the live data folder or R2: it takes no backup lock
+    and works in a private folder inside ``out_dir``, removed on any exit."""
+    if client is None:
+        raise CommandError("R2 credentials are not configured (R2_* variables)")
+    key = _pick_key(client, key)
+    out = Path(out_dir)
+    target = out / _fetched_name(key)
+    if target.exists():
+        raise CommandError(f"{target} already exists; use another folder or move it aside")
+    out.mkdir(mode=0o700, parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix=".fetch-", dir=out))
+    try:
+        plain, _ = _download_verified(client, key, work)
+        _scrub_fetched(plain, key)
+        os.chmod(plain, 0o600)
+        os.rename(plain, target)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    print(f"Wrote {target} from {key}.")
+    print("Scrubbed: device passwords, queued door requests, API keys, sign-in and mail tables. "
+          "New database_id; marked as a fetched copy, so backup, adopt, the collector and alerts refuse it.")
+    print("Employee names, emails and punches remain: run only the web app on it, with mail disabled.")
+    return target
+
+
+def _is_fetched_copy(path: str) -> bool:
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    try:
+        return _read_setting(conn, FETCHED_COPY_KEY) is not None
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
 
 
 def cmd_has_backups(client: R2Client | None) -> bool:
@@ -767,6 +858,8 @@ def cmd_adopt(
         raise CommandError("R2 credentials are not configured (R2_* variables)")
     if not os.path.exists(database_path):
         raise CommandError(SETUP_HINT)
+    if _is_fetched_copy(database_path):
+        raise CommandError("this database is a fetched copy; it can never own the R2 backups")
     with backup_lock(database_path):
         print(f"This makes {database_path} the owner of the R2 backups; snapshots from "
               "any other database are no longer protected from being replaced.")
@@ -897,6 +990,9 @@ def main(argv: list[str] | None = None) -> int:
     restore.add_argument("--key", help="exact R2 key, e.g. recent/20261014T101500.db.gz")
     restore.add_argument("--drill", action="store_true",
                          help="restore drill: give the copy a new database_id (never uploads)")
+    fetch = sub.add_parser("fetch", help="write a scrubbed, inert local copy of a snapshot")
+    fetch.add_argument("--out", required=True, help="folder for the copy (created 0700)")
+    fetch.add_argument("--key", help="exact R2 key, e.g. recent/20261014T101500.db.gz")
     sub.add_parser("list", help="list snapshots in R2")
     sub.add_parser("has-backups", help="exit 0 if R2 has latest.json, 3 if not")
     now_parser = sub.add_parser("now", help="run one backup cycle now")
@@ -917,6 +1013,8 @@ def main(argv: list[str] | None = None) -> int:
             cmd_init(path)
         elif args.command == "restore":
             cmd_restore(path, make_client(), key=args.key, drill=args.drill)
+        elif args.command == "fetch":
+            cmd_fetch(args.out, make_client(), key=args.key)
         elif args.command == "has-backups":
             return 0 if cmd_has_backups(make_client()) else 3
         elif args.command == "list":

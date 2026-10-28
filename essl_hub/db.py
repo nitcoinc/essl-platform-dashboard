@@ -59,7 +59,7 @@ from .hours import apply_corrections
 # are re-exported here, so ``from .db import ...`` keeps working.
 __all__ = [
     # Core.
-    "BUSY_TIMEOUT_MS", "C3_UNDECODED_BYTE", "DATE_COLUMNS", "DEFAULT_DAY_START_HOUR",
+    "BUSY_TIMEOUT_MS", "C3_UNDECODED_BYTE", "DATE_COLUMNS", "DEFAULT_DAY_START_HOUR", "FETCHED_COPY_KEY",
     "DEFAULT_TARGET_MINUTES", "DEVICE_CHANGE_KINDS", "DIRECTIONLESS_WINDOW_MIN", "DUPLICATE_WINDOW_MAX",
     "FRAPPE_GUESS_HOLD",
     "JSON_COLUMNS", "MIGRATIONS", "PUNCH_INSERT_BATCH", "PUNCH_TX_ROWS", "SCHEMA_STATEMENTS",
@@ -849,6 +849,9 @@ def _run_migration_statement(connection: Any, statement: str) -> None:
 
 DEFAULT_TARGET_MINUTES = "480"
 DEFAULT_DAY_START_HOUR = "6"
+# Stamped by `backup fetch`: a scrubbed copy of a production snapshot that must
+# never poll devices, send mail, back up or adopt the R2 bucket.
+FETCHED_COPY_KEY = "fetched_copy"
 
 
 def _schema_version(connection: Any) -> int:
@@ -2041,6 +2044,10 @@ class Database(AlertsMixin, FixesMixin, ArchivesMixin):
                 "SELECT * FROM api_keys ORDER BY created_at DESC"
             ).fetchall()
         return list(rows)
+
+    def is_fetched_copy(self) -> bool:
+        """True for a file made by `backup fetch` (the services refuse it)."""
+        return self.exists() and self.setting(FETCHED_COPY_KEY) is not None
 
     def setting(self, key: str, default: str | None = None) -> str | None:
         with self.connect() as connection:

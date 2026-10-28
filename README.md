@@ -206,6 +206,7 @@ docker compose run --rm backup python -m essl_hub.backup <command>
 | --- | --- |
 | `init` | Creates a new empty database with a new `database_id`. New installs only (the installer runs it). |
 | `restore [--key <key>]` | Downloads the latest snapshot (or the exact R2 key, e.g. `recent/20261014T101500.db.gz`), verifies it and moves it into place. |
+| `fetch --out <folder> [--key <key>]` | Writes a scrubbed, inert copy of a snapshot into `<folder>` for looking at production data elsewhere ([below](#looking-at-production-data-on-a-dev-box)). Never touches the live data folder. |
 | `list` | Lists snapshots in R2. |
 | `now` | Runs one backup cycle now (e.g. before a large roster import). Exit 0 on success. |
 | `status` | Shows the local `database_id`, the one in R2 `latest.json` and whether they match, plus the last and next cycle. |
@@ -213,6 +214,21 @@ docker compose run --rm backup python -m essl_hub.backup <command>
 | `import-turso` | One-time copy from Turso during the upgrade ([Upgrading from Turso](#upgrading-from-turso)). |
 
 `init`, `restore` and `import-turso` refuse while `essl.db`, `essl.db-wal` or `essl.db-shm` exists: a leftover WAL would replay another database's pages onto the new file. Stop the stack and move all three aside first. Every command and cycle holds a lock on `/data/backup.lock`, so `now` cannot collide with the running loop.
+
+### Looking at production data on a dev box
+
+Run `fetch` on the production host, where the R2 keys already are, then copy the file to the dev machine; the dev machine never needs R2 credentials.
+
+```bash
+mkdir -p fetched
+docker compose run --rm -u "$(id -u):$(id -g)" -v "$PWD/fetched:/out" backup \
+  python -m essl_hub.backup fetch --out /out            # newest snapshot; add --key recent/<ts>.db.gz for another
+scp fetched/essl-fetched-<timestamp>.db dev-box:        # then delete it from the host
+```
+
+The copy is made on a temporary file inside the output folder and renamed into place only after it passes checks. Device communication passwords, queued door-parameter requests, HRMS API keys, sessions, sign-in codes, report links and the mail outbox are removed (with `secure_delete` and a `VACUUM`, so old pages do not keep them). It gets a new `database_id` and a `fetched_copy` marker, so `backup` refuses to upload from it, `adopt` refuses it, and the collector and alerts services refuse to start on it. **Employee names, emails and punches stay in the copy**: treat it as production data (encrypted disk, delete it when done) and run only the web app on it.
+
+To use it: point a dev web instance at the file (`ESSL_DB_PATH=/path/essl-fetched-<timestamp>.db`) with `ESSL_MAIL_PROVIDER=console`, so a sign-in code is printed in the server log instead of being emailed to a real person, and no Frappe settings. Sign in with an admin email from the copy. A fetched copy of an older schema migrates when the web app opens it.
 
 **R2 is optional in compose, required by the installer.** With the `R2_*` values empty, the stack runs normally, nothing is copied off-site, and the health page shows Backups **Off**. `./deploy/install.sh` asks for all four values and will not continue without them; run without R2 only for dev or a scratch host.
 

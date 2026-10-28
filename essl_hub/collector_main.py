@@ -476,6 +476,9 @@ def main() -> None:
     # retries the boot work each cycle until the file exists.
     spool = Spool(spool_path())
     database = Database(must_exist=True)
+    if database.is_fetched_copy():
+        raise SystemExit("this database is a fetched copy of a production snapshot; "
+                         "the collector will not poll devices or push to Frappe from it")
     frappe = None
     frappe_config = frappe_sync.config_from_env()
     if frappe_config is not None:

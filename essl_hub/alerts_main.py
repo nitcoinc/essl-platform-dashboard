@@ -745,7 +745,11 @@ def main() -> None:
     if SCHEMA_VERSION < REQUIRED_SCHEMA:  # pragma: no cover - a packaging error
         raise SystemExit(f"this build knows schema v{SCHEMA_VERSION}; alerts need v{REQUIRED_SCHEMA}")
     # KTD3/KTD5: never create or migrate the shared database from here.
-    run_loop(AlertsService(Database(must_exist=True)))
+    database = Database(must_exist=True)
+    if database.is_fetched_copy():
+        raise SystemExit("this database is a fetched copy of a production snapshot; "
+                         "alerts will not send mail from it")
+    run_loop(AlertsService(database))
 
 
 if __name__ == "__main__":

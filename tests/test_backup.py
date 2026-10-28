@@ -187,6 +187,114 @@ class GuardTest(Base):
 # --- U3: pruning (written first) ----------------------------------------------
 
 
+class FetchTest(Base):
+    """`fetch`: a scrubbed, inert local copy of an R2 snapshot, written outside the live data folder."""
+
+    SECRET_PASSWORD = "device-pass-9f3a71c2"
+    SECRET_KEY_HASH = "api-key-hash-5b8e44d0"
+
+    def _snapshots(self) -> str:
+        db_id = self.init_db()
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO devices (id, site, model, ip, port, protocol, comm_password, door_params_request, "
+            "door_params_requested_at, door_params_result) VALUES ('c3', 'Gachibowli', 'C3-400', "
+            "'10.0.0.2', 4370, 'c3-pullsdk', ?, '{\"DoorN\": 1}', '2026-10-14 09:00:00', 'queued')",
+            (self.SECRET_PASSWORD,))
+        conn.execute(
+            "INSERT INTO api_keys (prefix, key_hash, label, created_at) VALUES ('ab12', ?, 'hrms', "
+            "'2026-10-14 09:00:00')", (self.SECRET_KEY_HASH,))
+        conn.commit()
+        conn.close()
+        _insert_punch(self.db_path, 1)
+        _seed_secrets(self.db_path)
+        self.cycle()
+        _insert_punch(self.db_path, 2)
+        self.cycle(NOW + timedelta(minutes=15))
+        for suffix in ("", "-wal", "-shm"):
+            if os.path.exists(self.db_path + suffix):
+                os.unlink(self.db_path + suffix)
+        return db_id
+
+    def _fetch(self, out: Path | None = None, **kw) -> Path:
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            return bk.cmd_fetch(str(out or self.dir / "out"), self.r2, **kw)
+
+    def test_fetch_writes_a_scrubbed_inert_copy_with_a_new_id_and_the_marker(self) -> None:
+        production_id = self._snapshots()
+        copy = self._fetch()
+        self.assertEqual(copy.name, "essl-fetched-20261014T101500.db")
+        self.assertEqual(copy.stat().st_mode & 0o777, 0o600)
+        conn = sqlite3.connect(copy)
+        self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM punches").fetchone()[0], 2)
+        self.assertEqual(conn.execute("SELECT comm_password, door_params_request, door_params_requested_at, "
+                                      "door_params_result FROM devices").fetchone(), (None, None, None, None))
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM api_keys").fetchone()[0], 0)
+        for table in bk.SCRUBBED_TABLES:
+            self.assertEqual(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0, table)
+        conn.close()
+        self.assertNotEqual(_setting(str(copy), "database_id"), production_id)
+        self.assertIn("recent/20261014T101500.db.gz", _setting(str(copy), bk.FETCHED_COPY_KEY))
+
+    def test_no_planted_secret_survives_in_the_file_bytes(self) -> None:
+        self._snapshots()
+        data = self._fetch().read_bytes()
+        self.assertNotIn(self.SECRET_PASSWORD.encode(), data)
+        self.assertNotIn(self.SECRET_KEY_HASH.encode(), data)
+
+    def test_only_the_final_file_is_left_and_the_live_data_folder_is_untouched(self) -> None:
+        self._snapshots()
+        before = sorted(p.name for p in self.dir.iterdir())
+        out = self.dir / "out"
+        self._fetch(out)
+        self.assertEqual([p.name for p in out.iterdir()], ["essl-fetched-20261014T101500.db"])
+        self.assertEqual(out.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir() if p.name != "out"), before)
+        self.assertFalse(os.path.exists(self.db_path))  # fetch never recreates the live database
+
+    def test_a_chosen_key_an_existing_file_and_missing_credentials(self) -> None:
+        self._snapshots()
+        older = self._fetch(key="recent/20261014T100000.db.gz")
+        conn = sqlite3.connect(older)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM punches").fetchone()[0], 1)
+        conn.close()
+        with self.assertRaisesRegex(bk.CommandError, "already exists"):
+            self._fetch(key="recent/20261014T100000.db.gz")
+        with self.assertRaisesRegex(bk.CommandError, "R2 credentials"):
+            bk.cmd_fetch(str(self.dir / "o2"), None)
+        self.assertEqual([p.name for p in (self.dir / "out").iterdir()], [older.name])
+
+    def test_a_corrupt_download_or_newer_schema_leaves_nothing_behind(self) -> None:
+        out = self.dir / "out"
+        self.r2.objects["recent/20261014T100000.db.gz"] = b"not gzip"
+        with self.assertRaises(bk.CommandError):
+            self._fetch(out)
+        raw = self.dir / "new.db"
+        conn = sqlite3.connect(raw)
+        conn.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute(f"PRAGMA user_version={SCHEMA_VERSION + 1}")
+        conn.commit()
+        conn.close()
+        self.r2.objects["recent/20261014T100000.db.gz"] = gzip.compress(raw.read_bytes())
+        with self.assertRaisesRegex(bk.CommandError, "newer"):
+            self._fetch(out)
+        self.assertEqual(list(out.iterdir()), [])
+
+    def test_a_fetched_copy_can_neither_back_up_nor_be_adopted(self) -> None:
+        self._snapshots()
+        copy = self._fetch()
+        status = str(self.dir / "copy-status.json")
+        self.r2.puts.clear()
+        latest_before = self.r2.latest()
+        self.assertNotEqual(bk.run_cycle(str(copy), self.r2, status_path=status, now=NOW), "ok")
+        self.assertEqual(self.r2.puts, [])
+        with self.assertRaisesRegex(bk.CommandError, "fetched copy"):
+            bk.cmd_adopt(str(copy), self.r2, confirm=lambda: True)
+        self.assertEqual(self.r2.latest(), latest_before)  # the bucket still belongs to production
+
+
 class PruneTest(Base):
     def test_retention_windows(self) -> None:
         def key(prefix: str, at: datetime) -> str:
