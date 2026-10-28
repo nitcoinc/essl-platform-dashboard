@@ -9,8 +9,8 @@ import re
 from datetime import date, datetime, time, timedelta
 
 from .. import alert_mail
-from ..day_story import CORRECTION_FLAGS, punch_basis, punch_flags
-from ..db import C3_UNDECODED_BYTE, FIX_ADD_KINDS, device_ids_of
+from ..day_story import CORRECTION_FLAGS, is_unconfirmed_guess, punch_basis, punch_flags
+from ..db import FIX_ADD_KINDS, device_ids_of
 from ..hashing import sha256_hex
 from ..hours import CORRECTION_ADDED, CORRECTION_DIRECTION, CORRECTION_IGNORED, work_day_window
 from .common import database
@@ -80,8 +80,7 @@ def _swipes(rows: list[dict], day: date) -> list[dict]:
             "actionable": _actionable(row),
             "basis": punch_basis(row, row.get("trusted_direction") or ""),
             # A live-log exit the device history has not confirmed yet.
-            "unconfirmed": (not correction and row.get("raw_direction_byte") == C3_UNDECODED_BYTE
-                            and row.get("source") == "realtime_fallback"),
+            "unconfirmed": not correction and is_unconfirmed_guess(row),
         })
     return swipes
 

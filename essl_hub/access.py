@@ -88,7 +88,7 @@ def can_view_fix_reviews(actor: dict | None) -> bool:
     return actor is not None and actor["role"] in FIX_REVIEW_ROLES
 
 
-def can_approve_fix(actor: dict | None, request: dict, database) -> bool:
+def can_approve_fix(actor: dict | None, request: dict) -> bool:
     """HR and admins decide a fix request; nobody decides their own.
     Database.decide_fix_lines re-checks the requester rule."""
     if actor is None or request is None:

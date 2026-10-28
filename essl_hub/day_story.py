@@ -10,7 +10,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from .db import C3_UNDECODED_BYTE
-from .hours import CORRECTION_ADDED, CORRECTION_DIRECTION, CORRECTION_IGNORED, Collapsed, DayResult
+from .hours import (
+    CORRECTION_ADDED, CORRECTION_DIRECTION, CORRECTION_IGNORED, NO_AUDIT_NAME, Collapsed, DayResult,
+)
+from .punch_alerts import C3_REALTIME_SOURCE
 
 
 @dataclass(frozen=True)
@@ -134,7 +137,12 @@ _CORRECTION_VERBS = {
     CORRECTION_DIRECTION: "Direction fixed",
     CORRECTION_IGNORED: "Ignored",
 }
-_NO_AUDIT = "before audit trail"  # the name a pre-v10 correction carries
+
+
+def is_unconfirmed_guess(row: dict) -> bool:
+    """A C3 live-log row still carrying the undecoded byte 15, whose direction
+    the device history has not confirmed yet (db.fill_punch_directions)."""
+    return row.get("raw_direction_byte") == C3_UNDECODED_BYTE and row.get("source") == C3_REALTIME_SOURCE
 
 
 def punch_basis(row: dict, direction: str, *, collapsed: bool = False, inferred: bool = False) -> str:
@@ -148,7 +156,7 @@ def punch_basis(row: dict, direction: str, *, collapsed: bool = False, inferred:
         verb = _CORRECTION_VERBS[correction]
         info = row.get("correction_info") or {}
         by = info.get("by")
-        if not by or by == _NO_AUDIT:
+        if not by or by == NO_AUDIT_NAME:
             return f"{verb} before the audit trail"
         text = f"{verb} by {by}" + (f" ({info['role']})" if info.get("role") else "")
         text += f": {info['reason']}" if info.get("reason") else ""
@@ -163,7 +171,7 @@ def punch_basis(row: dict, direction: str, *, collapsed: bool = False, inferred:
         return f"Filled in as {word} between the swipes around it"
     stored = _DIRECTION_WORDS.get(row.get("trusted_direction"))
     if stored:
-        if row.get("raw_direction_byte") == C3_UNDECODED_BYTE and row.get("source") == "realtime_fallback":
+        if is_unconfirmed_guess(row):
             return f"Guessed {stored} from the live log; the device history confirms it later"
         return f"Device said {stored}"
     return f"Counted as {word} by alternating from the first swipe" if word else ""
@@ -178,7 +186,7 @@ def punch_facts(row: dict) -> str:
         parts.append(f"reader {row['reader']}")
     if row.get("raw_direction_byte") is not None:
         parts.append(f"in/out byte {row['raw_direction_byte']}")
-    if row.get("source") == "realtime_fallback":
+    if row.get("source") == C3_REALTIME_SOURCE:
         parts.append("live log")
     return " · ".join(part for part in parts if part)
 

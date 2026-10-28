@@ -7,20 +7,32 @@ stamped with who made it (Database.record_direct_corrections)."""
 
 from __future__ import annotations
 
+import json
 from datetime import date
 
 from flask import Response, abort, g, redirect, render_template, request, url_for
 
 from .. import access, alert_mail
 from ..db import FIX_NOTE_MAX_CHARS, RuleViolation
+from ..hashing import sha256_hex
+from ..hours import CORRECTION_DIRECTION
 from . import common
 from .common import _day_start_hour, _day_start_label, _parse_date, _require_csrf, _role_required, database
 from .fix_review import _merge_proposed, _scored_day
-from .fix_views import _TO_DIRECTION, _actionable, _check_missed_time, _day_rows, _swipes, punch_set_hash
+from .fix_views import _DIRECTION_LABELS, _TO_DIRECTION, _actionable, _check_missed_time, _day_rows, _swipes
 from .fixes import _logger, bp
 
 ADD_ROWS = 3  # "add a missed punch" rows on the form
 _ACTIONS = ("", "in", "out", "ignore")
+
+
+def _state_hash(rows: list[dict]) -> str:
+    """The day as the admin saw it: every row, added ones included, with its
+    direction and correction. A confirmation made after anything changed it,
+    including this same fix replayed, no longer matches (409)."""
+    state = sorted((str(row.get("fingerprint")), str(row.get("trusted_direction") or ""),
+                    str(row.get("correction") or "")) for row in rows)
+    return sha256_hex(json.dumps(state))
 
 
 def _target(employee_id: int, raw_day: str) -> tuple[dict, date]:
@@ -34,7 +46,7 @@ def _target(employee_id: int, raw_day: str) -> tuple[dict, date]:
     return person, day
 
 
-def _read_form(person: dict, day: date, rows: list[dict], form) -> tuple[list[dict], dict, dict, str]:
+def _read_form(day: date, rows: list[dict], form) -> tuple[list[dict], dict, dict, str]:
     """(edits for record_direct_corrections, the raw values to redisplay,
     errors, reason). Only punches on the day can be targeted."""
     now = common._now_naive()
@@ -56,7 +68,8 @@ def _read_form(person: dict, day: date, rows: list[dict], form) -> tuple[list[di
             edits.append({"kind": "ignore", "fingerprint": fingerprint})
         elif action in ("in", "out"):
             direction = _TO_DIRECTION[action]
-            if direction != row.get("trusted_direction"):
+            already_fixed = row.get("correction") == CORRECTION_DIRECTION and direction == row.get("trusted_direction")
+            if not already_fixed:  # a chosen direction pins the punch even when the device agrees
                 edits.append({"kind": "set_direction", "fingerprint": fingerprint, "direction": direction})
     add_errors: dict[int, dict] = {}
     for n in range(ADD_ROWS):
@@ -108,13 +121,13 @@ def _render_form(person: dict, day: date, rows: list[dict], *, values: dict | No
         reason_max=FIX_NOTE_MAX_CHARS,
         add_rows=ADD_ROWS,
         notice=notice,
-        form_hash=punch_set_hash(rows),
+        form_hash=_state_hash(rows),
     ), status)
 
 
 def _summary(edits: list[dict], rows: list[dict]) -> list[str]:
     times = {row["fingerprint"]: row["event_timestamp"] for row in rows}
-    label = {"entry": "In", "exit": "Out"}
+    label = _DIRECTION_LABELS
     out = []
     for edit in edits:
         if edit["kind"] == "add":
@@ -130,7 +143,7 @@ def _summary(edits: list[dict], rows: list[dict]) -> list[str]:
 def _proposed(edits: list[dict], employee_id: int) -> list[dict]:
     proposed = []
     for n, edit in enumerate(edits, start=1):
-        item = {**edit, "employee_id": employee_id, "fingerprint": edit.get("fingerprint")}
+        item = {**edit, "employee_id": employee_id}
         if edit["kind"] == "add":
             item.update(id=f"proposed-{n}")
         proposed.append(item)
@@ -153,7 +166,7 @@ def direct_preview(employee_id: int, day: str) -> Response:
     person, work = _target(employee_id, day)
     day_start_hour = _day_start_hour(database)
     rows = _day_rows(person, work, day_start_hour)
-    edits, values, errors, reason = _read_form(person, work, rows, request.form)
+    edits, values, errors, reason = _read_form(work, rows, request.form)
     if errors:
         return _render_form(person, work, rows, values=values, errors=errors, reason=reason, status=400)
     windows = database.device_windows()
@@ -171,17 +184,17 @@ def direct_preview(employee_id: int, day: str) -> Response:
         reason=reason,
         before=before,
         after=after,
-        fields=_hidden_fields(request.form, values, rows),
-        form_hash=punch_set_hash(rows),
+        fields=_hidden_fields(values, reason),
+        form_hash=_state_hash(rows),
     ))
 
 
-def _hidden_fields(form, values: dict, rows: list[dict]) -> list[tuple[str, str]]:
+def _hidden_fields(values: dict, reason: str) -> list[tuple[str, str]]:
     fields = [(f"act-{fp}", action) for fp, action in values["act"].items() if action]
     for n, raw in enumerate(values["add"]):
         if raw["time"] or raw["dir"]:
             fields += [(f"add-{n}-time", raw["time"]), (f"add-{n}-dir", raw["dir"])]
-    fields.append(("reason", (form.get("reason") or "").strip()))
+    fields.append(("reason", reason))
     return fields
 
 
@@ -193,10 +206,10 @@ def direct_confirm(employee_id: int, day: str) -> Response:
     _require_csrf()
     person, work = _target(employee_id, day)
     rows = _day_rows(person, work, _day_start_hour(database))
-    edits, values, errors, reason = _read_form(person, work, rows, request.form)
+    edits, values, errors, reason = _read_form(work, rows, request.form)
     if errors:
         return _render_form(person, work, rows, values=values, errors=errors, reason=reason, status=400)
-    if request.form.get("punch_set_hash") != punch_set_hash(rows):
+    if request.form.get("punch_set_hash") != _state_hash(rows):
         return _render_form(
             person, work, rows, values=values, reason=reason, status=409,
             notice="The day's punches changed after you opened this page. Check them below, then review again.")

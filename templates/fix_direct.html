@@ -68,7 +68,7 @@
   <div class="field">
     <label for="f-reason">Why are you changing these punches?</label>
     <textarea id="f-reason" name="reason" rows="3" maxlength="{{ reason_max }}" aria-describedby="f-reason-hint{% if errors.reason %} f-reason-error{% endif %}"{% if errors.reason %} aria-invalid="true"{% endif %}>{{ reason }}</textarea>
-    <p class="field-hint" id="f-reason-hint">Required. Kept with the change, with your name and the time. Up to {{ reason_max }} characters.</p>
+    <p class="field-hint" id="f-reason-hint">Required. Kept with the change, with your name and the time. {{ person.name }} and their managers can read it. Up to {{ reason_max }} characters.</p>
     {% if errors.reason %}{{ ui.inline_error(errors.reason, 'f-reason-error') }}{% endif %}
   </div>
   <div class="review-actions">

@@ -713,10 +713,28 @@ def _require_exclusive(database_path: str) -> None:
             mode = conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
         except sqlite3.OperationalError:
             raise CommandError(message) from None
+        except sqlite3.DatabaseError:
+            raise CommandError(
+                f"{database_path} is not a readable database; nothing was changed. "
+                "Move it aside by hand if you mean to replace it, then use restore without --replace"
+            ) from None
         if str(mode).lower() != "delete":
             raise CommandError(message)
     finally:
         conn.close()
+
+
+def _make_drill_copy(path: str) -> str:
+    """Give an unpacked snapshot a fresh random database_id, so it can never
+    pass the bucket guard and upload over production backups."""
+    database_id = uuid.uuid4().hex
+    conn = sqlite3.connect(path)
+    try:
+        with conn:
+            _write_setting(conn, DATABASE_ID_KEY, database_id)
+    finally:
+        conn.close()
+    return database_id
 
 
 def _restore_replace(
@@ -731,6 +749,9 @@ def _restore_replace(
     if not yes:
         raise CommandError("--replace moves the live database aside and installs the snapshot; "
                            "add --yes to confirm")
+    if drill:
+        raise CommandError("--drill gives the copy a new database_id, which would silently stop "
+                           "production backups; use --drill without --replace on a scratch folder")
     if client is None:
         raise CommandError("R2 credentials are not configured (R2_* variables)")
     if not os.path.exists(database_path):
@@ -741,14 +762,6 @@ def _restore_replace(
         # Download first: the pre-restore snapshot below runs a normal cycle,
         # whose pruning could delete the very snapshot being restored.
         plain, database_id = _download_verified(client, key, work)
-        if drill:
-            database_id = uuid.uuid4().hex
-            conn = sqlite3.connect(plain)
-            try:
-                with conn:
-                    _write_setting(conn, DATABASE_ID_KEY, database_id)
-            finally:
-                conn.close()
         _require_exclusive(database_path)
         if not skip_pre_snapshot:
             result = run_cycle(database_path, client, allow_older=True)
@@ -757,9 +770,11 @@ def _restore_replace(
                     f"the pre-restore snapshot did not complete ({result}); nothing was changed. "
                     "Fix R2 and retry, or add --skip-pre-snapshot (the old files are still kept aside)")
         with backup_lock(database_path):
+            # The snapshot above can take a while: prove it again, right before the swap.
+            _require_exclusive(database_path)
             stamp = _now().strftime("%Y%m%dT%H%M%S")
             plan = [(database_path + suffix, f"{database_path}{suffix}.pre-restore-{stamp}")
-                    for suffix in ("-shm", "-wal", "")
+                    for suffix in ("-shm", "-wal", "-journal", "")
                     if os.path.exists(database_path + suffix)]
             for _, aside in plan:
                 if os.path.exists(aside):
@@ -771,12 +786,23 @@ def _restore_replace(
                     moved.append((live, aside))
                     os.chmod(aside, 0o600)
                 os.rename(plain, database_path)
-            except OSError as exc:
+            except BaseException as exc:
+                stuck = []
                 for live, aside in reversed(moved):
-                    os.rename(aside, live)
-                raise CommandError(
-                    f"could not install the snapshot ({exc}); the previous database was put back"
-                ) from None
+                    try:
+                        os.rename(aside, live)
+                    except OSError:
+                        stuck.append(aside)
+                if stuck:
+                    raise CommandError(
+                        f"could not install the snapshot ({exc}) and these files could not be put "
+                        f"back; move them to their old names by hand: {', '.join(stuck)}"
+                    ) from None
+                if isinstance(exc, OSError):
+                    raise CommandError(
+                        f"could not install the snapshot ({exc}); the previous database was put back"
+                    ) from None
+                raise
     print(f"Replaced {database_path} with {key}.")
     for _, aside in plan:
         print(f"Old file kept: {aside}")
@@ -812,13 +838,7 @@ def cmd_restore(
         with _work_dir(database_path, ".restore-") as work:
             plain, database_id = _download_verified(client, key, work)
             if drill:
-                database_id = uuid.uuid4().hex
-                conn = sqlite3.connect(plain)
-                try:
-                    with conn:
-                        _write_setting(conn, DATABASE_ID_KEY, database_id)
-                finally:
-                    conn.close()
+                database_id = _make_drill_copy(plain)
             _refuse_existing(database_path)
             os.rename(plain, database_path)
     print(f"Restored {key} to {database_path}.")
@@ -882,12 +902,17 @@ def cmd_fetch(out_dir: str, client: R2Client | None, key: str | None = None) -> 
     if target.exists():
         raise CommandError(f"{target} already exists; use another folder or move it aside")
     out.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for stale in out.glob(".fetch-*"):  # an interrupted run leaves an unscrubbed download behind
+        shutil.rmtree(stale, ignore_errors=True)
     work = Path(tempfile.mkdtemp(prefix=".fetch-", dir=out))
     try:
         plain, _ = _download_verified(client, key, work)
         _scrub_fetched(plain, key)
         os.chmod(plain, 0o600)
-        os.rename(plain, target)
+        try:
+            os.link(plain, target)  # unlike rename, never replaces a file made meanwhile
+        except FileExistsError:
+            raise CommandError(f"{target} already exists; use another folder or move it aside") from None
     finally:
         shutil.rmtree(work, ignore_errors=True)
     print(f"Wrote {target} from {key}.")

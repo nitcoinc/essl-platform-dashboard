@@ -12,8 +12,8 @@ Four roles:
 
 - **employee** checks their own punches, effective hours and progress against the daily target, and reports a problem with one of their own last 7 days (from an alert email link or their Day view). Lands on Today.
 - **manager** does the same, plus sees and exports the hours of everyone who reports to them, directly or indirectly. Gets one FYI email when a report files a fix request; never approves and never gets alerts. Lands on Team.
-- **hr** sees and exports every employee, manages the Directory (roster file import, add, edit, archive and restore, managers, roles up to hr), approves or rejects fix requests (never their own), and reads device health. Nobody takes backups by hand: a scrubbed snapshot of the database lands in R2 every 15 minutes, plus one kept per day. Lands on Employees.
-- **admin** has everything hr has, plus grants admin, adds, edits, retires and re-enables devices, and sets the daily target, attendance alert mode and hours, and HRMS API keys. An admin approves fix requests only when no active HR user other than the requester exists.
+- **hr** sees and exports every employee, manages the Directory (roster file import, add, edit, archive and restore, managers, roles up to hr), approves or rejects fix requests (never their own), and reads device health. Sees the raw device facts (device, door, reader, in/out byte) behind each punch. Nobody takes backups by hand: a scrubbed snapshot of the database lands in R2 every 15 minutes, plus one kept per day. Lands on Employees.
+- **admin** has everything hr has, plus grants admin, adds, edits, retires and re-enables devices, and sets the daily target, attendance alert mode and hours, and HRMS API keys. An admin also decides fix requests (never their own) and can fix another person's punches directly, with a required reason.
 
 Vocabulary: **Employees** is the HR/admin hours list (managers see the same page as **Team**); **Directory** is the list of people under People. Never "Everyone" or "Roster" for either; "roster" means only the import file.
 
@@ -36,8 +36,8 @@ One Docker Compose stack on an office Linux host with routes to `192.168.1.201` 
 - Seeded devices: Uppal X990 (`192.168.1.201`) and Gachibowli C3-400 (`192.168.1.202`). The devices table is authoritative: an admin adds devices of either family on the Devices page, and retires or re-enables them. A retired device is not polled and keeps its punches. Two active devices never share an IP:port, and device ids are immutable and never reused.
 - X990 collection supports the standard ZK protocol with TCP and UDP fallback; its communication key is intentionally not assumed. As of 2026-09-10 the device refuses TCP 4370 while its port-80 web interface answers — the signature of ADMS/cloud-push mode — which needs an operator with device or web-console access to confirm; it cannot be diagnosed further from this codebase.
 - C3-400 collection uses the PullSDK protocol on port 4370; its communication password is intentionally not assumed. Its realtime event queue holds only about 30 records in memory and is consumed once read, so the collector must stay running continuously.
-- Punches originate only from these devices. No screen, role, or API creates, edits, or deletes a punch. A broken day is shown as incomplete until HR approves a fix the employee asked for; HR never edits a day without a request.
-- An approved fix is an **overlay**: a correction row beside the punches (add a swipe, ignore a swipe, or set a swipe's direction) that every hours read path merges in, so views, exports and the hours API agree. Device punches stay untouched, and Frappe HR and `/api/v1/checkins` receive only raw punches, never fixes.
+- Punches originate only from these devices. No screen, role, or API creates, edits, or deletes a punch. A broken day is shown as incomplete until HR or an admin approves a fix the employee asked for, or an admin fixes it directly with a reason (never on their own punches).
+- An approved fix is an **overlay**: a correction row beside the punches (add a swipe, ignore a swipe, or set a swipe's direction) that every hours read path merges in, stamped with who made it, their name and role at that moment, when, why and by which path (a request, or a direct admin fix), and never editable afterwards, so views, exports and the hours API agree. Device punches stay untouched, and Frappe HR and `/api/v1/checkins` receive only raw punches, never fixes.
 - Hours are always recomputed from stored punches, never stored as a derived value.
 - Device deletion/clearing/reset operations are out of scope and must never be exposed. Retire is the only way to stop polling a device.
 - Communication passwords can be set by an admin on the Devices page; R2, tunnel and email credentials come only from the server's `.env` (mode 600), never browser fields or source code.
@@ -78,7 +78,7 @@ One Docker Compose stack on an office Linux host with routes to `192.168.1.201` 
 
 ## Product Principles
 
-- Punches are the record; hours are derived, never hand-entered. A correction is an approved, audited overlay, never an edited punch.
+- Punches are the record; hours are derived, never hand-entered. A correction is an audited overlay (approved, or made directly by an admin with a reason), never an edited punch.
 - An incomplete day is shown honestly as incomplete, never guessed into a number.
 - Make device state and recovery actions obvious to the admin, without ever exposing a destructive control.
 - Treat credentials, network access, and employee punch data as operational secrets.

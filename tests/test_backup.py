@@ -312,6 +312,87 @@ class ReplaceRestoreTest(Base):
         self.assertEqual(self.leftovers(), [])
 
 
+    # --- review hardening ---------------------------------------------------------------------
+
+    def test_exclusivity_is_proved_again_under_the_lock_just_before_the_swap(self) -> None:
+        self._live()
+        calls = []
+
+        def second_check_fails(path):
+            calls.append(path)
+            if len(calls) == 2:
+                raise bk.CommandError("another process still has the database open (test)")
+
+        with mock.patch.object(bk, "_require_exclusive", side_effect=second_check_fails):
+            with self.assertRaisesRegex(bk.CommandError, "still has the database open"):
+                self._replace()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual((self._count(self.db_path), self._aside()), (3, []))
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_live_file_that_is_not_a_database_is_refused_with_a_message(self) -> None:
+        self._live()
+        for suffix in ("-wal", "-shm"):
+            if os.path.exists(self.db_path + suffix):
+                os.unlink(self.db_path + suffix)
+        Path(self.db_path).write_bytes(b"this is not a sqlite file" * 200)
+        with self.assertRaisesRegex(bk.CommandError, "not a readable database"):
+            self._replace()
+        self.assertEqual(self._aside(), [])
+
+    def test_drill_cannot_be_combined_with_replace(self) -> None:
+        self._live()
+        with self.assertRaisesRegex(bk.CommandError, "--drill"):
+            self._replace(drill=True)
+        self.assertEqual((self._count(self.db_path), self._aside()), (3, []))
+
+    def test_a_failed_rollback_names_the_files_that_could_not_be_put_back(self) -> None:
+        self._live()
+        real_rename = os.rename
+
+        def fail(src, dst, *a, **kw):
+            name = os.path.basename(str(src))
+            if str(dst) == self.db_path and name.startswith("restore-"):
+                raise OSError("disk full")  # the install
+            if ".pre-restore-" in name and str(dst) == self.db_path:
+                raise OSError("permission denied")  # the rollback of the main file
+            return real_rename(src, dst, *a, **kw)
+
+        with mock.patch.object(bk.os, "rename", side_effect=fail):
+            with self.assertRaises(bk.CommandError) as caught:
+                self._replace(skip_pre_snapshot=True)
+        message = str(caught.exception)
+        self.assertIn("could not be put back", message)
+        self.assertIn(".pre-restore-", message)
+        self.assertEqual(len(self._aside()), 1)  # nothing was lost: the old file is still there
+
+    def test_the_cli_wires_replace_fetch_and_the_older_schema_flag(self) -> None:
+        self._live()
+        env = {"ESSL_DB_PATH": self.db_path}
+        with mock.patch.dict(os.environ, env), mock.patch.object(bk, "make_client", return_value=self.r2):
+            with redirect_stdout(io.StringIO()), mock.patch("sys.stderr", new=io.StringIO()) as err:
+                self.assertEqual(bk.main(["restore", "--replace"]), 1)  # no --yes
+                self.assertIn("--yes", err.getvalue())
+                out = self.dir / "cli-out"
+                self.assertEqual(bk.main(["fetch", "--out", str(out)]), 0)
+                self.assertEqual(len(list(out.iterdir())), 1)
+                self.assertEqual(bk.main(["restore", "--replace", "--yes", "--skip-pre-snapshot",
+                                          "--key", "recent/20261014T101500.db.gz"]), 0)
+        self.assertEqual(self._count(self.db_path), 1)
+
+    def test_the_cli_snapshots_an_older_schema_only_with_its_flag(self) -> None:
+        with mock.patch.object(db_module, "SCHEMA_VERSION", 9), \
+                mock.patch.object(bk, "SCHEMA_VERSION", 9), \
+                mock.patch.dict(db_module.MIGRATIONS, {}, clear=False):
+            db_module.MIGRATIONS.pop(10)
+            self.init_db()
+        env = {"ESSL_DB_PATH": self.db_path}
+        with mock.patch.dict(os.environ, env), mock.patch.object(bk, "make_client", return_value=self.r2), \
+                redirect_stdout(io.StringIO()):
+            self.assertEqual(bk.main(["now"]), 1)
+            self.assertEqual(bk.main(["now", "--allow-older-schema"]), 0)
+
+
 class FetchTest(Base):
     """`fetch`: a scrubbed, inert local copy of an R2 snapshot, written outside the live data folder."""
 
@@ -413,11 +494,44 @@ class FetchTest(Base):
         status = str(self.dir / "copy-status.json")
         self.r2.puts.clear()
         latest_before = self.r2.latest()
-        self.assertNotEqual(bk.run_cycle(str(copy), self.r2, status_path=status, now=NOW), "ok")
+        self.assertEqual(bk.run_cycle(str(copy), self.r2, status_path=status, now=NOW), "blocked")
+        self.assertIn("fetched copy", bk.load_status(status)["last_error"])
         self.assertEqual(self.r2.puts, [])
         with self.assertRaisesRegex(bk.CommandError, "fetched copy"):
             bk.cmd_adopt(str(copy), self.r2, confirm=lambda: True)
         self.assertEqual(self.r2.latest(), latest_before)  # the bucket still belongs to production
+
+
+    def test_a_stale_unscrubbed_temp_folder_from_an_interrupted_fetch_is_swept(self) -> None:
+        self._snapshots()
+        out = self.dir / "out"
+        stale = out / ".fetch-interrupted"
+        stale.mkdir(parents=True)
+        (stale / "restore-old.db").write_bytes(self.SECRET_PASSWORD.encode())
+        self._fetch(out)
+        self.assertFalse(stale.exists())
+
+    def test_fetch_scrubs_an_older_schema_snapshot_that_lacks_tables_and_columns(self) -> None:
+        self.init_db()
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO devices (id, site, model, ip, port, protocol, comm_password) VALUES "
+            "('c3', 'G', 'C3', '10.0.0.2', 4370, 'c3-pullsdk', ?)", (self.SECRET_PASSWORD,))
+        conn.execute("DROP TABLE api_keys")
+        conn.execute("ALTER TABLE devices DROP COLUMN door_params_request")
+        conn.execute("PRAGMA user_version=7")
+        conn.execute("DELETE FROM settings WHERE key='schema_version'")
+        conn.commit()
+        conn.close()
+        self.assertEqual(self.cycle(allow_older=True), "ok")
+        for suffix in ("", "-wal", "-shm"):
+            if os.path.exists(self.db_path + suffix):
+                os.unlink(self.db_path + suffix)
+        copy = self._fetch()
+        self.assertNotIn(self.SECRET_PASSWORD.encode(), copy.read_bytes())
+        check = sqlite3.connect(copy)
+        self.assertIsNone(check.execute("SELECT comm_password FROM devices").fetchone()[0])
+        check.close()
 
 
 class PruneTest(Base):
@@ -577,6 +691,12 @@ class CycleTest(Base):
         conn.commit()
         conn.close()
         self.assertEqual(self.cycle(allow_older=True), "ok")
+        [key] = [k for k in self.r2.objects if k.startswith("recent/")]
+        snapshot = self.dir / "older-snap.db"
+        snapshot.write_bytes(gzip.decompress(self.r2.objects[key]))
+        check = sqlite3.connect(snapshot)
+        self.assertNotIn("mail_outbox", {r[0] for r in check.execute("SELECT name FROM sqlite_master")})
+        check.close()
 
     def test_nightly_once_per_day_after_hour_and_across_restart(self) -> None:
         self.init_db()

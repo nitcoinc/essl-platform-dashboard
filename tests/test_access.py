@@ -156,24 +156,24 @@ class AccessTest(unittest.TestCase):
         self.assertFalse(access.can_view_fix_reviews(None))
 
     def test_hr_approves_anyone_but_themselves(self) -> None:
-        self.assertTrue(access.can_approve_fix(self.hr, self._request_by(self.c), self.db))
-        self.assertTrue(access.can_approve_fix(self.hr, self._request_by(self.admin), self.db))
-        self.assertFalse(access.can_approve_fix(self.hr, self._request_by(self.hr), self.db))
+        self.assertTrue(access.can_approve_fix(self.hr, self._request_by(self.c)))
+        self.assertTrue(access.can_approve_fix(self.hr, self._request_by(self.admin)))
+        self.assertFalse(access.can_approve_fix(self.hr, self._request_by(self.hr)))
 
     def test_managers_and_employees_never_approve(self) -> None:
-        self.assertFalse(access.can_approve_fix(self.a, self._request_by(self.c), self.db))
-        self.assertFalse(access.can_approve_fix(self.c, self._request_by(self.b), self.db))
+        self.assertFalse(access.can_approve_fix(self.a, self._request_by(self.c)))
+        self.assertFalse(access.can_approve_fix(self.c, self._request_by(self.b)))
 
     def test_admin_approves_anyone_but_themselves_even_with_an_hr_user(self) -> None:
-        self.assertTrue(access.can_approve_fix(self.admin, self._request_by(self.c), self.db))
-        self.assertTrue(access.can_approve_fix(self.admin, self._request_by(self.hr), self.db))
-        self.assertFalse(access.can_approve_fix(self.admin, self._request_by(self.admin), self.db))
+        self.assertTrue(access.can_approve_fix(self.admin, self._request_by(self.c)))
+        self.assertTrue(access.can_approve_fix(self.admin, self._request_by(self.hr)))
+        self.assertFalse(access.can_approve_fix(self.admin, self._request_by(self.admin)))
 
     def test_the_admin_rule_does_not_depend_on_who_else_is_hr(self) -> None:
         self.db.archive_employee(self.hr["id"])
-        self.assertTrue(access.can_approve_fix(self.admin, self._request_by(self.c), self.db))
+        self.assertTrue(access.can_approve_fix(self.admin, self._request_by(self.c)))
         self.db.set_employee_role(self.hr["id"], "employee")
-        self.assertTrue(access.can_approve_fix(self.admin, self._request_by(self.c), self.db))
+        self.assertTrue(access.can_approve_fix(self.admin, self._request_by(self.c)))
 
 
     # direct punch fixes (v10) ---------------------------------------------

@@ -274,12 +274,16 @@ def counted_punches(rows, windows: dict[str, int]) -> list[Punch]:
     return [punch_from_row(row, windows) for row in rows if row.get("correction") != CORRECTION_IGNORED]
 
 
+# What the v10 migration names a correction whose maker was never recorded.
+NO_AUDIT_NAME = "before audit trail"
+
+
 def correction_info(correction: dict) -> dict:
     """Who made a correction and why, as the day view shows it. A row from
     before the audit trail has no name of its own."""
     return {
         "id": correction.get("id"),
-        "by": correction.get("created_by_name") or "before audit trail",
+        "by": correction.get("created_by_name") or NO_AUDIT_NAME,
         "role": correction.get("created_by_role"),
         "at": correction.get("created_at"),
         "reason": correction.get("reason"),
@@ -320,11 +324,14 @@ def apply_corrections(rows, corrections, main_ids: dict[int, str]) -> list[dict]
                 continue
             if correction["kind"] == "ignore":
                 out["correction"] = CORRECTION_IGNORED
+                out["correction_info"] = correction_info(correction)
             elif correction["kind"] == "set_direction":
                 out["trusted_direction"] = correction["direction"]
                 if out["correction"] != CORRECTION_IGNORED:
                     out["correction"] = CORRECTION_DIRECTION
-            out["correction_info"] = correction_info(correction)  # the latest one is shown
+                    # An ignore decides the final state, so a later direction
+                    # fix does not take over its name.
+                    out["correction_info"] = correction_info(correction)
         merged.append(out)
     for correction in corrections:
         owner = correction["employee_id"]

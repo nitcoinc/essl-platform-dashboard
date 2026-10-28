@@ -1464,10 +1464,11 @@ class MissedPunchSchemaTest(unittest.TestCase):
             old.set_employee_role(old.employee_by_device_user_id(uid)["id"], role)
         return old
 
-    def _v9_correction(self, old: db_module.Database, *, decider: int | None, note: str | None) -> int:
+    def _v9_correction(self, old: db_module.Database, *, decider: int | None, note: str | None,
+                       day=DAY) -> int:
         asha = old.employee_by_device_user_id("101")["id"]
         request = old.file_fix_lines(
-            asha, DAY, [self._add_in()], source="link", punch_set_hash="h1")["request_id"]
+            asha, day, [self._add_in()], source="link", punch_set_hash="h1")["request_id"]
         line = old.fix_request(request)["lines"][0]["id"]
         with old.transaction() as connection:
             connection.execute(
@@ -1477,7 +1478,7 @@ class MissedPunchSchemaTest(unittest.TestCase):
             connection.execute(
                 "INSERT INTO punch_corrections (employee_id, work_day, kind, event_timestamp, direction, "
                 "request_line_id, created_at) VALUES (?, ?, 'add', ?, 'entry', ?, ?)",
-                (asha, DAY, datetime(2026, 10, 26, 13, 40), line, datetime(2026, 10, 27, 9, 0)))
+                (asha, day, datetime(2026, 10, 26, 13, 40), line, datetime(2026, 10, 27, 9, 0)))
         return asha
 
     def _corrections(self, database: db_module.Database) -> list[dict]:
@@ -1552,6 +1553,51 @@ class MissedPunchSchemaTest(unittest.TestCase):
         with self.database.transaction() as connection:  # employee removal still cascades
             connection.execute("DELETE FROM employees WHERE id = ?", (self.asha,))
         self.assertEqual(self._count("punch_corrections"), 0)
+
+    def test_the_autoincrement_counter_survives_the_rebuild(self) -> None:
+        old = self._v9_database("seq.db")
+        hari = old.employee_by_device_user_id("102")["id"]
+        self._v9_correction(old, decider=hari, note=None)
+        self._v9_correction(old, decider=hari, note=None, day=DAY + timedelta(days=1))
+        with old.transaction() as connection:  # the newest correction is gone before the upgrade
+            connection.execute("DELETE FROM punch_corrections WHERE id = 2")
+        old.migrate_schema()
+        with old.connect() as connection:
+            seq = connection.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name='punch_corrections'").fetchone()["seq"]
+        self.assertEqual(seq, 2)  # an id once handed out is never reused
+
+    def test_a_corrections_id_and_actor_cannot_be_repointed_but_the_actor_can_be_nulled_by_a_delete(self) -> None:
+        request_id = self._file(self._add_in())["request_id"]
+        line = self.database.fix_request(request_id)["lines"][0]["id"]
+        self.database.decide_fix_lines(request_id, [{"line_id": line, "status": "approved"}],
+                                       actor_id=self.hari, note="ok")
+        for statement in (
+            "UPDATE punch_corrections SET id = 99",
+            f"UPDATE punch_corrections SET created_by = {self.adam}",
+            "UPDATE punch_corrections SET created_by = NULL",
+        ):
+            with self.subTest(statement=statement), self.assertRaises(Exception) as caught:
+                with self.database.transaction() as connection:
+                    connection.execute(statement)
+            self.assertIn("append-only", str(caught.exception))
+        # The foreign key's own SET NULL (the actor's row is gone) still goes through.
+        with self.database.transaction() as connection:
+            connection.execute("UPDATE fix_request_lines SET decided_by = NULL WHERE decided_by = ?", (self.hari,))
+            connection.execute("UPDATE fix_requests SET decided_by = NULL WHERE decided_by = ?", (self.hari,))
+            connection.execute("DELETE FROM employees WHERE id = ?", (self.hari,))
+        [row] = self._corrections(self.database)
+        self.assertEqual((row["created_by"], row["created_by_name"]), (None, "Hari"))
+
+    def test_an_unknown_or_unauthorised_approver_cannot_decide_a_request(self) -> None:
+        request_id = self._file(self._add_in())["request_id"]
+        line = self.database.fix_request(request_id)["lines"][0]["id"]
+        for actor in (9999, self._person("106", "Eve", "employee")):
+            with self.subTest(actor=actor), self.assertRaises(db_module.RuleViolation):
+                self.database.decide_fix_lines(request_id, [{"line_id": line, "status": "approved"}],
+                                               actor_id=actor)
+        self.assertEqual(self._count("punch_corrections"), 0)
+        self.assertEqual(self.database.fix_request(request_id)["status"], "pending")
 
     def test_deleting_the_decider_keeps_the_name_that_was_recorded(self) -> None:
         request_id = self._file(self._add_in())["request_id"]

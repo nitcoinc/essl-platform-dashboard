@@ -374,6 +374,22 @@ class CorrectionOverlayTest(unittest.TestCase):
         [legacy] = apply_corrections(rows[:1], [self._fix("ignore", fingerprint="fp-0")], self.MAIN_IDS)
         self.assertEqual(legacy["correction_info"]["by"], "before audit trail")
 
+    def test_the_fixer_shown_matches_the_correction_that_decided_the_final_state(self) -> None:
+        rows = self._rows((_t(9), "entry"), (_t(13), "exit"), device="c3")
+        def fix(kind, cid, name, at):
+            return {**self._fix(kind, cid=cid, fingerprint="fp-1", direction="entry" if kind == "set_direction" else None),
+                    "created_by_name": name, "created_by_role": "admin", "created_at": at, "reason": name, "path": "direct"}
+        ignored_then_direction = apply_corrections(
+            rows, [fix("ignore", 1, "Ada", _t(20)), fix("set_direction", 2, "Bea", _t(21))], self.MAIN_IDS)
+        row = ignored_then_direction[1]
+        self.assertEqual((row["correction"], row["correction_info"]["by"]), ("ignored", "Ada"))
+        direction_then_ignored = apply_corrections(
+            rows, [fix("set_direction", 1, "Bea", _t(20)), fix("ignore", 2, "Ada", _t(21))], self.MAIN_IDS)
+        self.assertEqual(direction_then_ignored[1]["correction_info"]["by"], "Ada")
+        twice = apply_corrections(
+            rows, [fix("set_direction", 1, "Bea", _t(20)), fix("set_direction", 2, "Cy", _t(21))], self.MAIN_IDS)
+        self.assertEqual(twice[1]["correction_info"]["by"], "Cy")
+
     def test_a_direction_fix_keeps_what_the_device_said(self) -> None:
         rows = self._rows((_t(9), "entry"), (_t(13), "exit"), device="c3")
         merged = apply_corrections(

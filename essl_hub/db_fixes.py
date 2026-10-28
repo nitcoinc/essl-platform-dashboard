@@ -289,10 +289,10 @@ class FixesMixin:
                 raise _core().RuleViolation("Nobody decides their own fix request.")
             # The audit row keeps the actor's name and role as they are now.
             actor = connection.execute(
-                "SELECT name, role FROM employees WHERE id = ?", (actor_id,)
+                "SELECT name, role FROM employees WHERE id = ? AND archived_at IS NULL", (actor_id,)
             ).fetchone()
-            if actor is None:
-                raise _core().RuleViolation("Unknown approver.")
+            if actor is None or actor["role"] not in ("hr", "admin"):
+                raise _core().RuleViolation("Only HR or an admin can decide a fix request.")
             for decision in decisions:
                 line = connection.execute(
                     "SELECT l.*, d.name AS decided_by_name FROM fix_request_lines l "

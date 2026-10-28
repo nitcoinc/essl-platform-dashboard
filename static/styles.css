@@ -528,6 +528,8 @@ input[type="file"]::file-selector-button {
 .punch-list li { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s3); padding: var(--s1) 0; border-bottom: 1px solid var(--border); font-size: var(--text-14); }
 .punch-time { font-weight: 600; min-width: 5em; }
 .punch-dir { color: var(--text-secondary); min-width: 3em; }
+.punch-basis, .punch-facts { display: block; flex-basis: 100%; font-size: var(--text-sm, 0.875rem); }
+.punch-facts { font-size: var(--text-xs, 0.75rem); }
 @media (max-width: 600px) {
   .bar-text.is-wide { display: none; }
   .bar-text.is-narrow { display: inline; }

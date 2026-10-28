@@ -109,7 +109,7 @@ def _render_review(filed: dict, person: dict, day: date, *, values: dict | None 
     day_start_hour = _day_start_hour(database)
     rows = _day_rows(person, day, day_start_hour)
     lines = _review_lines(filed, rows, values, errors.get("lines"))
-    can_approve = access.can_approve_fix(g.employee, filed, database)
+    can_approve = access.can_approve_fix(g.employee, filed)
     day_changed = (filed["status"] == "pending" and bool(filed.get("punch_set_hash"))
                    and punch_set_hash(rows) != filed["punch_set_hash"])
     return Response(render_template(
@@ -309,7 +309,7 @@ def review_preview(request_id: int) -> Response:
     does to the day's hours. Nothing is written here."""
     _require_csrf()
     filed, person, day = _review_request(request_id)
-    if not access.can_approve_fix(g.employee, filed, database):
+    if not access.can_approve_fix(g.employee, filed):
         abort(403)
     decisions, values, errors, note = _read_review(filed, day, request.form)
     if request.form.get("action") == "edit":
@@ -381,7 +381,7 @@ def review_confirm(request_id: int) -> Response:
     """Apply HR's decisions in one transaction, then email the employee."""
     _require_csrf()
     filed, person, day = _review_request(request_id)
-    if not access.can_approve_fix(g.employee, filed, database):
+    if not access.can_approve_fix(g.employee, filed):
         abort(403)
     decisions, values, errors, note = _read_review(filed, day, request.form)
     if errors:

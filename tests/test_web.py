@@ -4072,6 +4072,28 @@ class DatabaseSetupTest(unittest.TestCase):
         self.assertIn("Busy, try again", response.text)
 
 
+class FetchedCopyMailTest(unittest.TestCase):
+    """A database made by `backup fetch` holds real staff emails: the web app never mails them."""
+
+    def test_a_fetched_copy_forces_console_mail_even_when_a_provider_is_configured(self) -> None:
+        from essl_hub import config
+
+        database = FakeDatabase()
+        database.is_fetched_copy = lambda: True
+        with patch.dict(os.environ, {"ESSL_MAIL_PROVIDER": "resend", "RESEND_API_KEY": "re_x"}):
+            create_app(database=database)
+            self.assertEqual(config.mail_provider(), "console")
+
+    def test_a_normal_database_keeps_its_configured_provider(self) -> None:
+        from essl_hub import config
+
+        database = FakeDatabase()
+        database.is_fetched_copy = lambda: False
+        with patch.dict(os.environ, {"ESSL_MAIL_PROVIDER": "resend", "RESEND_API_KEY": "re_x"}):
+            create_app(database=database)
+            self.assertEqual(config.mail_provider(), "resend")
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -6716,6 +6738,60 @@ class FixReviewTest(unittest.TestCase):
         response = self.client.post(self._url(), data={"csrf": "wrong", **self._form(**{"act-a-last": "ignore"})})
         self.assertIn(response.status_code, (400, 403))
         self.assertEqual(self.database.corrections, [])
+
+    @staticmethod
+    def _hidden_inputs(html: str) -> dict:
+        import re
+        from html import unescape
+
+        return {name: unescape(value) for name, value in
+                re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)"', html)}
+
+    def test_posting_exactly_what_the_preview_returned_writes_the_same_corrections(self) -> None:
+        self._sign_in(self.admin)
+        form = self._form(**{"act-a-last": "ignore", "add-0-time": "13:40", "add-0-dir": "in"})
+        preview = self._fix("", form)
+        hidden = self._hidden_inputs(preview.text)
+        self.assertIn("punch_set_hash", hidden)
+        response = self.client.post(self._url(step="/confirm"), data=hidden)
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(sorted((c["kind"], c["fingerprint"]) for c in self.database.corrections),
+                         [("add", None), ("ignore", "a-last")])
+
+    def test_replaying_a_confirmation_never_adds_the_missed_punch_twice(self) -> None:
+        self._sign_in(self.admin)
+        form = self._form(**{"add-0-time": "13:40", "add-0-dir": "in"})
+        hidden = self._hidden_inputs(self._fix("", form).text)
+        self.assertEqual(self.client.post(self._url(step="/confirm"), data=hidden).status_code, 302)
+        again = self.client.post(self._url(step="/confirm"), data=hidden)
+        self.assertEqual(again.status_code, 409)
+        self.assertEqual([c["kind"] for c in self.database.corrections], ["add"])
+
+    def test_choosing_the_direction_a_punch_already_has_still_pins_it(self) -> None:
+        self._sign_in(self.admin)
+        form = self._form(**{"act-a-in": "in"})  # a-in is already an In from the device
+        self._fix("/confirm", {**form, "punch_set_hash": self._hash_of(self._fix("", form).text)})
+        [correction] = self.database.corrections
+        self.assertEqual((correction["kind"], correction["fingerprint"], correction["direction"]),
+                         ("set_direction", "a-in", "entry"))
+
+    def test_a_database_refusal_becomes_403_and_a_bad_edit_becomes_400(self) -> None:
+        from essl_hub.db import RuleViolation
+
+        self._sign_in(self.admin)
+        form = self._form(**{"act-a-last": "ignore"})
+        confirm = {**form, "punch_set_hash": self._hash_of(self._fix("", form).text)}
+        with patch.object(self.database, "record_direct_corrections", side_effect=RuleViolation("no")):
+            self.assertEqual(self._fix("/confirm", confirm).status_code, 403)
+        with patch.object(self.database, "record_direct_corrections", side_effect=ValueError("bad edit")):
+            response = self._fix("/confirm", confirm)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Bad edit", response.text)
+        self.assertEqual(self.database.corrections, [])
+
+    def test_the_form_tells_the_admin_who_can_read_the_reason(self) -> None:
+        self._sign_in(self.admin)
+        self.assertIn("Asha Rao and their managers can read it", self.client.get(self._url()).text)
 
     @staticmethod
     def _hash_of(html: str) -> str:

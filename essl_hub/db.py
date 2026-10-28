@@ -783,6 +783,20 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         LEFT JOIN fix_requests r ON r.id = l.request_id
         ORDER BY c.id
         """,
+        # AUTOINCREMENT remembers the highest id ever handed out; the copy only
+        # knows the highest id still present, so carry the old counter over.
+        """
+        INSERT INTO sqlite_sequence (name, seq)
+        SELECT 'punch_corrections_v10', seq FROM sqlite_sequence
+        WHERE name = 'punch_corrections'
+          AND NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'punch_corrections_v10')
+        """,
+        """
+        UPDATE sqlite_sequence
+        SET seq = (SELECT seq FROM sqlite_sequence WHERE name = 'punch_corrections')
+        WHERE name = 'punch_corrections_v10'
+          AND (SELECT seq FROM sqlite_sequence WHERE name = 'punch_corrections') > seq
+        """,
         "DROP TABLE punch_corrections",
         "ALTER TABLE punch_corrections_v10 RENAME TO punch_corrections",
         "CREATE INDEX IF NOT EXISTS idx_punch_corrections_employee "
@@ -791,9 +805,19 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         # employee (the cascade runs once the employee row is gone).
         """
         CREATE TRIGGER IF NOT EXISTS punch_corrections_no_update
-        BEFORE UPDATE OF employee_id, work_day, kind, fingerprint, event_timestamp, direction,
+        BEFORE UPDATE OF id, employee_id, work_day, kind, fingerprint, event_timestamp, direction,
             request_line_id, created_at, created_by_name, created_by_role, path, reason
         ON punch_corrections
+        BEGIN SELECT RAISE(ABORT, 'punch corrections are append-only'); END
+        """,
+        # The actor id may only change by the foreign key's own SET NULL, which
+        # runs once the actor's employee row is gone.
+        """
+        CREATE TRIGGER IF NOT EXISTS punch_corrections_actor_fixed
+        BEFORE UPDATE OF created_by ON punch_corrections
+        WHEN NEW.created_by IS NOT OLD.created_by
+            AND (NEW.created_by IS NOT NULL
+                 OR EXISTS (SELECT 1 FROM employees WHERE id = OLD.created_by))
         BEGIN SELECT RAISE(ABORT, 'punch corrections are append-only'); END
         """,
         """
