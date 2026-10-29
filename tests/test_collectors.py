@@ -221,6 +221,109 @@ class _FakeC3:
         return self._batches.pop(0) if self._batches else []
 
 
+def _rt_frame(event: int, pin: int, in_out: int, second: int, door: int = 1) -> bytes:
+    """One 16-byte binary live-log record, laid out as c3.rtlog reads it."""
+    return (b"\x00\x00\x00\x00" + pin.to_bytes(4, "little") + bytes([1, door, event, in_out])
+            + second.to_bytes(4, "little"))
+
+
+class _FakeRawC3(_FakeC3):
+    """A panel answering the live-log command with raw frames, as the real
+    library's ``_send_receive`` does: binary, or key/value firmware."""
+
+    messages: list = []
+    key_value = False
+
+    def __init__(self, *a, **k):
+        from c3 import consts
+
+        super().__init__()
+        self._messages = list(type(self).messages)
+        self._rtlog_command = consts.Command.RTLOG_KEYVALUE if self.key_value else consts.Command.RTLOG_BINARY
+        self.statuses: list = []
+
+    def is_connected(self):
+        return True
+
+    def _send_receive(self, command):
+        message = self._messages.pop(0) if self._messages else b""
+        return message, len(message)
+
+    def _parse_kv_from_message(self, message):
+        return dict(pair.split("=", 1) for pair in message.decode().split("\t") if "=" in pair)
+
+    def _update_inout_status(self, records):
+        self.statuses.append(len(records))
+
+
+class C3RawInOutTest(unittest.TestCase):
+    """R3: the panel's own live-log in/out value is kept beside the decode."""
+
+    SECOND = 800000000
+
+    def setUp(self) -> None:
+        self.device = next(d for d in DEVICES if d.protocol == "c3-pullsdk")
+
+    def _realtime(self, *messages, key_value=False):
+        from essl_hub import collectors
+
+        _FakeRawC3.messages = list(messages)
+        with patch("c3.C3", _FakeRawC3), patch.object(_FakeRawC3, "key_value", key_value), patch.dict(os.environ, {"ESSL_C3_MODE": "realtime", "ESSL_C3_RTLOG_BATCH": "3"}):
+            return collectors.collect_c3(self.device).events
+
+    def test_a_byte_the_library_cannot_decode_is_kept_raw_with_no_direction(self) -> None:
+        [event] = self._realtime(_rt_frame(0, 173, 1, self.SECOND))
+        self.assertEqual(event["raw"]["in_out_raw"], 1)
+        self.assertEqual(event["raw_direction_byte"], 15)
+        self.assertIsNone(event["trusted_direction"])
+
+    def test_a_decoded_entry_keeps_its_raw_zero_and_direction(self) -> None:
+        [event] = self._realtime(_rt_frame(0, 173, 0, self.SECOND))
+        self.assertEqual((event["raw"]["in_out_raw"], event["raw_direction_byte"], event["trusted_direction"]),
+                         (0, 0, "entry"))
+
+    def test_several_records_in_one_reply_keep_their_own_values(self) -> None:
+        events = self._realtime(_rt_frame(0, 173, 0, self.SECOND) + _rt_frame(0, 174, 4, self.SECOND + 1))
+        self.assertEqual([e["raw"]["in_out_raw"] for e in events], [0, 4])
+
+    def test_key_value_mode_keeps_inoutstatus(self) -> None:
+        kv = "\t".join(["time=2025-05-09 10:13:20", "pin=173", "cardno=0", "eventaddr=1", "event=0",
+                        "inoutstatus=2", "verifytype=1", "index=1"]).encode()
+        [event] = self._realtime(kv, key_value=True)
+        self.assertEqual(event["raw"]["in_out_raw"], 2)
+        self.assertIsNone(event["trusted_direction"])
+
+    def test_the_fingerprint_still_matches_the_history_twin(self) -> None:
+        from essl_hub import collectors
+
+        [live] = self._realtime(_rt_frame(0, 173, 1, self.SECOND))
+        row = {"Pin": "173", "Cardno": "0", "Time_second": str(self.SECOND), "EventType": "0",
+               "InOutState": "1", "DoorID": "1", "ReaderID": "1"}
+        with patch("c3.C3", _FakeC3), patch.object(collectors, "read_c3_table", return_value=[row]), \
+                patch.dict(os.environ, {"ESSL_C3_MODE": "history"}):
+            [history] = collectors.collect_c3(self.device).events
+        self.assertEqual(live["fingerprint"], history["fingerprint"])
+
+    def test_a_reply_that_is_not_whole_records_switches_to_key_value(self) -> None:
+        from c3 import consts
+        from essl_hub.collectors import read_c3_rt_log
+
+        _FakeRawC3.messages = [b"\x01" * 7]
+        panel = _FakeRawC3()
+        self.assertEqual(read_c3_rt_log(panel), [])
+        self.assertEqual(panel._rtlog_command, consts.Command.RTLOG_KEYVALUE)
+        self.assertEqual(panel.statuses, [0])
+
+    def test_a_panel_without_the_internals_falls_back_to_get_rt_log(self) -> None:
+        from c3.utils import C3DateTime
+        from essl_hub import collectors
+
+        _FakeC3.rt_batches = [[_RtRecord(0, "173", 15, C3DateTime.from_value(self.SECOND))]]
+        with patch("c3.C3", _FakeC3), patch.dict(os.environ, {"ESSL_C3_MODE": "realtime"}):
+            [event] = collectors.collect_c3(self.device).events
+        self.assertNotIn("in_out_raw", event["raw"])
+
+
 class C3IntervalTooShortTest(unittest.TestCase):
     """U12/KTD11: event 20 is stored as a flagged swipe."""
 

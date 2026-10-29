@@ -349,6 +349,18 @@ class BreakViewTest(unittest.TestCase):
         self.assertEqual([f for _, f in shown], [
             "gachibowli-c3-400 · door 1 · in/out byte 0 · live log", "uppal-x990 · in/out byte 1"])
 
+    def test_raw_facts_show_what_the_panel_sent_when_the_library_could_not_decode_it(self) -> None:
+        swipes = [(_at(9), None), (_at(18), "entry")]
+        rows = self._rows(*swipes)
+        rows[0].update(device_id="gachibowli-c3-400", door="1", raw_direction_byte=15, in_out_raw=1,
+                       source="realtime_fallback")
+        rows[1].update(device_id="gachibowli-c3-400", door="1", raw_direction_byte=0, in_out_raw=0,
+                       source="realtime_fallback")
+        shown = self._basis(swipes, rows, show_facts=True)
+        self.assertEqual([f for _, f in shown], [
+            "gachibowli-c3-400 · door 1 · in/out byte 15 (panel sent 1) · live log",
+            "gachibowli-c3-400 · door 1 · in/out byte 0 · live log"])
+
     def test_day_level_fix_chip_follows_the_latest_request(self) -> None:
         swipes = [(_at(9), "entry"), (_at(18), "exit")]
         result, rows = self._day(*swipes), self._rows(*swipes)

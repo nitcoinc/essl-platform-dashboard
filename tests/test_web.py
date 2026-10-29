@@ -304,6 +304,7 @@ class FakeDatabase:
                 "door": p.get("door"),
                 "reader": p.get("reader"),
                 "source": p.get("source"),
+                "in_out_raw": p.get("in_out_raw"),
             }
             for p in self.punches
             if p.get("device_user_id") in wanted and start <= p["event_timestamp"] < end

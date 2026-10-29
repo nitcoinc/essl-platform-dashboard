@@ -206,6 +206,39 @@ def read_c3_table(panel: Any, table_name: str) -> list[dict[str, Any]]:
     return parse_c3_table(bytes(buffer), fields)
 
 
+def read_c3_rt_log(panel: Any) -> list[tuple[Any, int | None]]:
+    """``C3.get_rt_log`` that also keeps each record's in/out value as the
+    panel sent it (byte 11 of a binary record, ``inoutstatus`` of a key/value
+    one): the library decodes only 0, 2 and 3 and turns anything else into
+    15. Same command, mode switch and door-status update as the library; a
+    panel object without those internals falls back to ``get_rt_log``."""
+    from c3 import consts, rtlog
+
+    if not all(hasattr(panel, name) for name in ("_send_receive", "_rtlog_command", "_update_inout_status")):
+        return [(record, None) for record in panel.get_rt_log()]
+    if not panel.is_connected():
+        raise ConnectionError("No connection to C3 panel.")
+    pairs: list[tuple[Any, int | None]] = []
+    message, length = panel._send_receive(panel._rtlog_command)
+    if length:
+        if panel._rtlog_command == consts.Command.RTLOG_BINARY:
+            if length % 16 == 0:
+                for start in range(0, length, 16):
+                    frame = bytes(message[start : start + 16])
+                    pairs.append((rtlog.factory(frame), frame[11]))
+            else:  # the firmware has no binary mode; the library switches too
+                panel._rtlog_command = consts.Command.RTLOG_KEYVALUE
+        elif panel._rtlog_command == consts.Command.RTLOG_KEYVALUE:
+            pairs_kv = panel._parse_kv_from_message(message)
+            if pairs_kv:
+                value = str(pairs_kv.get("inoutstatus", "")).strip()
+                pairs.append((rtlog.factory(pairs_kv), int(value) if value.isdigit() else None))
+        else:
+            raise NotImplementedError(f"The requested RT log command {panel._rtlog_command} is not supported")
+    panel._update_inout_status([record for record, _ in pairs])
+    return pairs
+
+
 def collect(device: DeviceConfig) -> CollectionResult:
     if device.protocol == X990_PROTOCOL:
         return collect_x990(device)
@@ -375,7 +408,11 @@ def collect_c3(device: DeviceConfig) -> CollectionResult:
             )
         batch_size = max(1, min(int(os.getenv("ESSL_C3_RTLOG_BATCH", "250")), 2000))
         for _ in range(batch_size):
-            records = panel.get_rt_log()
+            in_out_raw = {}
+            records = []
+            for record, raw_in_out in read_c3_rt_log(panel):
+                records.append(record)
+                in_out_raw[id(record)] = raw_in_out
             realtime_events = [
                 record for record in records
                 if record.is_event()
@@ -402,6 +439,10 @@ def collect_c3(device: DeviceConfig) -> CollectionResult:
                     "timestamp": _format_datetime(record.time_second),
                     "source": "realtime_fallback",
                 }
+                if in_out_raw.get(id(record)) is not None:
+                    # R3: what the panel sent, before the library's decode
+                    # turns anything but 0/2/3 into 15. Evidence only.
+                    raw["in_out_raw"] = in_out_raw[id(record)]
                 events.append(
                     _normalized_event(
                         device,

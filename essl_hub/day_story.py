@@ -188,7 +188,11 @@ def punch_facts(row: dict) -> str:
     if row.get("reader"):
         parts.append(f"reader {row['reader']}")
     if row.get("raw_direction_byte") is not None:
-        parts.append(f"in/out byte {row['raw_direction_byte']}")
+        byte = f"in/out byte {row['raw_direction_byte']}"
+        sent = row.get("in_out_raw")
+        if sent is not None and sent != row["raw_direction_byte"]:
+            byte += f" (panel sent {sent})"  # R3: the live-log value before decoding
+        parts.append(byte)
     if row.get("source") == C3_REALTIME_SOURCE:
         parts.append("live log")
     return " · ".join(part for part in parts if part)
