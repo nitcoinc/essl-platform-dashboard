@@ -140,10 +140,12 @@ _CORRECTION_VERBS = {
 
 
 def is_unconfirmed_guess(row: dict) -> bool:
-    """A C3 live-log row still carrying the undecoded byte 15: no direction
-    (v11; older rows may still hold the old exit guess) until the device
-    history confirms it (db.fill_punch_directions)."""
-    return row.get("raw_direction_byte") == C3_UNDECODED_BYTE and row.get("source") == C3_REALTIME_SOURCE
+    """A C3 live-log row read as the undecoded byte 15 with no direction yet
+    (v11), until the device history confirms it (db.fill_punch_directions).
+    One that kept 15 with a direction was filled by history before fills
+    rewrote the byte, so it is confirmed."""
+    return (row.get("raw_direction_byte") == C3_UNDECODED_BYTE and row.get("source") == C3_REALTIME_SOURCE
+            and not row.get("trusted_direction"))
 
 
 def punch_basis(row: dict, direction: str, *, collapsed: bool = False, inferred: bool = False) -> str:
@@ -169,13 +171,11 @@ def punch_basis(row: dict, direction: str, *, collapsed: bool = False, inferred:
         return "Quick re-swipe: not counted"
     word = _DIRECTION_WORDS.get(direction)
     stored = _DIRECTION_WORDS.get(row.get("trusted_direction"))
-    if not stored and word and is_unconfirmed_guess(row):
+    if word and is_unconfirmed_guess(row):
         return f"The live log gave no direction; counted as {word} from the swipes around it until the device history confirms it"
     if inferred and word:
         return f"Filled in as {word} between the swipes around it"
     if stored:
-        if is_unconfirmed_guess(row):
-            return f"Guessed {stored} from the live log; the device history confirms it later"
         return f"Device said {stored}"
     return f"Counted as {word} by alternating from the first swipe" if word else ""
 

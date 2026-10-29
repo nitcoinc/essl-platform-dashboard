@@ -410,10 +410,6 @@ class CorrectionOverlayTest(unittest.TestCase):
         self.assertEqual(rows[0].get("correction", "untouched"), "untouched")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class LiveLogUnknownDirectionTest(unittest.TestCase):
     """v11: the reported Gachibowli day of 2026-10-28. 17:51 and 19:53 were
     live-log byte 15 (no direction); 19:55, 20:07 and 20:22 byte 0 (entry)."""
@@ -436,3 +432,7 @@ class LiveLogUnknownDirectionTest(unittest.TestCase):
         r = self._day()
         self.assertEqual(r.unpaired, ((_t(19, 55), "entry"), (_t(20, 7), "entry"), (_t(20, 22), "entry")))
         self.assertTrue(r.anomalies)
+
+
+if __name__ == "__main__":
+    unittest.main()

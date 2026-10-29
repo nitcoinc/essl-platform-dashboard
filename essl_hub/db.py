@@ -829,18 +829,24 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
     ),
     # v11: the C3 live log returns in/out 15 for arrivals and leavings alike,
     # so a live row read as 15 carries no direction (collectors KTD4, revised
-    # 2026-10-29). Drop the old "15 is an exit" guess on rows history has not
-    # filled yet (a filled row has byte 0/1); hours infer them from the swipes
-    # around them and fill_punch_directions confirms them later. Collector
-    # metadata, like that repair, not a punch edit. The cutover time (IST, only
-    # on a file that already holds punches) lets
-    # scripts/c3_guessed_frappe_report.py tell which rows Frappe got as OUT.
+    # 2026-10-29). Drop exactly what the retired rule wrote: an exit on a
+    # granted or event-20 swipe still at byte 15, collected since the rule
+    # landed (32c132c, 2026-10-12 22:43). A history fill replaces the byte
+    # since 2026-10-26; earlier fills kept 15 on rows the rule never guessed
+    # (collected before it, or filled as entry), so those keep their direction.
+    # Hours infer the cleared rows from the swipes around them and
+    # fill_punch_directions confirms them later. Collector metadata, like that
+    # repair, not a punch edit. The cutover time (IST, only on a file that
+    # already holds punches) lets scripts/c3_guessed_frappe_report.py tell
+    # which rows Frappe got as OUT.
     11: (
         """
         UPDATE punches SET trusted_direction = NULL
         WHERE raw_direction_byte = 15
-          AND trusted_direction IS NOT NULL
+          AND trusted_direction = 'exit'
           AND json_extract(raw_json, '$.source') = 'realtime_fallback'
+          AND CAST(json_extract(raw_json, '$.event_type') AS TEXT) IN ('0', '1', '2', '3', '20')
+          AND collected_at >= '2026-10-12 22:43:17'
           AND device_id IN (SELECT id FROM devices WHERE protocol = 'c3-pullsdk')
         """,
         """

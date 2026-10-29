@@ -268,13 +268,10 @@ class BreakViewTest(unittest.TestCase):
         rows[0].update(raw_direction_byte=0, source="realtime_fallback")
         rows[1].update(raw_direction_byte=1)  # a history row: the device's own byte
         rows[2].update(raw_direction_byte=0)
-        rows[3].update(raw_direction_byte=15, source="realtime_fallback")  # a pre-v11 guess
+        # Kept byte 15 with a direction: filled by history before fills rewrote the byte.
+        rows[3].update(raw_direction_byte=15, source="realtime_fallback")
         got = [b for b, _ in self._basis(swipes, rows)]
-        self.assertEqual(got, [
-            "Device said In",
-            "Device said Out",
-            "Device said In",
-            "Guessed Out from the live log; the device history confirms it later"])
+        self.assertEqual(got, ["Device said In", "Device said Out", "Device said In", "Device said Out"])
 
     def test_a_live_15_swipe_without_direction_says_it_waits_for_history(self) -> None:
         # v11: the reported 2026-10-28 day. 17:51 (arrival) and 19:53 (leaving)

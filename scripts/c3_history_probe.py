@@ -10,7 +10,8 @@ Stop the collector first so the panel serves one session, run this off-hours
 with someone on site, then start the collector again:
 
     docker compose stop collector
-    docker compose run --rm --no-deps -T collector python scripts/c3_history_probe.py
+    docker compose run --rm --no-deps -T -v "$PWD/scripts:/app/scripts" collector \
+        python scripts/c3_history_probe.py
     docker compose start collector
 
 Modes, run in this order by default (each on its own connection, one attempt):
@@ -20,7 +21,9 @@ Modes, run in this order by default (each on its own connection, one attempt):
     pipeline       several buffer reads in flight before reading any reply
 
 A reset during read-length or pipeline stops the run: that is a capability
-the panel lacks, and the remaining modes are skipped.
+the panel lacks, and the remaining modes are skipped. The probe refuses to
+start while collector-status.json shows a poll in the last two minutes
+(--force overrides).
 
     python scripts/c3_history_probe.py --mode measure
     python scripts/c3_history_probe.py --device gachibowli-c3-400 --read-length 32768 --pipeline 4
@@ -31,11 +34,14 @@ Uses ESSL_DB_PATH (opened read-only) for the device's address and password.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sqlite3
 import sys
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -47,7 +53,7 @@ from essl_hub.collectors import (  # noqa: E402
     request_c3_buffer,
     start_c3_table,
 )
-from essl_hub.config import C3_PROTOCOL, db_path  # noqa: E402
+from essl_hub.config import C3_PROTOCOL, TIMEZONE_NAME, collector_status_path, db_path  # noqa: E402
 
 MODES = ("measure", "fresh-session", "read-length", "pipeline")
 PROGRESS_SECONDS = 5
@@ -154,7 +160,7 @@ def _connect(ip: str, port: int, password: str | None):
 
 def run(modes: list[str], *, connect: Callable[[], Any], read_bytes: int, depth: int,
         say: Callable[[str], None] = print, pause: Callable[[float], None] = time.sleep) -> int:
-    failed_capability = False
+    failed = False
     for number, mode in enumerate(modes):
         if number:
             pause(5)  # let the panel close the previous session
@@ -180,6 +186,8 @@ def run(modes: list[str], *, connect: Callable[[], Any], read_bytes: int, depth:
                 result = read_length(panel, read_bytes)
             else:
                 result = pipeline(panel, depth)
+        except Exception as exc:  # e.g. a reset at GETDATA: report it, never a traceback
+            result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         finally:
             try:
                 panel.disconnect()
@@ -187,12 +195,23 @@ def run(modes: list[str], *, connect: Callable[[], Any], read_bytes: int, depth:
                 pass
         for key, value in result.items():
             say(f"  {key}: {value}")
-        if mode in ("read-length", "pipeline") and not result.get("ok"):
-            failed_capability = True
-            if "error" in result:
+        if not result.get("ok"):
+            failed = True
+            if mode in ("read-length", "pipeline") and "error" in result:
                 say("  the panel refused or reset; stopping here")
                 break
-    return 1 if failed_capability else 0
+    return 1 if failed else 0
+
+
+def collector_is_polling(path: str, now: datetime, *, within: timedelta = timedelta(minutes=2)) -> bool:
+    """True when the collector's status file shows a recent poll: the panel
+    serves one session, so the probe and the collector would cut each other off."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            last = datetime.fromisoformat(str(json.load(handle).get("last_poll")))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+    return now - last < within
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -202,7 +221,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--read-length", type=int, default=C3_MAX_READ_BYTES, metavar="N",
                         help=f"bytes for the read-length test (capped at {C3_MAX_READ_BYTES})")
     parser.add_argument("--pipeline", type=int, default=4, metavar="N", help="reads in flight for the pipeline test")
+    parser.add_argument("--force", action="store_true", help="run even though the collector polled recently")
     args = parser.parse_args(argv)
+    now = datetime.now(ZoneInfo(TIMEZONE_NAME)).replace(tzinfo=None)
+    if not args.force and collector_is_polling(collector_status_path(), now):
+        print("The collector polled in the last two minutes. Stop it first (docker compose stop collector),"
+              " or pass --force.", file=sys.stderr)
+        return 2
     device_id, ip, port, password = device_settings(db_path(), args.device)
     print(f"Probing {device_id} at {ip}:{port} (read-only). Is the collector stopped?")
     return run(args.mode or list(MODES), connect=lambda: _connect(ip, port, password),

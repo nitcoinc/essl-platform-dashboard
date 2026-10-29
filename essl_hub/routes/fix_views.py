@@ -63,10 +63,11 @@ def _day_rows(employee: dict, day: date, day_start_hour: int) -> list[dict]:
     view shows for it, so a flip turns that into its opposite."""
     start, end = work_day_window(day, day_start_hour)
     rows = database.punches_for_employee_range(device_ids_of(employee), start, end)
-    scored = scored_directions(counted_punches(rows, database.device_windows()))
+    scored, inferred = scored_directions(counted_punches(rows, database.device_windows()))
     for row in rows:
         if row.get("trusted_direction") is None and row.get("correction") != CORRECTION_IGNORED:
             row["scored_direction"] = scored.get(row["event_timestamp"])
+            row["scored_inferred"] = row["event_timestamp"] in inferred
     return rows
 
 
@@ -98,8 +99,8 @@ def _swipes(rows: list[dict], day: date) -> list[dict]:
             "direction": _DIRECTION_LABELS.get(current_direction(row), "Swipe"),
             "chips": chips,
             "actionable": _actionable(row),
-            "basis": punch_basis(row, current_direction(row) or ""),
-            # A live-log exit the device history has not confirmed yet.
+            "basis": punch_basis(row, current_direction(row) or "", inferred=bool(row.get("scored_inferred"))),
+            # A live-log swipe with no direction the device history has not confirmed yet.
             "unconfirmed": not correction and is_unconfirmed_guess(row),
         })
     return swipes

@@ -268,12 +268,13 @@ def punch_from_row(row, windows: dict[str, int]) -> Punch:
     return Punch(row["event_timestamp"], row["trusted_direction"], window)
 
 
-def scored_directions(punches: list[Punch]) -> dict[datetime, Direction]:
+def scored_directions(punches: list[Punch]) -> tuple[dict[datetime, Direction], set[datetime]]:
     """Each counted swipe's direction as the day scores it (KTD9): the stored
-    one, or the one inferred or alternated for a direction-less swipe. Quick
+    one, or the one inferred or alternated for a direction-less swipe; and
+    the swipes whose direction was filled in between their neighbours. Quick
     re-swipes that were not counted are absent."""
-    resolved, _, _, _ = _resolve_directions(sorted(punches, key=lambda p: p.timestamp))
-    return dict(resolved)
+    resolved, _, inferred, _ = _resolve_directions(sorted(punches, key=lambda p: p.timestamp))
+    return dict(resolved), set(inferred)
 
 
 def counted_punches(rows, windows: dict[str, int]) -> list[Punch]:

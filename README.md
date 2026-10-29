@@ -616,7 +616,7 @@ A missed swipe looks like a long break: someone forgets to swipe, or the Gachibo
 **The two emails.**
 
 - **Daytime ("out too long"):** checked every 5 minutes inside the alert hours (default 09:00-20:00). Sent when someone who came in today has been out 15 minutes past their limit, and it is still before their usual leaving time.
-- **Next morning:** after the morning email hour (default 09:00), about yesterday, when the day ends on an In with no Out, has an Out with no In, two Ins in a row, or an unclear gap. A day with a C3 direction still being guessed waits for the next history read.
+- **Next morning:** after the morning email hour (default 09:00), about yesterday, when the day ends on an In with no Out, has an Out with no In, two Ins in a row, or an unclear gap. A day with a C3 live-log swipe still waiting for its direction (in/out 15) waits for the next history read.
 
 At most one of each per person per work day, and never to someone who did not swipe that day. Both skip while the collector's data is stale (no poll for 10 minutes, punches still spooled, or a device that can't be reached). If one check would email more than 5 people, or 20% of those in, it looks like an outage, not missed swipes: those people are recorded as *held* and nobody is emailed. Emails show only times and the length of the out-stretch, never anyone's limit, and assume the reader missed a swipe.
 
@@ -683,15 +683,29 @@ If it stops reporting:
 
 The C3 sends big tables in chunks, which the bundled library cannot read, so the collector downloads them itself (`read_c3_table` in `essl_hub/collectors.py`, checked against the panel's CRC). With `ESSL_C3_MODE=auto` it pulls the full history (about 30,000 events, 80 seconds on the tested `AC Ver 18.1.2`) at start and every `ESSL_C3_HISTORY_HOURS`, and reads the live queue on the polls between. The history is the source of truth for direction: it records which reader took the swipe (outside reader = entry, inside = exit). The live queue's in/out byte does not follow the reader. The bundled library decodes only 0 (entry) and 3 (exit), and anything else, read as 15, came back for both arrivals and leavings at Gachibowli (2026-10-29). So a live swipe read as 15 carries no direction. The day page counts it from the swipes around it and says so, until the next history read fills the real byte. Upgrading to schema v11 clears the old "15 is an exit" guess on rows history had not filled yet. A failed history download is logged (`C3 history download for … failed after …`), shown on the device's card as "History download failing since …", and retried after `ESSL_C3_HISTORY_RETRY_MINUTES` (default 30) instead of on every poll; the card also shows when history was last read. Only access-granted swipes count, plus event 20 ("Too Short Punch Interval"): the door refused to reopen but the person was there, so it is stored as attendance noted *interval too short*. Other denied swipes, the exit button and door alarms are skipped. Set the door's **Punch Interval** to 1 second or less so real swipes are not denied (now possible from the Devices page, below). The panel allows one session at a time, so pause ZKAccess or other tools while the collector runs.
 
-**Directions.** The history table carries the real in/out byte (0 In, 1 Out). The live queue's library decodes byte 1 as "unknown" (15); on the tested panel only bytes 0 and 1 occur, so a live 15 on a granted or event-20 swipe is stored as Out. The next history read overwrites any live-read direction it disagrees with.
+**Directions.** The history table carries the real in/out byte (0 In, 1 Out), and the next history read overwrites any live-read direction it disagrees with. A live 15 is stored with no direction (see above); before schema v11 it was stored as Out.
 
 **Door settings (Devices page).** Each C3 card shows the panel's door parameters and when they were read. **Read from device** asks the collector to read them on its next poll. An admin can change a closed whitelist: per door *Punch interval* (`DoorNIntertime`, 0–10 s), *Unlock time* (`DoorNDrivertime`), *Door-open alarm after* (`DoorNDetectortime`), *Lock when door closes* (`DoorNCloseAndLock`), *Door sensor* (`DoorNSensorType`), plus panel-wide *Anti-passback* (0–6) and *Interlock* (0–5). Changes go through a confirm page (old → new), are applied by the collector one key at a time and count as applied only when read back. A request the collector has not reached within 15 minutes expires unsent. The values from before the last write are kept and **Restore previous values** puts them back through the same confirm page. Every change is recorded with who made it. The dashboard never writes `ComPwd`, `IPAddress`, `NetMask`, `GATEIPAddress`, `RS232BaudRate`, `DeviceID` or `DoorNVerifyType`.
+
+**Upgrading to schema v11.** Stop the collector before the upgrade (`docker compose stop collector`, then `./deploy/install.sh`), so an old collector cannot store a new "15 is an exit" guess after the migration has run. To check the result, run this read-only before and after:
+
+```
+docker compose exec -T web python - <<'PY'
+import sqlite3
+c = sqlite3.connect("file:/data/essl.db?mode=ro", uri=True)
+print(c.execute("""SELECT raw_direction_byte, trusted_direction, COUNT(*) FROM punches
+    WHERE json_extract(raw_json,'$.source') = 'realtime_fallback' GROUP BY 1, 2 ORDER BY 1, 2""").fetchall())
+print(c.execute("SELECT value FROM settings WHERE key = 'c3_live15_cutover_at'").fetchone())
+PY
+```
+
+Afterwards the `(15, 'exit')` count drops to the rows history filled before 2026-10-12 or that were collected before the rule (normally none), `(15, None)` grows by the same amount, and the cutover time is set.
 
 **When the history download fails.** The card says "History download failing since …" and the collector log names the error. To find out why, run the read-only probe off-hours with someone on site. It replays the collector's download, then tests a fresh session, one long buffer read and pipelined reads, each on its own connection. It writes no setting and clears no log:
 
 ```
 docker compose stop collector
-docker compose run --rm --no-deps -T collector python scripts/c3_history_probe.py
+docker compose run --rm --no-deps -T -v "$PWD/scripts:/app/scripts" collector python scripts/c3_history_probe.py
 docker compose start collector
 ```
 
@@ -722,7 +736,7 @@ Each cycle (at most every `FRAPPE_SYNC_INTERVAL_SECONDS`) new punches are POSTed
 
 Two kinds of punch are held back:
 - C3 *door denied* rows are never sent; payroll cannot see the flag.
-- A C3 live-queue swipe read as in/out 15 has no direction (schema v11; earlier versions guessed it as an exit), and Frappe keeps the log type it is first sent. These rows wait until the next history read confirms the real byte, at most 24 h, then go without a log type. Before v11 such a row went as OUT, and at Gachibowli some of those were arrivals. `python scripts/c3_guessed_frappe_report.py > guessed-outs.csv` (read-only) lists the ones that may be wrong, with their Frappe check-in names, so HR can correct them in Frappe or with Fix punches.
+- A C3 live-queue swipe read as in/out 15 has no direction (schema v11; earlier versions guessed it as an exit), and Frappe keeps the log type it is first sent. These rows wait until the next history read confirms the real byte, at most 24 h, then go without a log type. Before v11 such a row went as OUT, and at Gachibowli some of those were arrivals. `docker compose run --rm --no-deps -T -v "$PWD/scripts:/app/scripts" web python scripts/c3_guessed_frappe_report.py > guessed-outs.csv` (read-only) lists the ones that may be wrong, with their Frappe check-in names, so HR can correct them in Frappe or with Fix punches. It rebuilds what was sent from the live decode kept in each row, so it still works after history fills the byte.
 
 After a run with nothing left pending, each `FRAPPE_SHIFT_TYPES` entry gets `last_sync_of_checkin` = oldest successful device poll (only moves forward), stopping just before any punch still held. Auto Attendance therefore does not mark absences for punches not yet collected or confirmed. Last run status is in `settings.frappe_last_sync` (JSON).
 

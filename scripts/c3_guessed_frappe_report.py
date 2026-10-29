@@ -1,28 +1,32 @@
 """Read-only report: C3 live-log punches Frappe HR got as OUT on a guess.
 
-Before schema v11 the hub read a C3 live-log in/out 15 as an exit. A row
-the history read had not confirmed within FRAPPE_GUESS_HOLD (24 h) went to
-Frappe with log type OUT, and Frappe keeps the type it is first sent. At
-Gachibowli 15 came back for arrivals too, so some of those OUTs are wrong.
-The hub never stored the log type it sent, so this rebuilds it:
+From 2026-10-12 to schema v11 the hub read a C3 live-log in/out 15 as an
+exit. Frappe keeps the log type it is first sent, and at Gachibowli 15 came
+back for arrivals too, so some of those OUTs are wrong. The hub never stored
+the log type it sent, so this rebuilds it from the live decode kept in
+raw_json (in_out_state 15 survives a later history fill) and the send time:
 
-- sent as OUT: still in/out 15, a swipe event (0-3, 20), synced before the
-  v11 cutover (settings.c3_live15_cutover_at).
+- sent as OUT: synced before the 24 h hold was deployed (--hold-since,
+  default the 2026-10-26 release), or after it while still unconfirmed.
 - possibly sent as OUT: history has since filled the byte, but the row was
-  synced at or after its swipe time plus the hold, so it likely went before
-  history confirmed it.
+  synced at or after its swipe time plus the hold, so it likely went first.
 
-A row is listed only when that OUT may be wrong: the direction now is entry,
-or still unconfirmed. Fix each in Frappe (the check-in name is given) or on
-the hub with Fix punches.
+Sends before the rule (2026-10-12 22:43) and after the v11 cutover
+(settings.c3_live15_cutover_at) carried no log type and are not listed.
+A row is listed only when that OUT may be wrong: the direction now is In,
+or still unconfirmed. Columns: employee, device_user_id, day, time,
+sent_log_type, direction_now, checkin_name. Fix each in Frappe (by its
+check-in name) or on the hub with Fix punches.
 
-    python scripts/c3_guessed_frappe_report.py > guessed-outs.csv
+    docker compose run --rm --no-deps -T -v "$PWD/scripts:/app/scripts" web \
+        python scripts/c3_guessed_frappe_report.py > guessed-outs.csv
 
 Uses ESSL_DB_PATH, opened read-only. Prints CSV to stdout and writes nothing.
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import sqlite3
@@ -39,6 +43,11 @@ from essl_hub.db import C3_UNDECODED_BYTE, FRAPPE_GUESS_HOLD  # noqa: E402
 # Swipe events the retired rule read as an exit on in/out 15.
 OLD_EXIT_EVENTS = {"0", "1", "2", "3", "20"}
 CUTOVER_KEY = "c3_live15_cutover_at"
+# 32c132c: the rule that read live 15 as an exit.
+GUESS_SINCE = datetime(2026, 10, 12, 22, 43, 17)
+# 4734bef (merged 8cdc0d5): unconfirmed rows wait FRAPPE_GUESS_HOLD before
+# the send. Before it, a guessed exit went out on the next sync.
+HOLD_SINCE = datetime(2026, 10, 26, 21, 36, 48)
 COLUMNS = ("employee", "device_user_id", "day", "time", "sent_log_type", "direction_now", "checkin_name")
 
 _SQL = """
@@ -59,13 +68,15 @@ ORDER BY p.event_timestamp, p.id
 def _when(value: object) -> datetime | None:
     if isinstance(value, datetime):
         return value
+    if value is None:
+        return None
     try:
         return datetime.fromisoformat(str(value))
     except ValueError:
         return None
 
 
-def guessed_outs(rows: Iterable[dict], cutover: datetime | None) -> list[dict]:
+def guessed_outs(rows: Iterable[dict], cutover: datetime | None, *, hold_since: datetime = HOLD_SINCE) -> list[dict]:
     """The rows whose Frappe OUT may be wrong, with the rebuilt log type."""
     out = []
     for row in rows:
@@ -75,16 +86,19 @@ def guessed_outs(rows: Iterable[dict], cutover: datetime | None) -> list[dict]:
         raw = row["raw_json"] if isinstance(row["raw_json"], dict) else json.loads(row["raw_json"] or "{}")
         if str(raw.get("event_type", "")).strip() not in OLD_EXIT_EVENTS:
             continue
-        before_cutover = cutover is None or synced < cutover
-        if not before_cutover:
-            continue  # after v11 an unconfirmed row goes without a log type
-        if row["raw_direction_byte"] == C3_UNDECODED_BYTE:
+        live_byte = raw.get("in_out_state", row["raw_direction_byte"])
+        if str(live_byte) != str(C3_UNDECODED_BYTE):
+            continue  # the live log decoded it; no guess was made
+        if synced < GUESS_SINCE or (cutover is not None and synced >= cutover):
+            continue  # sent without a log type
+        unconfirmed = row["raw_direction_byte"] == C3_UNDECODED_BYTE
+        if synced < hold_since or unconfirmed:
             sent = "OUT"
         elif synced >= at + FRAPPE_GUESS_HOLD:
             sent = "possibly OUT"
         else:
             continue  # history confirmed it before the send
-        if row["trusted_direction"] == "exit":
+        if not unconfirmed and row["trusted_direction"] == "exit":
             continue  # the OUT was right
         out.append({
             "employee": row["employee"],
@@ -92,30 +106,38 @@ def guessed_outs(rows: Iterable[dict], cutover: datetime | None) -> list[dict]:
             "day": at.date().isoformat(),
             "time": at.strftime("%H:%M:%S"),
             "sent_log_type": sent,
-            "direction_now": {"entry": "In"}.get(row["trusted_direction"], "unconfirmed"),
+            "direction_now": "unconfirmed" if unconfirmed else {"entry": "In"}.get(row["trusted_direction"], "unconfirmed"),
             "checkin_name": row["checkin_name"] or "",
         })
     return out
 
 
-def report(path: str, stream: IO[str]) -> int:
+def report(path: str, stream: IO[str], *, hold_since: datetime = HOLD_SINCE) -> int:
     connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
     try:
-        found = connection.execute("SELECT value FROM settings WHERE key = ?", (CUTOVER_KEY,)).fetchone()
-        cutover = _when(found["value"]) if found else None
+        settings = {r["key"]: r["value"] for r in connection.execute(
+            "SELECT key, value FROM settings WHERE key IN (?, 'schema_version')", (CUTOVER_KEY,)).fetchall()}
         rows = [dict(r) for r in connection.execute(_SQL, (C3_PROTOCOL,)).fetchall()]
     finally:
         connection.close()
-    listed = guessed_outs(rows, cutover)
+    cutover = _when(settings.get(CUTOVER_KEY))
+    if cutover is None and int(settings.get("schema_version") or 0) >= 11:
+        listed = []  # v11 ran on a file with no punches: nothing was ever guessed
+    else:
+        listed = guessed_outs(rows, cutover, hold_since=hold_since)
     writer = csv.DictWriter(stream, fieldnames=COLUMNS)
     writer.writeheader()
     writer.writerows(listed)
     return len(listed)
 
 
-def main() -> int:
-    count = report(db_path(), sys.stdout)
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--hold-since", type=datetime.fromisoformat, default=HOLD_SINCE, metavar="WHEN",
+                        help="when the 24 h hold reached production (default %(default)s, the release)")
+    args = parser.parse_args(argv)
+    count = report(db_path(), sys.stdout, hold_since=args.hold_since)
     print(f"{count} punch(es) to check in Frappe", file=sys.stderr)
     return 0
 

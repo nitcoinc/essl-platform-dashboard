@@ -6772,13 +6772,13 @@ class FixReviewTest(unittest.TestCase):
 
     def test_the_fix_form_says_why_each_punch_counts_and_warns_on_an_unconfirmed_guess(self) -> None:
         self.database.insert_punches([{
-            **_punch_row("g-1", datetime(2026, 10, 26, 18, 0), "exit", uid="118"),
+            **_punch_row("g-1", datetime(2026, 10, 26, 18, 0), None, uid="118"),
             "raw_direction_byte": 15, "door": "1", "source": "realtime_fallback"}])
         self._sign_in(self.admin)
         page = self.client.get(self._url()).text
         self.assertIn("Device said In", page)
         self.assertEqual(page.count("Not confirmed yet"), 1)
-        self.assertIn("Guessed Out from the live log", page)
+        self.assertIn("The live log gave no direction; counted as In", page)
 
     def test_validation_refuses_without_writing(self) -> None:
         self._sign_in(self.admin)

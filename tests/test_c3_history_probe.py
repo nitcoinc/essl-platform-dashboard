@@ -191,6 +191,84 @@ class RunTest(unittest.TestCase):
         self.assertIn("  the panel refused or reset; stopping here", lines)
 
 
+class EdgeTest(unittest.TestCase):
+    def test_a_table_that_fits_one_reply_needs_no_buffer_reads(self) -> None:
+        class _OneReply(_Panel):
+            def _send(self, command, data):
+                self.sent.append((command, bytes(data)))
+                self.replies.append(_frame(0xC8, self.buffer))
+
+        for check in (lambda p: probe.download(p, connected_at=0.0, say=lambda _: None),
+                      lambda p: probe.read_length(p, 1000), lambda p: probe.pipeline(p, 3)):
+            panel = _OneReply(_buffer(2))
+            self.assertTrue(check(panel)["ok"])
+            self.assertEqual([c for c, _ in panel.sent], [0x08])
+
+    def test_a_failed_connect_ends_the_run(self) -> None:
+        def connect():
+            raise ConnectionError("rejected")
+
+        lines = []
+        self.assertEqual(probe.run(["measure"], connect=connect, read_bytes=1, depth=1, say=lines.append,
+                                   pause=lambda _: None), 1)
+        self.assertIn("  could not connect: ConnectionError: rejected", lines)
+
+    def test_a_reset_before_the_download_is_reported_not_raised(self) -> None:
+        class _ParamsReset(_Panel):
+            def get_device_param(self, names):
+                raise ConnectionResetError(104, "Connection reset by peer")
+
+        panels = []
+
+        def connect():
+            panels.append(_ParamsReset(_buffer(30), chunk=10) if not panels else _Panel(_buffer(30), chunk=10))
+            return panels[-1]
+
+        lines = []
+        code = probe.run(["measure", "fresh-session"], connect=connect, read_bytes=1, depth=1,
+                         say=lines.append, pause=lambda _: None)
+        self.assertEqual(code, 1)
+        self.assertTrue(any("ConnectionResetError" in line for line in lines))
+        self.assertIn("\n== fresh-session ==", lines)  # carried on
+        self.assertTrue(all(p.disconnected for p in panels))
+
+
+class CollectorGuardTest(unittest.TestCase):
+    NOW = probe.datetime(2026, 10, 30, 21, 0)
+
+    def _status(self, payload) -> str:
+        import json
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "collector-status.json")
+        if payload is not None:
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+        return path
+
+    def test_a_recent_poll_means_the_collector_is_running(self) -> None:
+        recent = self._status({"last_poll": "2026-10-30 20:59:30"})
+        old = self._status({"last_poll": "2026-10-30 20:50:00"})
+        self.assertTrue(probe.collector_is_polling(recent, self.NOW))
+        self.assertFalse(probe.collector_is_polling(old, self.NOW))
+        self.assertFalse(probe.collector_is_polling(self._status(None), self.NOW))
+        self.assertFalse(probe.collector_is_polling(self._status({"last_poll": None}), self.NOW))
+
+    def test_main_refuses_while_the_collector_polls_unless_forced(self) -> None:
+        with unittest.mock.patch.object(probe, "collector_is_polling", return_value=True), \
+                unittest.mock.patch.object(probe, "device_settings") as settings, \
+                unittest.mock.patch("sys.stderr"):
+            self.assertEqual(probe.main([]), 2)
+        settings.assert_not_called()
+        with unittest.mock.patch.object(probe, "collector_is_polling", return_value=True), \
+                unittest.mock.patch.object(probe, "device_settings", return_value=("c3", "10.0.0.1", 4370, None)), \
+                unittest.mock.patch.object(probe, "run", return_value=0) as run, \
+                unittest.mock.patch("builtins.print"):
+            self.assertEqual(probe.main(["--force"]), 0)
+        run.assert_called_once()
+
+
 class DeviceSettingsTest(unittest.TestCase):
     def test_reads_the_c3_row_read_only_and_falls_back_to_the_env_password(self) -> None:
         tmp = tempfile.TemporaryDirectory()

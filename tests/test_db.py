@@ -1296,22 +1296,32 @@ class DatabaseTest(unittest.TestCase):
         self.database.migrate_schema()
 
     def test_v11_drops_stored_live_15_guesses_only(self) -> None:
-        live = {"pin": "118", "source": "realtime_fallback"}
+        live = {"pin": "118", "event_type": 0, "source": "realtime_fallback"}
         self.database.insert_punches([
             self._punch(fingerprint="live-15", raw_direction_byte=15, trusted_direction="exit", raw=live),
+            self._punch(fingerprint="live-15-ev20", raw_direction_byte=15, trusted_direction="exit",
+                        raw={**live, "event_type": 20}),
             self._punch(fingerprint="live-filled", raw_direction_byte=1, trusted_direction="exit", raw=live),
             self._punch(fingerprint="live-0", raw_direction_byte=0, trusted_direction="entry", raw=live),
+            # Filled by history before 2026-10-26, when a fill kept byte 15.
+            self._punch(fingerprint="old-fill-entry", raw_direction_byte=15, trusted_direction="entry", raw=live),
+            self._punch(fingerprint="old-fill-exit", raw_direction_byte=15, trusted_direction="exit", raw=live),
+            self._punch(fingerprint="denied", raw_direction_byte=15, trusted_direction="exit",
+                        raw={**live, "event_type": 24}),
             self._punch(fingerprint="history-1", raw_direction_byte=1, trusted_direction="exit"),
             self._punch(fingerprint="x990", device_id="uppal-x990", site="Uppal",
                         raw_direction_byte=15, trusted_direction="exit", raw=live),
         ])
+        with self.database.transaction() as connection:  # collected before the guess rule existed
+            connection.execute("UPDATE punches SET collected_at='2026-10-10 09:00:00' WHERE fingerprint='old-fill-exit'")
         self._rerun_from(10)
         cutover = self.database.setting("c3_live15_cutover_at")
         self._rerun_from(10)  # a re-run changes nothing and keeps the first cutover
         with self.database.connect() as connection:
             rows = {r["fingerprint"]: r["trusted_direction"] for r in connection.execute(
                 "SELECT fingerprint, trusted_direction FROM punches").fetchall()}
-        self.assertEqual(rows, {"live-15": None, "live-filled": "exit", "live-0": "entry",
+        self.assertEqual(rows, {"live-15": None, "live-15-ev20": None, "live-filled": "exit", "live-0": "entry",
+                                "old-fill-entry": "entry", "old-fill-exit": "exit", "denied": "exit",
                                 "history-1": "exit", "x990": "exit"})
         self.assertIsNotNone(cutover)
         self.assertEqual(self.database.setting("c3_live15_cutover_at"), cutover)
@@ -1322,7 +1332,7 @@ class DatabaseTest(unittest.TestCase):
         self.assertIsNone(self.database.setting("c3_live15_cutover_at"))
 
     def test_history_fills_a_live_row_v11_cleared(self) -> None:
-        live = {"pin": "118", "source": "realtime_fallback"}
+        live = {"pin": "118", "event_type": 0, "source": "realtime_fallback"}
         self.database.insert_punches([
             self._punch(raw_direction_byte=15, trusted_direction="exit", raw=live)])
         self._rerun_from(10)

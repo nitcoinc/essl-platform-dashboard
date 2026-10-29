@@ -114,7 +114,7 @@ class LiveDecisionTest(unittest.TestCase):
             {"event_timestamp": _t(9), "trusted_direction": "entry", "device_id": "c3"},
             # Realtime in/out 15 on a granted swipe (event 0) carries no
             # direction (v11); after an In the day alternates it to Out.
-            {"event_timestamp": _t(13), "trusted_direction": _c3_trusted_direction(15, 0),
+            {"event_timestamp": _t(13), "trusted_direction": _c3_trusted_direction(15),
              "raw_direction_byte": C3_UNDECODED_BYTE, "device_id": "c3"},
         ]
         punches = [punch_from_row(row, {}) for row in rows]
@@ -123,7 +123,7 @@ class LiveDecisionTest(unittest.TestCase):
 
     def test_door_denied_row_is_never_out(self) -> None:
         now = _t(14, 45)
-        denied = {"event_timestamp": _t(13), "trusted_direction": _c3_trusted_direction(15, 24),
+        denied = {"event_timestamp": _t(13), "trusted_direction": _c3_trusted_direction(15),
                   "raw_direction_byte": C3_UNDECODED_BYTE, "device_id": "c3",
                   "raw_state": "door denied: anti-passback"}
         self.assertIsNone(denied["trusted_direction"])

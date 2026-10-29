@@ -129,22 +129,32 @@ def _c3_history_ok(device_id: str, seconds: float) -> None:
                                      "failing_since": None, "last_error": None, "next_try_at": None}
 
 
-def _c3_history_failed(device_id: str, seconds: float, exc: BaseException) -> None:
-    """R4: a failed download is logged and recorded, never silent."""
-    minutes = max(1.0, float(os.getenv("ESSL_C3_HISTORY_RETRY_MINUTES", "30")))
+def _retry_minutes() -> float:
+    try:
+        return max(1.0, float(os.getenv("ESSL_C3_HISTORY_RETRY_MINUTES", "30")))
+    except ValueError:
+        return 30.0  # a bad value must not stop the live-log fallback
+
+
+def _c3_history_failed(device_id: str, seconds: float, exc: BaseException, *, backoff: bool = True) -> None:
+    """R4: a failed download is logged and recorded, never silent. Auto mode
+    backs off; history-only mode raises and retries on the next poll."""
+    minutes = _retry_minutes()
     error = f"{type(exc).__name__}: {_friendly_error(exc)}"
     _logger.warning(
-        "C3 history download for %s failed after %.1fs: %s; reading the live log, next try in %.0f min",
-        device_id, seconds, error, minutes,
+        "C3 history download for %s failed after %.1fs: %s%s",
+        device_id, seconds, error,
+        f"; reading the live log, next try in {minutes:.0f} min" if backoff else "",
     )
-    _C3_HISTORY_RETRY_AT[device_id] = time.monotonic() + minutes * 60
+    if backoff:
+        _C3_HISTORY_RETRY_AT[device_id] = time.monotonic() + minutes * 60
     previous = _C3_HISTORY_STATUS.get(device_id) or {}
     _C3_HISTORY_STATUS[device_id] = {
         "last_ok_at": previous.get("last_ok_at"),
         "seconds": round(seconds, 1),
         "failing_since": previous.get("failing_since") or _ist_text(),
         "last_error": error,
-        "next_try_at": _ist_text(minutes * 60),
+        "next_try_at": _ist_text(minutes * 60) if backoff else None,
     }
 
 
@@ -295,6 +305,9 @@ def read_c3_table(panel: Any, table_name: str) -> list[dict[str, Any]]:
     return finish_c3_table(start, bytes(buffer), table_name)
 
 
+_RT_RAW_WARNED = False
+
+
 def read_c3_rt_log(panel: Any) -> list[tuple[Any, int | None]]:
     """``C3.get_rt_log`` that also keeps each record's in/out value as the
     panel sent it (byte 11 of a binary record, ``inoutstatus`` of a key/value
@@ -304,6 +317,10 @@ def read_c3_rt_log(panel: Any) -> list[tuple[Any, int | None]]:
     from c3 import consts, rtlog
 
     if not all(hasattr(panel, name) for name in ("_send_receive", "_rtlog_command", "_update_inout_status")):
+        global _RT_RAW_WARNED
+        if not _RT_RAW_WARNED:
+            _RT_RAW_WARNED = True
+            _logger.warning("C3 library internals changed; live-log rows are stored without the panel's raw in/out value")
         return [(record, None) for record in panel.get_rt_log()]
     if not panel.is_connected():
         raise ConnectionError("No connection to C3 panel.")
@@ -434,7 +451,7 @@ def collect_c3(device: DeviceConfig) -> CollectionResult:
                 history_error = None
                 _c3_history_ok(device.id, time.monotonic() - started)
             except Exception as exc:
-                _c3_history_failed(device.id, time.monotonic() - started, exc)
+                _c3_history_failed(device.id, time.monotonic() - started, exc, backoff=mode != "history")
                 if mode == "history":
                     raise
                 transactions = []
@@ -499,13 +516,8 @@ def collect_c3(device: DeviceConfig) -> CollectionResult:
             )
         batch_size = max(1, min(int(os.getenv("ESSL_C3_RTLOG_BATCH", "250")), 2000))
         for _ in range(batch_size):
-            in_out_raw = {}
-            records = []
-            for record, raw_in_out in read_c3_rt_log(panel):
-                records.append(record)
-                in_out_raw[id(record)] = raw_in_out
             realtime_events = [
-                record for record in records
+                (record, raw_in_out) for record, raw_in_out in read_c3_rt_log(panel)
                 if record.is_event()
                 and _c3_keep(
                     str(int(record.event_type)),
@@ -517,7 +529,7 @@ def collect_c3(device: DeviceConfig) -> CollectionResult:
             ]
             if not realtime_events:
                 break
-            for record in realtime_events:
+            for record, raw_in_out in realtime_events:
                 pin = str(record.pin or "")
                 card = str(record.card_no or "")
                 raw = {
@@ -530,10 +542,10 @@ def collect_c3(device: DeviceConfig) -> CollectionResult:
                     "timestamp": _format_datetime(record.time_second),
                     "source": "realtime_fallback",
                 }
-                if in_out_raw.get(id(record)) is not None:
+                if raw_in_out is not None:
                     # R3: what the panel sent, before the library's decode
                     # turns anything but 0/2/3 into 15. Evidence only.
-                    raw["in_out_raw"] = in_out_raw[id(record)]
+                    raw["in_out_raw"] = raw_in_out
                 events.append(
                     _normalized_event(
                         device,
@@ -555,9 +567,7 @@ def collect_c3(device: DeviceConfig) -> CollectionResult:
                         ),
                         door=str(record.port_nr),
                         raw_direction_byte=int(record.in_out_state),
-                        trusted_direction=_c3_trusted_direction(
-                            int(record.in_out_state), int(record.event_type)
-                        ),
+                        trusted_direction=_c3_trusted_direction(int(record.in_out_state)),
                         identity=c3_identity(
                             pin, card, raw["timestamp"], str(record.port_nr), str(int(record.event_type))
                         ),
@@ -813,13 +823,13 @@ def _normalized_event(
     }
 
 
-def _c3_trusted_direction(in_out_state: int, event_type: int | None = None) -> str | None:
+def _c3_trusted_direction(in_out_state: int) -> str | None:
     """KTD4 (revised 2026-10-29): only bytes the library decodes as a direction
     count, 0 entry and 3 exit. Anything else arrives as its fallback 15, which
     the live log returns for arrivals and leavings alike at Gachibowli (one
     reader outside, one inside), so 15 is unknown: hours.py infers it from the
     swipes around it until a history read fills the real byte
-    (db.fill_punch_directions). ``event_type`` is kept for the call sites."""
+    (db.fill_punch_directions)."""
     if in_out_state == 0:
         return "entry"
     if in_out_state == 3:
