@@ -190,11 +190,16 @@
     <p class="device-warning" role="status">{{ ui.icon('triangle-alert') }}<span>Last checked {{ row.checked_ago }}. The collector writes at least every {{ stale_minutes // 2 }} minutes, so it may have stopped. Check the collector container on the office host.</span></p>
     {% endif %}
     {% if device.last_error %}<p class="inline-error">{{ ui.icon('circle-alert') }}<span>{{ device.last_error }}</span></p>{% endif %}
+    {% set history = row.history %}
+    {% if history and history.failing_since %}
+    <p class="device-warning" role="status">{{ ui.icon('triangle-alert') }}<span>History download failing since {{ when(history.failing_since) }}{% if history.last_error %}: {{ history.last_error }}{% endif %}. Live-log directions stay unconfirmed until it works.{% if history.next_try_at %} Next try {{ when(history.next_try_at) }}.{% endif %}</span></p>
+    {% endif %}
 
     <dl class="device-facts">
       <div><dt>Address</dt><dd class="num">{{ device.ip }}:{{ device.port }}</dd></div>
       <div><dt>Last checked</dt><dd>{{ when(device.last_attempt) }}{% if row.checked_ago %} <span class="muted">({{ row.checked_ago }})</span>{% endif %}</dd></div>
       <div><dt>Last success</dt><dd>{{ when(device.last_success) }}</dd></div>
+      {% if history %}<div><dt>History last read</dt><dd>{{ when(history.last_ok_at) }}</dd></div>{% endif %}
       <div><dt>Punches stored</dt><dd class="num">{{ '{:,}'.format(device.stored_punches or 0) }}</dd></div>
       {% if device.retired_at %}<div><dt>Retired</dt><dd>{{ when(device.retired_at) }}</dd></div>{% endif %}
       {% if device.connection_updated_at %}<div><dt>Connection changed</dt><dd>{{ when(device.connection_updated_at) }}</dd></div>{% endif %}

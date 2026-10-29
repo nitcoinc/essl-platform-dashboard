@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import socket
@@ -10,8 +11,9 @@ import zlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
-from .config import C3_PROTOCOL, X990_PROTOCOL, DeviceConfig, numeric_comm_password, password_for
+from .config import C3_PROTOCOL, TIMEZONE_NAME, X990_PROTOCOL, DeviceConfig, numeric_comm_password, password_for
 from .door_params import (
     DOOR_REQUEST_TTL,
     READ_BATCH,
@@ -22,6 +24,8 @@ from .door_params import (
     validate_request,
 )
 from .hashing import sha256_hex
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -94,14 +98,60 @@ C3_ATTENDANCE_EVENT_TYPES = C3_GRANTED_EVENT_TYPES | {C3_INTERVAL_TOO_SHORT_EVEN
 C3_DOOR_DENIED_NOTES = {"24": "door denied: anti-passback", "25": "door denied: interlock"}
 
 _C3_HISTORY_AT: dict[str, float] = {}
+# R4: after a failed download the next try waits ESSL_C3_HISTORY_RETRY_MINUTES
+# instead of tying the panel up for most of every poll. Monotonic for the
+# schedule; _C3_HISTORY_STATUS holds wall-clock IST text for the status file.
+_C3_HISTORY_RETRY_AT: dict[str, float] = {}
+_C3_HISTORY_STATUS: dict[str, dict[str, Any]] = {}
 
 
 def _c3_history_due(device_id: str) -> bool:
     """Auto mode pulls the full history at start and then every
-    ESSL_C3_HISTORY_HOURS (default 6); the realtime log covers the gaps."""
+    ESSL_C3_HISTORY_HOURS (default 6); the realtime log covers the gaps.
+    After a failure it retries once the backoff has passed."""
+    retry = _C3_HISTORY_RETRY_AT.get(device_id)
+    if retry is not None:
+        return time.monotonic() >= retry
     hours = float(os.getenv("ESSL_C3_HISTORY_HOURS", "6"))
     last = _C3_HISTORY_AT.get(device_id)
     return last is None or time.monotonic() - last >= hours * 3600
+
+
+def _ist_text(offset_seconds: float = 0) -> str:
+    now = datetime.now(ZoneInfo(TIMEZONE_NAME)).replace(tzinfo=None) + timedelta(seconds=offset_seconds)
+    return now.isoformat(sep=" ", timespec="seconds")
+
+
+def _c3_history_ok(device_id: str, seconds: float) -> None:
+    _C3_HISTORY_AT[device_id] = time.monotonic()
+    _C3_HISTORY_RETRY_AT.pop(device_id, None)
+    _C3_HISTORY_STATUS[device_id] = {"last_ok_at": _ist_text(), "seconds": round(seconds, 1),
+                                     "failing_since": None, "last_error": None, "next_try_at": None}
+
+
+def _c3_history_failed(device_id: str, seconds: float, exc: BaseException) -> None:
+    """R4: a failed download is logged and recorded, never silent."""
+    minutes = max(1.0, float(os.getenv("ESSL_C3_HISTORY_RETRY_MINUTES", "30")))
+    error = f"{type(exc).__name__}: {_friendly_error(exc)}"
+    _logger.warning(
+        "C3 history download for %s failed after %.1fs: %s; reading the live log, next try in %.0f min",
+        device_id, seconds, error, minutes,
+    )
+    _C3_HISTORY_RETRY_AT[device_id] = time.monotonic() + minutes * 60
+    previous = _C3_HISTORY_STATUS.get(device_id) or {}
+    _C3_HISTORY_STATUS[device_id] = {
+        "last_ok_at": previous.get("last_ok_at"),
+        "seconds": round(seconds, 1),
+        "failing_since": previous.get("failing_since") or _ist_text(),
+        "last_error": error,
+        "next_try_at": _ist_text(minutes * 60),
+    }
+
+
+def c3_history_status() -> dict[str, dict[str, Any]]:
+    """Per C3 device: when its history download last worked, and since when
+    it has been failing, for collector-status.json and the Devices page."""
+    return {device_id: dict(status) for device_id, status in _C3_HISTORY_STATUS.items()}
 
 
 def _c3_is_punch(event_type: str) -> bool:
@@ -339,11 +389,13 @@ def collect_c3(device: DeviceConfig) -> CollectionResult:
             transactions = []
             history_error = ConnectionError("history not due; reading the realtime log")
         else:
+            started = time.monotonic()
             try:
                 transactions = read_c3_table(panel, "transaction")
                 history_error = None
-                _C3_HISTORY_AT[device.id] = time.monotonic()
+                _c3_history_ok(device.id, time.monotonic() - started)
             except Exception as exc:
+                _c3_history_failed(device.id, time.monotonic() - started, exc)
                 if mode == "history":
                     raise
                 transactions = []

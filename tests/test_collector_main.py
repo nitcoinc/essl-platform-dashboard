@@ -1105,6 +1105,7 @@ class SpoolCycleTest(unittest.TestCase):
                 "spool_oldest_at",
                 "dead_count",
                 "offline",
+                "c3_history",
             },
         )
         self.assertEqual([n for n in os.listdir(self.tmp) if n.endswith(".tmp")], [])

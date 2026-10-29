@@ -37,6 +37,7 @@ from .common import (
     _login_required,
     _now_naive,
     _parse_ts,
+    _read_json,
     _require_csrf,
     _role_required,
     _target_minutes,
@@ -142,6 +143,7 @@ def _device_rows() -> list[dict]:
     now = _now_naive()
     stale_after = timedelta(seconds=2 * config.heartbeat_write_seconds())
     interval = config.collector_interval_seconds()
+    histories = _c3_history_views()
     rows = []
     for device in database.devices():
         checked = device.get("last_attempt")
@@ -159,9 +161,29 @@ def _device_rows() -> list[dict]:
                 and (checked is None or checked < updated),
                 # Retired devices are not polled, so they get no door section.
                 "door": None if retired else _door_view(device, now, interval),
+                "history": None if retired else histories.get(device["id"]),
             }
         )
     return rows
+
+
+def _c3_history_views() -> dict[str, dict]:
+    """R4: each C3 device's history download as the collector last reported
+    it (collector-status.json): when it last worked, or since when it fails.
+    A missing or older status file shows nothing."""
+    status = _read_json(config.collector_status_path())
+    entries = status.get("c3_history") if isinstance(status, dict) else None
+    views = {}
+    for device_id, entry in (entries or {}).items() if isinstance(entries, dict) else ():
+        if not isinstance(entry, dict):
+            continue
+        views[device_id] = {
+            "last_ok_at": _parse_ts(entry.get("last_ok_at")),
+            "failing_since": _parse_ts(entry.get("failing_since")),
+            "next_try_at": _parse_ts(entry.get("next_try_at")),
+            "last_error": str(entry.get("last_error") or "")[:300],
+        }
+    return views
 
 
 def _strict_int(raw: object) -> int | None:

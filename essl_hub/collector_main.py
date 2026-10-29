@@ -14,6 +14,7 @@ from .collectors import (
     CollectionResult,
     DoorStep,
     c3_door_step,
+    c3_history_status,
     collect,
 )
 from .config import (
@@ -388,6 +389,9 @@ def collector_status(database: Database, spool: Spool, state: PollState) -> dict
         "spool_oldest_at": spool.oldest_at(),
         "dead_count": spool.dead_count(),
         "offline": not state.ready,
+        # R4: per C3 device, when its history download last worked or since
+        # when it has been failing (the Devices page shows it).
+        "c3_history": c3_history_status(),
     }
 
 

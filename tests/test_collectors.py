@@ -324,6 +324,78 @@ class C3RawInOutTest(unittest.TestCase):
         self.assertNotIn("in_out_raw", event["raw"])
 
 
+class C3HistoryStatusTest(unittest.TestCase):
+    """R4: a failed history download is logged, recorded and backed off."""
+
+    def setUp(self) -> None:
+        from essl_hub import collectors
+
+        self.collectors = collectors
+        self.device = next(d for d in DEVICES if d.protocol == "c3-pullsdk")
+        for table in (collectors._C3_HISTORY_AT, collectors._C3_HISTORY_RETRY_AT, collectors._C3_HISTORY_STATUS):
+            table.pop(self.device.id, None)
+            self.addCleanup(table.pop, self.device.id, None)
+
+    def _poll(self, table, mode="auto"):
+        from c3.utils import C3DateTime
+
+        _FakeC3.rt_batches = [[_RtRecord(0, "173", 0, C3DateTime.from_value(800000000))]]
+        reader = patch.object(self.collectors, "read_c3_table",
+                              **({"side_effect": table} if isinstance(table, BaseException) else {"return_value": table}))
+        with patch("c3.C3", _FakeC3), reader, patch.dict(os.environ, {"ESSL_C3_MODE": mode}):
+            return self.collectors.collect_c3(self.device)
+
+    def _status(self):
+        return self.collectors.c3_history_status()[self.device.id]
+
+    def test_a_good_read_records_when_and_waits_for_the_schedule(self) -> None:
+        result = self._poll([])
+        self.assertEqual(result.transport, "TCP history")
+        status = self._status()
+        self.assertIsNotNone(status["last_ok_at"])
+        self.assertIsNone(status["failing_since"])
+        self.assertFalse(self.collectors._c3_history_due(self.device.id))
+
+    def test_a_failed_read_is_logged_falls_back_and_backs_off(self) -> None:
+        with self.assertLogs("essl_hub.collectors", level="WARNING") as logs:
+            result = self._poll(ConnectionResetError(104, "Connection reset by peer"))
+        self.assertEqual(result.transport, "TCP realtime")
+        self.assertEqual(len(result.events), 1)
+        self.assertIn("C3 history download for gachibowli-c3-400 failed after", logs.output[0])
+        self.assertIn("ConnectionResetError", logs.output[0])
+        status = self._status()
+        self.assertIsNotNone(status["failing_since"])
+        self.assertIn("Connection reset by peer", status["last_error"])
+        self.assertIsNotNone(status["next_try_at"])
+        # Within the backoff the next poll reads only the live log.
+        self.assertFalse(self.collectors._c3_history_due(self.device.id))
+        with patch.object(self.collectors, "read_c3_table") as reader, patch("c3.C3", _FakeC3), \
+                patch.dict(os.environ, {"ESSL_C3_MODE": "auto"}):
+            self.collectors.collect_c3(self.device)
+        reader.assert_not_called()
+
+    def test_a_second_failure_keeps_failing_since_and_a_success_clears_it(self) -> None:
+        with self.assertLogs("essl_hub.collectors", level="WARNING"):
+            self._poll(ConnectionResetError("reset"))
+        first = self._status()["failing_since"]
+        self.collectors._C3_HISTORY_RETRY_AT[self.device.id] = self.collectors.time.monotonic() - 1
+        self.assertTrue(self.collectors._c3_history_due(self.device.id))
+        with self.assertLogs("essl_hub.collectors", level="WARNING"):
+            self._poll(TimeoutError("timed out"))
+        self.assertEqual(self._status()["failing_since"], first)
+        self.collectors._C3_HISTORY_RETRY_AT[self.device.id] = self.collectors.time.monotonic() - 1
+        self._poll([])
+        status = self._status()
+        self.assertIsNone(status["failing_since"])
+        self.assertIsNone(status["last_error"])
+        self.assertNotIn(self.device.id, self.collectors._C3_HISTORY_RETRY_AT)
+
+    def test_history_mode_still_raises_but_records_the_failure(self) -> None:
+        with self.assertLogs("essl_hub.collectors", level="WARNING"), self.assertRaises(ConnectionError):
+            self._poll(ConnectionResetError("reset"), mode="history")
+        self.assertIsNotNone(self._status()["failing_since"])
+
+
 class C3IntervalTooShortTest(unittest.TestCase):
     """U12/KTD11: event 20 is stored as a flagged swipe."""
 

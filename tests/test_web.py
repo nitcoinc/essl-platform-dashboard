@@ -2556,6 +2556,49 @@ class AdminDeviceEditTest(unittest.TestCase):
         self.assertIn("192.168.5.5", page.text)
         self.assertIn("Saved", page.text)
 
+    def _collector_status(self, payload: dict | None) -> None:
+        import json
+        import tempfile
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "collector.json")
+        if payload is not None:
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+        patcher = patch.dict(os.environ, {"ESSL_COLLECTOR_STATUS_PATH": path})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_failing_c3_history_download_is_shown_on_its_card_only(self) -> None:
+        self._collector_status({"last_poll": "2026-10-29 19:30:10", "c3_history": {
+            "gachibowli-c3-400": {
+                "last_ok_at": "2026-10-21 19:05:00", "failing_since": "2026-10-29 18:00:00",
+                "last_error": "ConnectionResetError: [Errno 104] Connection reset by peer",
+                "next_try_at": "2026-10-29 19:59:00", "seconds": 57.5}}})
+        page = self.client.get("/devices").text
+        self.assertEqual(page.count("History download failing since"), 1)
+        self.assertIn("29 Oct, 18:00", page)
+        self.assertIn("Connection reset by peer", page)
+        self.assertIn("Live-log directions stay unconfirmed until it works.", page)
+        self.assertIn("Next try", page)
+        self.assertEqual(page.count("History last read"), 1)
+        self.assertIn("21 Oct, 19:05", page)
+
+    def test_a_working_history_shows_only_when_it_was_last_read(self) -> None:
+        self._collector_status({"c3_history": {"gachibowli-c3-400": {
+            "last_ok_at": "2026-10-29 19:00:00", "failing_since": None, "last_error": None,
+            "next_try_at": None}}})
+        page = self.client.get("/devices").text
+        self.assertNotIn("History download failing", page)
+        self.assertIn("History last read", page)
+
+    def test_no_status_file_adds_no_history_line(self) -> None:
+        self._collector_status(None)
+        page = self.client.get("/devices").text
+        self.assertNotIn("History last read", page)
+        self.assertNotIn("History download", page)
+
     def test_pending_until_a_newer_attempt_then_applied(self) -> None:
         self._post("uppal-x990", ip="192.168.1.201", port="4370", comm_password="")
         device = self.database.device_by_id("uppal-x990")
