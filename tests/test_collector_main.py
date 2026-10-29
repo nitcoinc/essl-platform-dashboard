@@ -1169,3 +1169,39 @@ class SpoolCycleTest(unittest.TestCase):
             count = connection.execute("SELECT COUNT(*) AS n FROM punches").fetchone()["n"]
         self.assertEqual(count, 2)
         self.assertEqual(self.spool.depth(), 0)
+
+
+class BacklogRepairTest(unittest.TestCase):
+    """U5/R6: the first good history read confirms every live-log row v11
+    left without a direction, on a real database, inserting nothing."""
+
+    def test_one_history_read_fills_a_week_of_live_rows(self) -> None:
+        import tempfile
+
+        from essl_hub.db import Database
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        database = Database(os.path.join(tmp.name, "essl.db"))
+        self.addCleanup(database.close)
+        database.initialize(DEVICES)
+        c3 = DEVICES[1]
+        start = datetime(2026, 10, 22, 9, 0)
+        live, history = [], []
+        for n in range(20):
+            at = start + timedelta(days=n % 7, hours=n // 7)
+            base = {"fingerprint": f"fp-{n}", "device_id": c3.id, "site": c3.site, "device_user_id": "NP0009",
+                    "event_timestamp": at, "door": "1"}
+            live.append({**base, "raw_direction_byte": 15, "trusted_direction": None,
+                         "raw": {"pin": "9", "source": "realtime_fallback"}})
+            byte = n % 2
+            history.append({**base, "raw_direction_byte": byte,
+                            "trusted_direction": "entry" if byte == 0 else "exit", "raw": {"Pin": 9}})
+        database.insert_punches(live)
+        collect_once(database, c3, collector=lambda d: CollectionResult(history, "TCP history", "SN", "FW"))
+        with database.connect() as connection:
+            rows = connection.execute(
+                "SELECT fingerprint, trusted_direction, raw_direction_byte FROM punches ORDER BY id").fetchall()
+        self.assertEqual(len(rows), 20)  # nothing inserted
+        self.assertEqual({r["fingerprint"]: (r["trusted_direction"], r["raw_direction_byte"]) for r in rows},
+                         {h["fingerprint"]: (h["trusted_direction"], h["raw_direction_byte"]) for h in history})

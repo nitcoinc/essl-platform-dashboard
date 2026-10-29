@@ -722,7 +722,7 @@ Each cycle (at most every `FRAPPE_SYNC_INTERVAL_SECONDS`) new punches are POSTed
 
 Two kinds of punch are held back:
 - C3 *door denied* rows are never sent; payroll cannot see the flag.
-- A C3 live-queue swipe read as in/out 15 has no direction (schema v11; earlier versions guessed it as an exit), and Frappe keeps the log type it is first sent. These rows wait until the next history read confirms the real byte, at most 24 h, then go without a log type.
+- A C3 live-queue swipe read as in/out 15 has no direction (schema v11; earlier versions guessed it as an exit), and Frappe keeps the log type it is first sent. These rows wait until the next history read confirms the real byte, at most 24 h, then go without a log type. Before v11 such a row went as OUT, and at Gachibowli some of those were arrivals. `python scripts/c3_guessed_frappe_report.py > guessed-outs.csv` (read-only) lists the ones that may be wrong, with their Frappe check-in names, so HR can correct them in Frappe or with Fix punches.
 
 After a run with nothing left pending, each `FRAPPE_SHIFT_TYPES` entry gets `last_sync_of_checkin` = oldest successful device poll (only moves forward), stopping just before any punch still held. Auto Attendance therefore does not mark absences for punches not yet collected or confirmed. Last run status is in `settings.frappe_last_sync` (JSON).
 
