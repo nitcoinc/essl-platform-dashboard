@@ -351,6 +351,53 @@ class CorrectionOverlayTest(unittest.TestCase):
         real = self._score(self._rows((_t(9), "entry"), (_t(13), "exit"), (_t(13, 0, 30), "exit")))
         self.assertEqual(len(real.collapsed), 1)
 
+    def test_corrected_rows_carry_who_fixed_them_and_why(self) -> None:
+        rows = self._rows((_t(9), "entry"), (_t(13), "exit"), (_t(18), "exit"), device="c3")
+        by_hari = {**self._fix("set_direction", cid=4, fingerprint="fp-1", direction="entry"),
+                   "created_by_name": "Hari", "created_by_role": "hr", "created_at": _t(20),
+                   "reason": "Badge log", "path": "request"}
+        by_adam = {**self._fix("ignore", cid=7, fingerprint="fp-1"),
+                   "created_by_name": "Adam", "created_by_role": "admin", "created_at": _t(21),
+                   "reason": "Duplicate", "path": "direct"}
+        added = {**self._fix("add", cid=9, at=_t(13, 40), direction="entry"),
+                 "created_by_name": "Adam", "created_by_role": "admin", "created_at": _t(21, 5),
+                 "reason": "Forgot to tap", "path": "direct"}
+        merged = apply_corrections(rows, [by_hari, by_adam, added], self.MAIN_IDS)
+        info = {r["fingerprint"]: r["correction_info"] for r in merged}
+        self.assertIsNone(info["fp-0"])
+        # The later correction on one punch names the fixer shown.
+        self.assertEqual(info["fp-1"], {"id": 7, "by": "Adam", "role": "admin", "at": _t(21),
+                                        "reason": "Duplicate", "path": "direct"})
+        self.assertEqual(info["correction:9"], {"id": 9, "by": "Adam", "role": "admin", "at": _t(21, 5),
+                                                "reason": "Forgot to tap", "path": "direct"})
+        # A correction row from before the audit trail still merges.
+        [legacy] = apply_corrections(rows[:1], [self._fix("ignore", fingerprint="fp-0")], self.MAIN_IDS)
+        self.assertEqual(legacy["correction_info"]["by"], "before audit trail")
+
+    def test_the_fixer_shown_matches_the_correction_that_decided_the_final_state(self) -> None:
+        rows = self._rows((_t(9), "entry"), (_t(13), "exit"), device="c3")
+        def fix(kind, cid, name, at):
+            return {**self._fix(kind, cid=cid, fingerprint="fp-1", direction="entry" if kind == "set_direction" else None),
+                    "created_by_name": name, "created_by_role": "admin", "created_at": at, "reason": name, "path": "direct"}
+        ignored_then_direction = apply_corrections(
+            rows, [fix("ignore", 1, "Ada", _t(20)), fix("set_direction", 2, "Bea", _t(21))], self.MAIN_IDS)
+        row = ignored_then_direction[1]
+        self.assertEqual((row["correction"], row["correction_info"]["by"]), ("ignored", "Ada"))
+        direction_then_ignored = apply_corrections(
+            rows, [fix("set_direction", 1, "Bea", _t(20)), fix("ignore", 2, "Ada", _t(21))], self.MAIN_IDS)
+        self.assertEqual(direction_then_ignored[1]["correction_info"]["by"], "Ada")
+        twice = apply_corrections(
+            rows, [fix("set_direction", 1, "Bea", _t(20)), fix("set_direction", 2, "Cy", _t(21))], self.MAIN_IDS)
+        self.assertEqual(twice[1]["correction_info"]["by"], "Cy")
+
+    def test_a_direction_fix_keeps_what_the_device_said(self) -> None:
+        rows = self._rows((_t(9), "entry"), (_t(13), "exit"), device="c3")
+        merged = apply_corrections(
+            rows, [self._fix("set_direction", fingerprint="fp-1", direction="entry")], self.MAIN_IDS)
+        self.assertEqual([(r["trusted_direction"], r["device_direction"]) for r in merged],
+                         [("entry", "entry"), ("entry", "exit")])
+        self.assertEqual(self._rows((_t(9), None))[0].get("device_direction", "absent"), "absent")
+
     def test_dangling_or_foreign_fingerprint_is_inert(self) -> None:
         rows = self._rows((_t(9), "entry"), (_t(18), "exit"), device="c3")
         corrections = [self._fix("ignore", fingerprint="fp-gone"),
@@ -361,6 +408,30 @@ class CorrectionOverlayTest(unittest.TestCase):
         self.assertEqual([(r["trusted_direction"], r["correction"]) for r in merged],
                          [("entry", None), ("exit", None)])
         self.assertEqual(rows[0].get("correction", "untouched"), "untouched")
+
+
+class LiveLogUnknownDirectionTest(unittest.TestCase):
+    """v11: the reported Gachibowli day of 2026-10-28. 17:51 and 19:53 were
+    live-log byte 15 (no direction); 19:55, 20:07 and 20:22 byte 0 (entry)."""
+
+    def _day(self):
+        return compute_day([
+            Punch(_t(17, 51), None, 10), Punch(_t(19, 53), None, 10), Punch(_t(19, 55), "entry", 10),
+            Punch(_t(20, 7), "entry", 10), Punch(_t(20, 22), "entry", 10),
+        ], target_minutes=480)
+
+    def test_arrival_counts_in_and_the_swipe_before_the_next_entry_counts_out(self) -> None:
+        r = self._day()
+        self.assertEqual(r.segments[0], Segment(_t(17, 51), _t(19, 53)))
+        self.assertEqual(r.inferred, (_t(19, 53),))
+        self.assertEqual(r.effective_seconds, 2 * 3600 + 2 * 60)
+
+    def test_back_to_back_live_entries_stay_unpaired_until_history_confirms_them(self) -> None:
+        # Known limit (plan, System-Wide Impact): only the history read can
+        # say which of 19:55, 20:07 and 20:22 was really a leaving.
+        r = self._day()
+        self.assertEqual(r.unpaired, ((_t(19, 55), "entry"), (_t(20, 7), "entry"), (_t(20, 22), "entry")))
+        self.assertTrue(r.anomalies)
 
 
 if __name__ == "__main__":

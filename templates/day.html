@@ -22,6 +22,9 @@
 
 {% if strip %}{% with drawer=false, strip_from=none %}{% include "_day_strip.html" %}{% endwith %}{% endif %}
 {% include "_day_live.html" %}
+{% if can_fix_direct %}
+<p class="day-report">{{ ui.button('Fix punches', 'secondary', href=url_for('fixes.direct_form', employee_id=subject.id, day=day.isoformat())) }}<span class="muted">Set a punch's direction, ignore one or add a missed punch. Your name and reason are kept.</span></p>
+{% endif %}
 {% if can_report %}
 <p class="day-report">{{ ui.button('Report a problem', 'secondary', href=url_for('fixes.report_view', day=day.isoformat())) }}<span class="muted">Missed swipe, or one read the wrong way? Tell HR.</span></p>
 {% endif %}

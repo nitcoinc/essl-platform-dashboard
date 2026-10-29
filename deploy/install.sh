@@ -225,10 +225,13 @@ else
 fi
 
 # --- 2c. Pre-update snapshot -------------------------------------------------
-# An update can migrate the schema. Before that, push a snapshot to R2.
+# An update can migrate the schema. Before that, push a snapshot to R2. The
+# images are already built, so the database may be one schema step behind the
+# new code: --allow-older-schema lets this one snapshot through (the scheduled
+# loop stays strict).
 if [ "$STATE" = update ] && [ "$CHECK_ONLY" = 0 ] && [ "$SKIP_BACKUP" = 0 ]; then
   step "Snapshot before update (R2)"
-  if docker compose run --rm --no-deps backup python -m essl_hub.backup now; then
+  if docker compose run --rm --no-deps backup python -m essl_hub.backup now --allow-older-schema; then
     ok "snapshot uploaded to R2 recent/"
   else
     warn "snapshot failed (see above). The last scheduled snapshot is still in R2."

@@ -84,7 +84,7 @@ Run the same command: `./deploy/install.sh`. On an existing install it:
 
 1. Fast-forwards to the latest `main`, then re-runs the new installer. It refuses to pull over local edits to tracked files.
 2. Backs up `.env` to `.env.bak.<time>` (keeps the last 5) and adds any settings the new release introduced, with their defaults.
-3. Uploads a fresh database snapshot to R2 before the schema can change (`backup now`). If that fails it asks before continuing. On an install still on Turso it stops here and prints the [upgrade steps](#upgrading-from-turso).
+3. Uploads a fresh database snapshot to R2 before the schema can change (`backup now --allow-older-schema`: the new image is built by then, so the database may be one schema step behind). If that fails it asks before continuing. On an install still on Turso it stops here and prints the [upgrade steps](#upgrading-from-turso).
 4. Builds, restarts only changed containers, waits for the web app, and prunes old images. If the web app does not come up, it prints the `git checkout <previous>` command to roll back and exits non-zero.
 
 A lock file stops two runs overlapping. The very first time you move to this installer from an older checkout, run `git pull` once by hand.
@@ -205,14 +205,45 @@ docker compose run --rm backup python -m essl_hub.backup <command>
 | Command | What it does |
 | --- | --- |
 | `init` | Creates a new empty database with a new `database_id`. New installs only (the installer runs it). |
-| `restore [--key <key>]` | Downloads the latest snapshot (or the exact R2 key, e.g. `recent/20261014T101500.db.gz`), verifies it and moves it into place. |
+| `restore [--key <key>]` | Downloads the latest snapshot (or the exact R2 key, e.g. `recent/20261014T101500.db.gz`), verifies it and moves it into place. Onto an empty data folder only; to swap a live database use `--replace --yes` ([below](#restoring-over-a-live-database)). |
+| `fetch --out <folder> [--key <key>]` | Writes a scrubbed, inert copy of a snapshot into `<folder>` for looking at production data elsewhere ([below](#looking-at-production-data-on-a-dev-box)). Never touches the live data folder. |
 | `list` | Lists snapshots in R2. |
 | `now` | Runs one backup cycle now (e.g. before a large roster import). Exit 0 on success. |
 | `status` | Shows the local `database_id`, the one in R2 `latest.json` and whether they match, plus the last and next cycle. |
 | `adopt [--yes]` | Makes this database the bucket's owner (asks you to type `adopt`). |
 | `import-turso` | One-time copy from Turso during the upgrade ([Upgrading from Turso](#upgrading-from-turso)). |
 
-`init`, `restore` and `import-turso` refuse while `essl.db`, `essl.db-wal` or `essl.db-shm` exists: a leftover WAL would replay another database's pages onto the new file. Stop the stack and move all three aside first. Every command and cycle holds a lock on `/data/backup.lock`, so `now` cannot collide with the running loop.
+`init`, `restore` (without `--replace`) and `import-turso` refuse while `essl.db`, `essl.db-wal` or `essl.db-shm` exists: a leftover WAL would replay another database's pages onto the new file. Stop the stack and move all three aside first. Every command and cycle holds a lock on `/data/backup.lock`, so `now` cannot collide with the running loop.
+
+### Restoring over a live database
+
+`restore` refuses to touch an existing database. To roll production back to a snapshot (a bad import, wrong fixes, a corrupted file), use `--replace --yes` with the stack stopped:
+
+```bash
+docker compose stop web collector alerts
+docker compose run --rm backup python -m essl_hub.backup list                 # pick a key
+docker compose run --rm backup python -m essl_hub.backup restore --key recent/<ts>.db.gz --replace --yes
+docker compose up -d web collector alerts
+```
+
+What it does, in order: downloads and verifies the snapshot (it must not be from a newer schema); proves nothing else has the database open (it refuses if web, collector or alerts, or anything else, still holds it, even idle); takes a snapshot of the **live** state to R2; moves `essl.db`, `-wal` and `-shm` aside to `essl.db.pre-restore-<time>` (mode 0600, never deleted or overwritten); installs the snapshot. If the install fails, the old files are put back. If the live file cannot be snapshotted (R2 down, or it belongs to a different database than the bucket), the command stops and changes nothing; `--skip-pre-snapshot` goes ahead anyway, with the old files still kept aside. `--drill` cannot be combined with `--replace` (a drill copy gets a new `database_id` and would silently stop production backups). It re-proves that nothing has the database open just before the swap, and if putting the old files back ever fails it lists the files to rename by hand.
+
+After it: everyone signs in again; **roles, archives, fix requests and corrections made after the snapshot are rolled back**, so re-check departed or demoted accounts and any approved fixes. The punches themselves come back from the devices (each returns its whole log on every poll). Keep the `pre-restore` files until you are sure: they hold everything written after the snapshot, including the audit trail of fixes. A snapshot from an older schema migrates when web or collector starts; `backup now` fails with "behind" until then. To roll back the other way, restore the snapshot the command just took of the live state.
+
+### Looking at production data on a dev box
+
+Run `fetch` on the production host, where the R2 keys already are, then copy the file to the dev machine; the dev machine never needs R2 credentials.
+
+```bash
+mkdir -p fetched
+docker compose run --rm -u "$(id -u):$(id -g)" -v "$PWD/fetched:/out" backup \
+  python -m essl_hub.backup fetch --out /out            # newest snapshot; add --key recent/<ts>.db.gz for another
+scp fetched/essl-fetched-<timestamp>.db dev-box:        # then delete it from the host
+```
+
+The copy is made on a temporary file inside the output folder and renamed into place only after it passes checks. Device communication passwords, queued door-parameter requests, HRMS API keys, sessions, sign-in codes, report links and the mail outbox are removed (with `secure_delete` and a `VACUUM`, so old pages do not keep them). It gets a new `database_id` and a `fetched_copy` marker, so `backup` refuses to upload from it, `adopt` refuses it, and the collector and alerts services refuse to start on it. **Employee names, emails and punches stay in the copy**: treat it as production data (encrypted disk, delete it when done) and run only the web app on it.
+
+To use it: point a dev web instance at the file (`ESSL_DB_PATH=/path/essl-fetched-<timestamp>.db`). The web app notices the marker and forces console mail, so a sign-in code is printed in the server log and nothing is emailed to a real person; leave Frappe settings unset. Sign in with an admin email from the copy. A fetched copy of an older schema migrates when the web app opens it.
 
 **R2 is optional in compose, required by the installer.** With the `R2_*` values empty, the stack runs normally, nothing is copied off-site, and the health page shows Backups **Off**. `./deploy/install.sh` asks for all four values and will not continue without them; run without R2 only for dev or a scratch host.
 
@@ -560,7 +591,8 @@ Rolling back to the previous release after the cutover needs Turso, so keep the 
 | Sync health (`/health`) | - | - | - | yes |
 | Daily target, attendance alerts, HRMS API keys (**Settings**) | - | - | - | yes |
 | Report a problem on own day (last 7 days) | yes | yes | yes | yes |
-| Approve or reject fix requests | - | - | yes, never their own | only when no HR user other than the requester exists, never their own |
+| Approve or reject fix requests | - | - | yes, never their own | yes, never their own |
+| Fix punches directly (day page → **Fix punches**) | - | - | - | yes, never their own |
 
 | Role | Lands on | Sidebar |
 | --- | --- | --- |
@@ -569,7 +601,9 @@ Rolling back to the previous release after the cutover needs Turso, so keep the 
 | hr | Employees | Today, Week, Employees, People (Directory, ID issues, Archive) |
 | admin | Employees | Today, Week, Employees, People (Directory, ID issues, Archive), Devices, Settings (plus the sync-health indicator) |
 
-**Fix requests.** HR approves every fix request, on its own review page. When an employee files one, their manager gets one FYI email listing the lines (no button, HR decides) and every HR user gets the same with a **Review request** link. If the requester is the only HR user, admins other than the requester are emailed and may approve instead. Nobody approves their own request.
+**Fix requests.** HR or an admin approves every fix request, on its own review page. Each approval records who decided it, their role at that moment and the note (the correction record cannot be edited afterwards). When an employee files one, their manager gets one FYI email listing the lines (no button, HR decides) and every HR user gets the same with a **Review request** link. If the requester is the only HR user, admins other than the requester are emailed instead; admins can open and decide any request from the review list either way. Nobody approves their own request.
+
+**Direct fixes (admin).** On another person's day, **Fix punches** lets an admin count a punch as In or Out, ignore it, or add a missed one, with a required reason and a before/after hours preview. Nothing in the device records changes: each fix is a correction stored with the admin's name and role at that moment, the time, the reason and the path (`direct`, or `request` when HR or an admin approved an employee's request). The correction record cannot be edited or deleted. An admin cannot fix their own punches this way; they file a report like anyone else and HR or another admin decides it. Frappe HR still receives the device's own direction, so a corrected day can differ from Frappe.
 
 Asking for someone you may not see returns 404, the same as an id that does not exist. `/admin` redirects to **Devices**; `/devices/ids` redirects to **People → ID issues**.
 
@@ -582,7 +616,7 @@ A missed swipe looks like a long break: someone forgets to swipe, or the Gachibo
 **The two emails.**
 
 - **Daytime ("out too long"):** checked every 5 minutes inside the alert hours (default 09:00-20:00). Sent when someone who came in today has been out 15 minutes past their limit, and it is still before their usual leaving time.
-- **Next morning:** after the morning email hour (default 09:00), about yesterday, when the day ends on an In with no Out, has an Out with no In, two Ins in a row, or an unclear gap. A day with a C3 direction still being guessed waits for the next history read.
+- **Next morning:** after the morning email hour (default 09:00), about yesterday, when the day ends on an In with no Out, has an Out with no In, two Ins in a row, or an unclear gap. A day with a C3 live-log swipe still waiting for its direction (in/out 15) waits for the next history read.
 
 At most one of each per person per work day, and never to someone who did not swipe that day. Both skip while the collector's data is stale (no poll for 10 minutes, punches still spooled, or a device that can't be reached). If one check would email more than 5 people, or 20% of those in, it looks like an outage, not missed swipes: those people are recorded as *held* and nobody is emailed. Emails show only times and the length of the out-stretch, never anyone's limit, and assume the reader missed a swipe.
 
@@ -592,7 +626,7 @@ At most one of each per person per work day, and never to someone who did not sw
 
 **Review and approval.** A report that changes anything goes to HR (and an FYI to the manager, see [Roles](#roles)). On the review page HR sees the day's swipes and each requested line, can adjust a time or direction, and approves or rejects each line; rejecting needs a note. A confirm page shows the hours before and after. The employee is emailed the decision. The page warns when the day's swipes changed after the report, or when a swipe a fix points at no longer exists.
 
-**What an approved fix does.** It is stored beside the punches as a correction and changes the computed hours everywhere: Today, Week, Team, exports and `/api/v1/hours`. The device punch itself is never edited or deleted, and the day shows chips such as *added by HR* or *direction fixed*. Frappe HR and `/api/v1/checkins` keep receiving only the raw device punches, so Frappe's hours can differ from the dashboard for a fixed day.
+**What an approved fix does.** It is stored beside the punches as a correction and changes the computed hours everywhere: Today, Week, Team, exports and `/api/v1/hours`. The device punch itself is never edited or deleted, and the day shows chips such as *added*, *direction fixed* or *ignored*. Under each punch the day page says why it counts as In or Out: what the device said, a live-log swipe with no direction the device history has not confirmed yet, the hub's alternation, a quick re-swipe, or who made a fix and why. HR and admins also see the raw device facts (device, door, reader, in/out byte, source). Frappe HR and `/api/v1/checkins` keep receiving only the raw device punches, so Frappe's hours can differ from the dashboard for a fixed day.
 
 **Email delivery.** All these emails go through the same provider as sign-in codes. Resend sends the HTML version with the NITCO logo. The Cloudflare provider sends **text only**, so there is no logo; set `ESSL_MAIL_PROVIDER=resend` if the branded version matters. `ESSL_HR_REPLY_TO` makes replies go to an HR mailbox.
 
@@ -647,11 +681,35 @@ If it stops reporting:
 2. In ZKAccess/eSSL software confirm IP `192.168.1.202`, port `4370` and the communication password. Put it in `ESSL_C3_PASSWORD`.
 3. Pause other access-control software during the first test, then `diagnose.py gachibowli-c3-400`.
 
-The C3 sends big tables in chunks, which the bundled library cannot read, so the collector downloads them itself (`read_c3_table` in `essl_hub/collectors.py`, checked against the panel's CRC). With `ESSL_C3_MODE=auto` it pulls the full history (about 30,000 events, 80 seconds on the tested `AC Ver 18.1.2`) at start and every `ESSL_C3_HISTORY_HOURS`, and reads the live queue on the polls between. Only access-granted swipes count, plus event 20 ("Too Short Punch Interval"): the door refused to reopen but the person was there, so it is stored as attendance noted *interval too short*. Other denied swipes, the exit button and door alarms are skipped. Set the door's **Punch Interval** to 1 second or less so real swipes are not denied (now possible from the Devices page, below). The panel allows one session at a time, so pause ZKAccess or other tools while the collector runs.
+The C3 sends big tables in chunks, which the bundled library cannot read, so the collector downloads them itself (`read_c3_table` in `essl_hub/collectors.py`, checked against the panel's CRC). With `ESSL_C3_MODE=auto` it pulls the full history (about 30,000 events, 80 seconds on the tested `AC Ver 18.1.2`) at start and every `ESSL_C3_HISTORY_HOURS`, and reads the live queue on the polls between. The history is the source of truth for direction: it records which reader took the swipe (outside reader = entry, inside = exit). The live queue's in/out byte does not follow the reader. The bundled library decodes only 0 (entry) and 3 (exit), and anything else, read as 15, came back for both arrivals and leavings at Gachibowli (2026-10-29). So a live swipe read as 15 carries no direction. The day page counts it from the swipes around it and says so, until the next history read fills the real byte. Upgrading to schema v11 clears the old "15 is an exit" guess on rows history had not filled yet. A failed history download is logged (`C3 history download for … failed after …`), shown on the device's card as "History download failing since …", and retried after `ESSL_C3_HISTORY_RETRY_MINUTES` (default 30) instead of on every poll; the card also shows when history was last read. Only access-granted swipes count, plus event 20 ("Too Short Punch Interval"): the door refused to reopen but the person was there, so it is stored as attendance noted *interval too short*. Other denied swipes, the exit button and door alarms are skipped. Set the door's **Punch Interval** to 1 second or less so real swipes are not denied (now possible from the Devices page, below). The panel allows one session at a time, so pause ZKAccess or other tools while the collector runs.
 
-**Directions.** The history table carries the real in/out byte (0 In, 1 Out). The live queue's library decodes byte 1 as "unknown" (15); on the tested panel only bytes 0 and 1 occur, so a live 15 on a granted or event-20 swipe is stored as Out. The next history read overwrites any live-read direction it disagrees with.
+**Directions.** The history table carries the real in/out byte (0 In, 1 Out), and the next history read overwrites any live-read direction it disagrees with. A live 15 is stored with no direction (see above); before schema v11 it was stored as Out.
 
 **Door settings (Devices page).** Each C3 card shows the panel's door parameters and when they were read. **Read from device** asks the collector to read them on its next poll. An admin can change a closed whitelist: per door *Punch interval* (`DoorNIntertime`, 0–10 s), *Unlock time* (`DoorNDrivertime`), *Door-open alarm after* (`DoorNDetectortime`), *Lock when door closes* (`DoorNCloseAndLock`), *Door sensor* (`DoorNSensorType`), plus panel-wide *Anti-passback* (0–6) and *Interlock* (0–5). Changes go through a confirm page (old → new), are applied by the collector one key at a time and count as applied only when read back. A request the collector has not reached within 15 minutes expires unsent. The values from before the last write are kept and **Restore previous values** puts them back through the same confirm page. Every change is recorded with who made it. The dashboard never writes `ComPwd`, `IPAddress`, `NetMask`, `GATEIPAddress`, `RS232BaudRate`, `DeviceID` or `DoorNVerifyType`.
+
+**Upgrading to schema v11.** Stop the collector before the upgrade (`docker compose stop collector`, then `./deploy/install.sh`), so an old collector cannot store a new "15 is an exit" guess after the migration has run. To check the result, run this read-only before and after:
+
+```
+docker compose exec -T web python - <<'PY'
+import sqlite3
+c = sqlite3.connect("file:/data/essl.db?mode=ro", uri=True)
+print(c.execute("""SELECT raw_direction_byte, trusted_direction, COUNT(*) FROM punches
+    WHERE json_extract(raw_json,'$.source') = 'realtime_fallback' GROUP BY 1, 2 ORDER BY 1, 2""").fetchall())
+print(c.execute("SELECT value FROM settings WHERE key = 'c3_live15_cutover_at'").fetchone())
+PY
+```
+
+Afterwards the `(15, 'exit')` count drops to the rows history filled before 2026-10-12 or that were collected before the rule (normally none), `(15, None)` grows by the same amount, and the cutover time is set.
+
+**When the history download fails.** The card says "History download failing since …" and the collector log names the error. To find out why, run the read-only probe off-hours with someone on site. It replays the collector's download, then tests a fresh session, one long buffer read and pipelined reads, each on its own connection. It writes no setting and clears no log:
+
+```
+docker compose stop collector
+docker compose run --rm --no-deps -T -v "$PWD/scripts:/app/scripts" collector python scripts/c3_history_probe.py
+docker compose start collector
+```
+
+It prints the table size, the panel's chunk, round-trip times, bytes per second, and where and after how long the panel cut the download. Until history works, live-log swipes stay unconfirmed and an admin can fix them with **Fix punches**. Exporting and then clearing old transactions on the panel with ZKAccess also shortens the download. The hub never does that itself.
 
 **Wait for door close.** Interlock (event 25) and anti-passback (event 24) are the only panel settings that deny a swipe based on door state or swipe history. With **Wait for door close** checked (default) those denials are not attendance. Unchecked, denials that carry a PIN or card are stored from that moment on, flagged *door denied*, and not sent to Frappe; past denials are not added. Setting InterLock and AntiPassback to 0 stops the denials at the source. As read on 2026-10-26 the Gachibowli panel has no door sensor configured and both set to 0, so the panel never waits for the door.
 
@@ -678,7 +736,7 @@ Each cycle (at most every `FRAPPE_SYNC_INTERVAL_SECONDS`) new punches are POSTed
 
 Two kinds of punch are held back:
 - C3 *door denied* rows are never sent; payroll cannot see the flag.
-- A C3 live-queue exit is read as in/out 15, so its direction is a guess, and Frappe keeps the log type it is first sent. These rows wait until the next history read confirms the real byte, at most 24 h.
+- A C3 live-queue swipe read as in/out 15 has no direction (schema v11; earlier versions guessed it as an exit), and Frappe keeps the log type it is first sent. These rows wait until the next history read confirms the real byte, at most 24 h, then go without a log type. Before v11 such a row went as OUT, and at Gachibowli some of those were arrivals. `docker compose run --rm --no-deps -T -v "$PWD/scripts:/app/scripts" web python scripts/c3_guessed_frappe_report.py > guessed-outs.csv` (read-only) lists the ones that may be wrong, with their Frappe check-in names, so HR can correct them in Frappe or with Fix punches. It rebuilds what was sent from the live decode kept in each row, so it still works after history fills the byte.
 
 After a run with nothing left pending, each `FRAPPE_SHIFT_TYPES` entry gets `last_sync_of_checkin` = oldest successful device poll (only moves forward), stopping just before any punch still held. Auto Attendance therefore does not mark absences for punches not yet collected or confirmed. Last run status is in `settings.frappe_last_sync` (JSON).
 
@@ -708,7 +766,7 @@ All settings live in `.env`; `.env.example` documents each one. The daily target
 | `ESSL_HEARTBEAT_WRITE_SECONDS` | `900` | collector, Devices staleness warning |
 | `ESSL_X990_IP` / `_PORT` / `_PASSWORD` | `192.168.1.201` / `4370` / `0` | collector (seeds the row once) |
 | `ESSL_C3_IP` / `_PORT` / `_PASSWORD` | `192.168.1.202` / `4370` / blank | collector (seeds the row once) |
-| `ESSL_C3_MODE`, `ESSL_C3_HISTORY_HOURS`, `ESSL_C3_RTLOG_BATCH` | `auto`, `6`, `250` | collector |
+| `ESSL_C3_MODE`, `ESSL_C3_HISTORY_HOURS`, `ESSL_C3_HISTORY_RETRY_MINUTES`, `ESSL_C3_RTLOG_BATCH` | `auto`, `6`, `30`, `250` | collector |
 | `ESSL_C3_ID_FORMAT`, `ESSL_C3_UNLINKED_PINS` | `NP{pin:04d}`, `1,2` | collector: C3 PIN to device ID |
 | `ESSL_MAIL_PROVIDER` | auto | web, alerts: `cloudflare`, `resend`, or `console` (local testing only: prints the email to the server log) |
 | `CLOUDFLARE_API_TOKEN` / `_ACCOUNT_ID` / `_FROM_ADDRESS` | | web (sign-in codes), alerts (every other email); text only, no logo |

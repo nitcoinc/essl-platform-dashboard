@@ -22,6 +22,7 @@ from .fix_views import (
     _day_rows,
     _line_view,
     _swipes,
+    current_direction,
     punch_set_hash,
 )
 from .fixes import _logger, bp
@@ -44,12 +45,9 @@ def _review_request(request_id: int) -> tuple[dict, dict, date]:
 
 
 def _readonly_reason(filed: dict) -> str | None:
-    """Why the viewer may look but not decide (KTD6), or None."""
+    """Why the viewer may look but not decide, or None."""
     if filed["employee_id"] == g.employee["id"]:
-        return "This is your own request. Another HR user decides it; nobody approves their own fixes."
-    if g.employee["role"] == "admin":
-        return ("An HR user decides fix requests. Admins approve only when no HR user "
-                "other than the requester exists.")
+        return "This is your own request. Another HR user or an admin decides it; nobody approves their own fixes."
     return None
 
 
@@ -60,7 +58,7 @@ def _default_direction(line: dict, rows_by_fp: dict) -> str | None:
         return _FROM_DIRECTION.get(line["direction"])
     if line["kind"] == "flip":
         row = rows_by_fp.get(line.get("target_fingerprint"))
-        current = row.get("trusted_direction") if row else None
+        current = current_direction(row) if row else None
         return _FROM_DIRECTION.get(OPPOSITE_DIRECTION.get(current))
     return None
 
@@ -112,7 +110,7 @@ def _render_review(filed: dict, person: dict, day: date, *, values: dict | None 
     day_start_hour = _day_start_hour(database)
     rows = _day_rows(person, day, day_start_hour)
     lines = _review_lines(filed, rows, values, errors.get("lines"))
-    can_approve = access.can_approve_fix(g.employee, filed, database)
+    can_approve = access.can_approve_fix(g.employee, filed)
     day_changed = (filed["status"] == "pending" and bool(filed.get("punch_set_hash"))
                    and punch_set_hash(rows) != filed["punch_set_hash"])
     return Response(render_template(
@@ -241,6 +239,12 @@ def _proposed_rows(rows: list[dict], filed: dict, person: dict, decisions: list[
             if direction:
                 proposed.append({"kind": "set_direction", "employee_id": employee_id,
                                  "fingerprint": line["target_fingerprint"], "direction": direction})
+    return _merge_proposed(rows, proposed, employee_id, person)
+
+
+def _merge_proposed(rows: list[dict], proposed: list[dict], employee_id: int, person: dict) -> list[dict]:
+    """``rows`` with ``proposed`` corrections merged by apply_corrections;
+    markers the rows already carried are kept where a proposal adds none."""
     before = {row.get("fingerprint"): row.get("correction") for row in rows}
     merged = apply_corrections(rows, proposed, {employee_id: str(person["device_user_id"])})
     for row in merged:
@@ -306,7 +310,7 @@ def review_preview(request_id: int) -> Response:
     does to the day's hours. Nothing is written here."""
     _require_csrf()
     filed, person, day = _review_request(request_id)
-    if not access.can_approve_fix(g.employee, filed, database):
+    if not access.can_approve_fix(g.employee, filed):
         abort(403)
     decisions, values, errors, note = _read_review(filed, day, request.form)
     if request.form.get("action") == "edit":
@@ -378,7 +382,7 @@ def review_confirm(request_id: int) -> Response:
     """Apply HR's decisions in one transaction, then email the employee."""
     _require_csrf()
     filed, person, day = _review_request(request_id)
-    if not access.can_approve_fix(g.employee, filed, database):
+    if not access.can_approve_fix(g.employee, filed):
         abort(403)
     decisions, values, errors, note = _read_review(filed, day, request.form)
     if errors:

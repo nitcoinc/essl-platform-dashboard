@@ -59,7 +59,7 @@ from .hours import apply_corrections
 # are re-exported here, so ``from .db import ...`` keeps working.
 __all__ = [
     # Core.
-    "BUSY_TIMEOUT_MS", "C3_UNDECODED_BYTE", "DATE_COLUMNS", "DEFAULT_DAY_START_HOUR",
+    "BUSY_TIMEOUT_MS", "C3_UNDECODED_BYTE", "DATE_COLUMNS", "DEFAULT_DAY_START_HOUR", "FETCHED_COPY_KEY",
     "DEFAULT_TARGET_MINUTES", "DEVICE_CHANGE_KINDS", "DIRECTIONLESS_WINDOW_MIN", "DUPLICATE_WINDOW_MAX",
     "FRAPPE_GUESS_HOLD",
     "JSON_COLUMNS", "MIGRATIONS", "PUNCH_INSERT_BATCH", "PUNCH_TX_ROWS", "SCHEMA_STATEMENTS",
@@ -83,7 +83,7 @@ _TZ = ZoneInfo(TIMEZONE_NAME)
 _logger = logging.getLogger(__name__)
 
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 11
 
 # libsql exposes no declared column types (U8), so read-side conversion is by
 # column name. Every TIMESTAMP column in the schema is listed here (a test
@@ -744,13 +744,125 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         """,
         "CREATE INDEX IF NOT EXISTS idx_punch_archives_user ON punch_archives(device_user_id)",
     ),
+    # v10: an audit trail for corrections. A direct admin fix has no request
+    # line, so request_line_id becomes nullable (SQLite cannot relax a NOT NULL
+    # in place: rebuild, copying ids). Each row keeps who made it, their name
+    # and role at that moment, the path and the reason. The new columns are
+    # defaulted, so v9 code still inserts into a v10 file (a rollback). The
+    # backfill names the old decider but not a role, which was never recorded;
+    # a decider who is gone shows as "before audit trail".
+    10: (
+        """
+        CREATE TABLE IF NOT EXISTS punch_corrections_v10 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+            work_day TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('add', 'ignore', 'set_direction')),
+            fingerprint TEXT,
+            event_timestamp TIMESTAMP,
+            direction TEXT CHECK (direction IN ('entry', 'exit')),
+            request_line_id INTEGER UNIQUE REFERENCES fix_request_lines(id),
+            created_at TIMESTAMP NOT NULL,
+            created_by INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            created_by_name TEXT NOT NULL DEFAULT 'before audit trail',
+            created_by_role TEXT,
+            path TEXT NOT NULL DEFAULT 'request' CHECK (path IN ('request', 'direct')),
+            reason TEXT
+        )
+        """,
+        """
+        INSERT INTO punch_corrections_v10 (id, employee_id, work_day, kind, fingerprint,
+            event_timestamp, direction, request_line_id, created_at, created_by,
+            created_by_name, created_by_role, path, reason)
+        SELECT c.id, c.employee_id, c.work_day, c.kind, c.fingerprint, c.event_timestamp,
+            c.direction, c.request_line_id, c.created_at, l.decided_by,
+            COALESCE(e.name, 'before audit trail'), NULL, 'request', r.decision_note
+        FROM punch_corrections c
+        LEFT JOIN fix_request_lines l ON l.id = c.request_line_id
+        LEFT JOIN employees e ON e.id = l.decided_by
+        LEFT JOIN fix_requests r ON r.id = l.request_id
+        ORDER BY c.id
+        """,
+        # AUTOINCREMENT remembers the highest id ever handed out; the copy only
+        # knows the highest id still present, so carry the old counter over.
+        """
+        INSERT INTO sqlite_sequence (name, seq)
+        SELECT 'punch_corrections_v10', seq FROM sqlite_sequence
+        WHERE name = 'punch_corrections'
+          AND NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'punch_corrections_v10')
+        """,
+        """
+        UPDATE sqlite_sequence
+        SET seq = (SELECT seq FROM sqlite_sequence WHERE name = 'punch_corrections')
+        WHERE name = 'punch_corrections_v10'
+          AND (SELECT seq FROM sqlite_sequence WHERE name = 'punch_corrections') > seq
+        """,
+        "DROP TABLE punch_corrections",
+        "ALTER TABLE punch_corrections_v10 RENAME TO punch_corrections",
+        "CREATE INDEX IF NOT EXISTS idx_punch_corrections_employee "
+        "ON punch_corrections(employee_id, work_day)",
+        # Append-only: a correction is never edited, and only leaves with its
+        # employee (the cascade runs once the employee row is gone).
+        """
+        CREATE TRIGGER IF NOT EXISTS punch_corrections_no_update
+        BEFORE UPDATE OF id, employee_id, work_day, kind, fingerprint, event_timestamp, direction,
+            request_line_id, created_at, created_by_name, created_by_role, path, reason
+        ON punch_corrections
+        BEGIN SELECT RAISE(ABORT, 'punch corrections are append-only'); END
+        """,
+        # The actor id may only change by the foreign key's own SET NULL, which
+        # runs once the actor's employee row is gone.
+        """
+        CREATE TRIGGER IF NOT EXISTS punch_corrections_actor_fixed
+        BEFORE UPDATE OF created_by ON punch_corrections
+        WHEN NEW.created_by IS NOT OLD.created_by
+            AND (NEW.created_by IS NOT NULL
+                 OR EXISTS (SELECT 1 FROM employees WHERE id = OLD.created_by))
+        BEGIN SELECT RAISE(ABORT, 'punch corrections are append-only'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS punch_corrections_no_delete
+        BEFORE DELETE ON punch_corrections
+        WHEN EXISTS (SELECT 1 FROM employees WHERE id = OLD.employee_id)
+        BEGIN SELECT RAISE(ABORT, 'punch corrections are append-only'); END
+        """,
+    ),
+    # v11: the C3 live log returns in/out 15 for arrivals and leavings alike,
+    # so a live row read as 15 carries no direction (collectors KTD4, revised
+    # 2026-10-29). Drop exactly what the retired rule wrote: an exit on a
+    # granted or event-20 swipe still at byte 15, collected since the rule
+    # landed (32c132c, 2026-10-12 22:43). A history fill replaces the byte
+    # since 2026-10-26; earlier fills kept 15 on rows the rule never guessed
+    # (collected before it, or filled as entry), so those keep their direction.
+    # Hours infer the cleared rows from the swipes around them and
+    # fill_punch_directions confirms them later. Collector metadata, like that
+    # repair, not a punch edit. The cutover time (IST, only on a file that
+    # already holds punches) lets scripts/c3_guessed_frappe_report.py tell
+    # which rows Frappe got as OUT.
+    11: (
+        """
+        UPDATE punches SET trusted_direction = NULL
+        WHERE raw_direction_byte = 15
+          AND trusted_direction = 'exit'
+          AND json_extract(raw_json, '$.source') = 'realtime_fallback'
+          AND CAST(json_extract(raw_json, '$.event_type') AS TEXT) IN ('0', '1', '2', '3', '20')
+          AND collected_at >= '2026-10-12 22:43:17'
+          AND device_id IN (SELECT id FROM devices WHERE protocol = 'c3-pullsdk')
+        """,
+        """
+        INSERT OR IGNORE INTO settings (key, value)
+        SELECT 'c3_live15_cutover_at', datetime('now', '+5 hours', '+30 minutes')
+        WHERE EXISTS (SELECT 1 FROM punches)
+        """,
+    ),
 }
 
-# The C3 library's "unknown" in/out value: a realtime exit (byte 1) arrives as
-# 15 and its direction is a guess until a history read gives the real byte.
+# The C3 library's "unknown" in/out value: a live-log byte it cannot decode
+# arrives as 15 and carries no direction until a history read gives the real
+# byte (v11; before it, 15 was guessed as an exit).
 C3_UNDECODED_BYTE = 15
-# How long such a guess waits for that confirmation before Frappe gets it
-# anyway (history is re-read every ESSL_C3_HISTORY_HOURS, default 6).
+# How long such a row waits for that confirmation before Frappe gets it
+# anyway, without a log type (history is re-read every ESSL_C3_HISTORY_HOURS, default 6).
 FRAPPE_GUESS_HOLD = timedelta(hours=24)
 # Params: C3_UNDECODED_BYTE, now - FRAPPE_GUESS_HOLD. COALESCE keeps NOT (...)
 # true for rows with no byte or no source (SQL NULL would hide them).
@@ -790,6 +902,9 @@ def _run_migration_statement(connection: Any, statement: str) -> None:
 
 DEFAULT_TARGET_MINUTES = "480"
 DEFAULT_DAY_START_HOUR = "6"
+# Stamped by `backup fetch`: a scrubbed copy of a production snapshot that must
+# never poll devices, send mail, back up or adopt the R2 bucket.
+FETCHED_COPY_KEY = "fetched_copy"
 
 
 def _schema_version(connection: Any) -> int:
@@ -1983,6 +2098,10 @@ class Database(AlertsMixin, FixesMixin, ArchivesMixin):
             ).fetchall()
         return list(rows)
 
+    def is_fetched_copy(self) -> bool:
+        """True for a file made by `backup fetch` (the services refuse it)."""
+        return self.exists() and self.setting(FETCHED_COPY_KEY) is not None
+
     def setting(self, key: str, default: str | None = None) -> str | None:
         with self.connect() as connection:
             row = connection.execute(
@@ -2132,7 +2251,9 @@ def _overlaid_punches(
     rows = connection.execute(
         f"""
         SELECT device_user_id, fingerprint, event_timestamp, trusted_direction,
-            raw_direction_byte, raw_state, site, device_id
+            raw_direction_byte, raw_state, site, device_id, door, reader,
+            json_extract(raw_json, '$.source') AS source,
+            json_extract(raw_json, '$.in_out_raw') AS in_out_raw
         FROM punches p
         WHERE device_user_id IN (SELECT value FROM json_each(?))
           AND event_timestamp >= ? AND event_timestamp < ?

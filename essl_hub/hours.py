@@ -268,10 +268,36 @@ def punch_from_row(row, windows: dict[str, int]) -> Punch:
     return Punch(row["event_timestamp"], row["trusted_direction"], window)
 
 
+def scored_directions(punches: list[Punch]) -> tuple[dict[datetime, Direction], set[datetime]]:
+    """Each counted swipe's direction as the day scores it (KTD9): the stored
+    one, or the one inferred or alternated for a direction-less swipe; and
+    the swipes whose direction was filled in between their neighbours. Quick
+    re-swipes that were not counted are absent."""
+    resolved, _, inferred, _ = _resolve_directions(sorted(punches, key=lambda p: p.timestamp))
+    return dict(resolved), set(inferred)
+
+
 def counted_punches(rows, windows: dict[str, int]) -> list[Punch]:
     """The Punches ``compute_day`` scores from merged rows: a punch HR ignored
     (KTD4) stays in the raw list but never counts."""
     return [punch_from_row(row, windows) for row in rows if row.get("correction") != CORRECTION_IGNORED]
+
+
+# What the v10 migration names a correction whose maker was never recorded.
+NO_AUDIT_NAME = "before audit trail"
+
+
+def correction_info(correction: dict) -> dict:
+    """Who made a correction and why, as the day view shows it. A row from
+    before the audit trail has no name of its own."""
+    return {
+        "id": correction.get("id"),
+        "by": correction.get("created_by_name") or NO_AUDIT_NAME,
+        "role": correction.get("created_by_role"),
+        "at": correction.get("created_at"),
+        "reason": correction.get("reason"),
+        "path": correction.get("path") or "request",
+    }
 
 
 def apply_corrections(rows, corrections, main_ids: dict[int, str]) -> list[dict]:
@@ -281,7 +307,9 @@ def apply_corrections(rows, corrections, main_ids: dict[int, str]) -> list[dict]
     ``rows`` carry ``fingerprint`` and their owner's ``employee_id`` (None for
     an unmapped ID); ``corrections`` are ``punch_corrections`` rows, oldest
     first; ``main_ids`` maps each owner to their main device user ID. Inputs
-    are never mutated; every returned row has a ``correction`` key:
+    are never mutated; every returned row has a ``correction`` key, a
+    ``correction_info`` (who fixed it and why, None when untouched) and the
+    ``device_direction`` the fix may have overridden:
 
     - ``set_direction`` overrides the direction of its fingerprint's row;
     - ``ignore`` keeps its row, marked, for the raw list;
@@ -297,16 +325,22 @@ def apply_corrections(rows, corrections, main_ids: dict[int, str]) -> list[dict]
             targeted.setdefault(correction["fingerprint"], []).append(correction)
     merged = []
     for row in rows:
-        out = {**row, "correction": None}
+        out = {**row, "correction": None, "correction_info": None}
+        if "trusted_direction" in row:
+            out["device_direction"] = row["trusted_direction"]  # before any fix overrides it
         for correction in targeted.get(row.get("fingerprint"), ()):
             if correction["employee_id"] != row.get("employee_id"):
                 continue
             if correction["kind"] == "ignore":
                 out["correction"] = CORRECTION_IGNORED
+                out["correction_info"] = correction_info(correction)
             elif correction["kind"] == "set_direction":
                 out["trusted_direction"] = correction["direction"]
                 if out["correction"] != CORRECTION_IGNORED:
                     out["correction"] = CORRECTION_DIRECTION
+                    # An ignore decides the final state, so a later direction
+                    # fix does not take over its name.
+                    out["correction_info"] = correction_info(correction)
         merged.append(out)
     for correction in corrections:
         owner = correction["employee_id"]
@@ -323,6 +357,7 @@ def apply_corrections(rows, corrections, main_ids: dict[int, str]) -> list[dict]
             "site": None,
             "device_id": None,
             "correction": CORRECTION_ADDED,
+            "correction_info": correction_info(correction),
         })
     merged.sort(key=lambda r: r["event_timestamp"])
     return merged

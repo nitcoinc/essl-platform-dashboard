@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from pathlib import Path
 
@@ -96,6 +97,11 @@ def create_app(database: Database | None = None) -> Flask:
             "Database %s not set up; serving the setup page until one of these runs: %s",
             getattr(database, "path", "?"), "; ".join(SETUP_COMMANDS),
         )
+    if getattr(database, "is_fetched_copy", lambda: False)():
+        # A copy made by `backup fetch` holds real staff emails: sign-in codes
+        # print to this log, and nothing is mailed to a real person.
+        os.environ["ESSL_MAIL_PROVIDER"] = "console"
+        _logger.warning("Database is a fetched copy of production: mail is forced to the console")
     app.extensions["essl_database"] = database
     app.extensions["essl_setup_token"] = config.setup_token()
     app.extensions["essl_max_upload_mb"] = max_upload_mb

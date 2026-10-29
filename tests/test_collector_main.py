@@ -851,6 +851,35 @@ class DoorStepDatabaseTest(unittest.TestCase):
         self.assertEqual(self.panel.instances, [])
 
 
+class FetchedCopyTest(unittest.TestCase):
+    def test_collector_main_refuses_a_fetched_copy_but_not_a_normal_database(self) -> None:
+        import tempfile
+
+        from essl_hub.db import FETCHED_COPY_KEY, Database
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "essl.db")
+            database = Database(path)
+            database.initialize(())
+            database.set_setting(FETCHED_COPY_KEY, "2026-10-28 from recent/x")
+            database.close()
+            with patch.dict(os.environ, {"ESSL_DB_PATH": path}), \
+                    patch.object(collector_main, "run_forever") as run:
+                with self.assertRaisesRegex(SystemExit, "fetched copy"):
+                    collector_main.main()
+                run.assert_not_called()
+                with self.assertRaises(SystemExit):
+                    collector_main.main()  # still refused on a second start
+            normal = os.path.join(tmp, "normal.db")
+            fresh = Database(normal)
+            fresh.initialize(())
+            fresh.close()
+            with patch.dict(os.environ, {"ESSL_DB_PATH": normal}), \
+                    patch.object(collector_main, "run_forever") as run:
+                collector_main.main()
+                run.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -1076,6 +1105,7 @@ class SpoolCycleTest(unittest.TestCase):
                 "spool_oldest_at",
                 "dead_count",
                 "offline",
+                "c3_history",
             },
         )
         self.assertEqual([n for n in os.listdir(self.tmp) if n.endswith(".tmp")], [])
@@ -1139,3 +1169,39 @@ class SpoolCycleTest(unittest.TestCase):
             count = connection.execute("SELECT COUNT(*) AS n FROM punches").fetchone()["n"]
         self.assertEqual(count, 2)
         self.assertEqual(self.spool.depth(), 0)
+
+
+class BacklogRepairTest(unittest.TestCase):
+    """U5/R6: the first good history read confirms every live-log row v11
+    left without a direction, on a real database, inserting nothing."""
+
+    def test_one_history_read_fills_a_week_of_live_rows(self) -> None:
+        import tempfile
+
+        from essl_hub.db import Database
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        database = Database(os.path.join(tmp.name, "essl.db"))
+        self.addCleanup(database.close)
+        database.initialize(DEVICES)
+        c3 = DEVICES[1]
+        start = datetime(2026, 10, 22, 9, 0)
+        live, history = [], []
+        for n in range(20):
+            at = start + timedelta(days=n % 7, hours=n // 7)
+            base = {"fingerprint": f"fp-{n}", "device_id": c3.id, "site": c3.site, "device_user_id": "NP0009",
+                    "event_timestamp": at, "door": "1"}
+            live.append({**base, "raw_direction_byte": 15, "trusted_direction": None,
+                         "raw": {"pin": "9", "source": "realtime_fallback"}})
+            byte = n % 2
+            history.append({**base, "raw_direction_byte": byte,
+                            "trusted_direction": "entry" if byte == 0 else "exit", "raw": {"Pin": 9}})
+        database.insert_punches(live)
+        collect_once(database, c3, collector=lambda d: CollectionResult(history, "TCP history", "SN", "FW"))
+        with database.connect() as connection:
+            rows = connection.execute(
+                "SELECT fingerprint, trusted_direction, raw_direction_byte FROM punches ORDER BY id").fetchall()
+        self.assertEqual(len(rows), 20)  # nothing inserted
+        self.assertEqual({r["fingerprint"]: (r["trusted_direction"], r["raw_direction_byte"]) for r in rows},
+                         {h["fingerprint"]: (h["trusted_direction"], h["raw_direction_byte"]) for h in history})

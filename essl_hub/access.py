@@ -78,7 +78,7 @@ def can_archive(actor: dict, target: dict) -> tuple[str, int] | None:
     return None
 
 
-# --- Fix requests (KTD6) ------------------------------------------------------
+# --- Fix requests (KTD6, v10: admins decide like HR) -------------------------
 
 FIX_REVIEW_ROLES = ("hr", "admin")
 
@@ -88,25 +88,20 @@ def can_view_fix_reviews(actor: dict | None) -> bool:
     return actor is not None and actor["role"] in FIX_REVIEW_ROLES
 
 
-def can_approve_fix(actor: dict | None, request: dict, database) -> bool:
-    """KTD6: HR decides, never the requester. An admin who is not the
-    requester decides only while no active HR user other than the requester
-    exists. Database.decide_fix_lines re-checks the requester rule."""
+def can_approve_fix(actor: dict | None, request: dict) -> bool:
+    """HR and admins decide a fix request; nobody decides their own.
+    Database.decide_fix_lines re-checks the requester rule."""
     if actor is None or request is None:
         return False
-    requester = request["employee_id"]
-    if actor["id"] == requester:
+    if actor["id"] == request["employee_id"]:
         return False
-    if actor["role"] == "hr":
-        return True
-    if actor["role"] == "admin":
-        return not database.has_active_hr_other_than(requester)
-    return False
+    return actor["role"] in FIX_REVIEW_ROLES
 
 
 def fix_approvers(requester_id: int, database) -> list[dict]:
-    """Who decides a person's fix request, by the can_approve_fix rule: every
-    active HR user but the requester, else every active admin but them."""
+    """Who is emailed about a person's fix request: every active HR user but
+    the requester, else every active admin but them. Admins can decide a
+    request either way (can_approve_fix)."""
     approvers = [p for p in database.active_hr_users() if p["id"] != requester_id]
     if approvers:
         return approvers
@@ -123,3 +118,28 @@ PUNCH_ARCHIVE_ROLES = ("admin",)
 def can_archive_punches(actor: dict | None) -> bool:
     """Archive and restore ID-issue punches (admins only)."""
     return actor is not None and actor["role"] in PUNCH_ARCHIVE_ROLES
+
+
+# --- Direct punch fixes (v10) -----------------------------------------------------
+
+# An admin may fix an employee's punches without a request, but never their
+# own: those go through a request someone else decides. Database.
+# record_direct_corrections re-checks both rules.
+DIRECT_FIX_ROLES = ("admin",)
+
+
+def can_fix_punches_directly(actor: dict | None, employee_id: int) -> bool:
+    """Fix ``employee_id``'s punches now (admins only, never their own)."""
+    return actor is not None and actor["role"] in DIRECT_FIX_ROLES and actor["id"] != employee_id
+
+
+# --- Raw device facts on a punch (v10) --------------------------------------------
+
+# Device, door, reader and the raw in/out byte behind a punch: what HR and
+# admins need to check a direction against the device. Employees and managers
+# see the plain reason only.
+PUNCH_FACT_ROLES = ("hr", "admin")
+
+
+def can_see_punch_facts(actor: dict | None) -> bool:
+    return actor is not None and actor["role"] in PUNCH_FACT_ROLES

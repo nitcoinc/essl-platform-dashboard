@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest import mock
 
 from essl_hub import backup as bk
+from essl_hub import db as db_module
 from essl_hub.db import SCHEMA_VERSION, Database
 
 NOW = datetime(2026, 10, 14, 10, 0, 0)
@@ -186,6 +187,354 @@ class GuardTest(Base):
 # --- U3: pruning (written first) ----------------------------------------------
 
 
+class ReplaceRestoreTest(Base):
+    """`restore --replace --yes`: swap a live database for a snapshot, proving nothing else has it open."""
+
+    def _live(self) -> str:
+        """A live database that owns the bucket: the newest snapshot holds one
+        punch; the live file has since taken two more."""
+        db_id = self.init_db()
+        self.cycle()
+        _insert_punch(self.db_path, 1)
+        self.cycle(NOW + timedelta(minutes=15))
+        _insert_punch(self.db_path, 2)
+        _insert_punch(self.db_path, 3)
+        return db_id
+
+    def _count(self, path: str) -> int:
+        conn = sqlite3.connect(path)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM punches").fetchone()[0]
+        finally:
+            conn.close()
+
+    def _replace(self, **kw) -> None:
+        kw.setdefault("replace", True)
+        kw.setdefault("yes", True)
+        with redirect_stdout(io.StringIO()):
+            bk.cmd_restore(self.db_path, self.r2, key="recent/20261014T101500.db.gz", **kw)
+
+    def _aside(self) -> list[Path]:
+        return sorted(p for p in self.dir.iterdir() if ".pre-restore-" in p.name)
+
+    def test_replace_installs_the_snapshot_keeps_the_old_file_and_the_database_id(self) -> None:
+        db_id = self._live()
+        self._replace()
+        self.assertEqual(self._count(self.db_path), 1)
+        [aside] = self._aside()
+        self.assertEqual(self._count(str(aside)), 3)
+        self.assertEqual(aside.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(_setting(self.db_path, "database_id"), db_id)
+        database = Database(self.db_path, must_exist=True)
+        self.addCleanup(database.close)
+        self.assertEqual(database.schema_version(), SCHEMA_VERSION)
+        # The pre-restore snapshot of the live state went to R2 first.
+        self.assertTrue(any(k.startswith("recent/") and k != "recent/20261014T101500.db.gz"
+                            and k != "recent/20261014T100000.db.gz" for k in self.r2.objects))
+        self.assertEqual(self.leftovers(), [])
+
+    def test_replace_needs_yes_and_an_existing_database(self) -> None:
+        self._live()
+        with self.assertRaisesRegex(bk.CommandError, "--yes"):
+            self._replace(yes=False)
+        self.assertEqual(self._count(self.db_path), 3)
+        self.assertEqual(self._aside(), [])
+        os.unlink(self.db_path)
+        for suffix in ("-wal", "-shm"):
+            if os.path.exists(self.db_path + suffix):
+                os.unlink(self.db_path + suffix)
+        with self.assertRaisesRegex(bk.CommandError, "nothing to replace"):
+            self._replace()
+
+    def test_replace_refuses_while_another_process_has_the_database_open(self) -> None:
+        self._live()
+        holder = subprocess.Popen(
+            [sys.executable, "-c",
+             "import sqlite3,sys,time\n"
+             "c=sqlite3.connect(sys.argv[1],isolation_level=None)\n"
+             "c.execute('PRAGMA journal_mode=WAL'); c.execute('SELECT COUNT(*) FROM punches').fetchall()\n"
+             "print('ready',flush=True); time.sleep(60)", self.db_path],
+            stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (holder.kill(), holder.wait()))
+        self.assertEqual(holder.stdout.readline().strip(), "ready")
+        puts = list(self.r2.puts)
+        with self.assertRaisesRegex(bk.CommandError, "still has the database open"):
+            self._replace()
+        self.assertEqual(self._count(self.db_path), 3)
+        self.assertEqual((self._aside(), self.r2.puts), ([], puts))
+
+    def test_replace_refuses_while_a_reader_is_active_in_this_process(self) -> None:
+        self._live()
+        reader = sqlite3.connect(self.db_path, isolation_level=None)
+        self.addCleanup(reader.close)
+        reader.execute("PRAGMA journal_mode=WAL")
+        reader.execute("BEGIN")
+        reader.execute("SELECT COUNT(*) FROM punches").fetchall()
+        with self.assertRaisesRegex(bk.CommandError, "still has the database open"):
+            self._replace()
+        self.assertEqual(self._aside(), [])
+
+    def test_a_failed_pre_restore_snapshot_changes_nothing_unless_skipped(self) -> None:
+        self._live()
+        self.r2.fail_put = RuntimeError("R2 down")
+        with self.assertRaisesRegex(bk.CommandError, "pre-restore snapshot"):
+            self._replace()
+        self.assertEqual((self._count(self.db_path), self._aside()), (3, []))
+        self._replace(skip_pre_snapshot=True)
+        self.assertEqual(self._count(self.db_path), 1)
+        self.assertEqual(len(self._aside()), 1)
+
+    def test_a_second_replace_in_the_same_second_never_overwrites_the_first_aside_copy(self) -> None:
+        self._live()
+        with mock.patch.object(bk, "_now", return_value=NOW):
+            self._replace(skip_pre_snapshot=True)
+            [first] = self._aside()
+            _insert_punch(self.db_path, 9)
+            with self.assertRaisesRegex(bk.CommandError, "already exists"):
+                self._replace(skip_pre_snapshot=True)
+        self.assertEqual(self._count(str(first)), 3)
+        self.assertEqual(self._count(self.db_path), 2)  # the restored punch plus the one just added
+
+    def test_a_failed_install_puts_the_previous_database_back(self) -> None:
+        self._live()
+        real_rename = os.rename
+
+        def fail_install(src, dst, *a, **kw):
+            if str(dst) == self.db_path and os.path.basename(str(src)).startswith("restore-"):
+                raise OSError("disk full")
+            return real_rename(src, dst, *a, **kw)
+
+        with mock.patch.object(bk.os, "rename", side_effect=fail_install):
+            with self.assertRaisesRegex(bk.CommandError, "put back"):
+                self._replace(skip_pre_snapshot=True)
+        self.assertEqual(self._count(self.db_path), 3)
+        self.assertEqual(self._aside(), [])
+        self.assertEqual(self.leftovers(), [])
+
+
+    # --- review hardening ---------------------------------------------------------------------
+
+    def test_exclusivity_is_proved_again_under_the_lock_just_before_the_swap(self) -> None:
+        self._live()
+        calls = []
+
+        def second_check_fails(path):
+            calls.append(path)
+            if len(calls) == 2:
+                raise bk.CommandError("another process still has the database open (test)")
+
+        with mock.patch.object(bk, "_require_exclusive", side_effect=second_check_fails):
+            with self.assertRaisesRegex(bk.CommandError, "still has the database open"):
+                self._replace()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual((self._count(self.db_path), self._aside()), (3, []))
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_live_file_that_is_not_a_database_is_refused_with_a_message(self) -> None:
+        self._live()
+        for suffix in ("-wal", "-shm"):
+            if os.path.exists(self.db_path + suffix):
+                os.unlink(self.db_path + suffix)
+        Path(self.db_path).write_bytes(b"this is not a sqlite file" * 200)
+        with self.assertRaisesRegex(bk.CommandError, "not a readable database"):
+            self._replace()
+        self.assertEqual(self._aside(), [])
+
+    def test_drill_cannot_be_combined_with_replace(self) -> None:
+        self._live()
+        with self.assertRaisesRegex(bk.CommandError, "--drill"):
+            self._replace(drill=True)
+        self.assertEqual((self._count(self.db_path), self._aside()), (3, []))
+
+    def test_a_failed_rollback_names_the_files_that_could_not_be_put_back(self) -> None:
+        self._live()
+        real_rename = os.rename
+
+        def fail(src, dst, *a, **kw):
+            name = os.path.basename(str(src))
+            if str(dst) == self.db_path and name.startswith("restore-"):
+                raise OSError("disk full")  # the install
+            if ".pre-restore-" in name and str(dst) == self.db_path:
+                raise OSError("permission denied")  # the rollback of the main file
+            return real_rename(src, dst, *a, **kw)
+
+        with mock.patch.object(bk.os, "rename", side_effect=fail):
+            with self.assertRaises(bk.CommandError) as caught:
+                self._replace(skip_pre_snapshot=True)
+        message = str(caught.exception)
+        self.assertIn("could not be put back", message)
+        self.assertIn(".pre-restore-", message)
+        self.assertEqual(len(self._aside()), 1)  # nothing was lost: the old file is still there
+
+    def test_the_cli_wires_replace_fetch_and_the_older_schema_flag(self) -> None:
+        self._live()
+        env = {"ESSL_DB_PATH": self.db_path}
+        with mock.patch.dict(os.environ, env), mock.patch.object(bk, "make_client", return_value=self.r2):
+            with redirect_stdout(io.StringIO()), mock.patch("sys.stderr", new=io.StringIO()) as err:
+                self.assertEqual(bk.main(["restore", "--replace"]), 1)  # no --yes
+                self.assertIn("--yes", err.getvalue())
+                out = self.dir / "cli-out"
+                self.assertEqual(bk.main(["fetch", "--out", str(out)]), 0)
+                self.assertEqual(len(list(out.iterdir())), 1)
+                self.assertEqual(bk.main(["restore", "--replace", "--yes", "--skip-pre-snapshot",
+                                          "--key", "recent/20261014T101500.db.gz"]), 0)
+        self.assertEqual(self._count(self.db_path), 1)
+
+    def test_the_cli_snapshots_an_older_schema_only_with_its_flag(self) -> None:
+        with mock.patch.object(db_module, "SCHEMA_VERSION", 9), \
+                mock.patch.object(bk, "SCHEMA_VERSION", 9), \
+                mock.patch.dict(db_module.MIGRATIONS, {}, clear=False):
+            for later in (10, 11):
+                db_module.MIGRATIONS.pop(later)
+            self.init_db()
+        env = {"ESSL_DB_PATH": self.db_path}
+        with mock.patch.dict(os.environ, env), mock.patch.object(bk, "make_client", return_value=self.r2), \
+                redirect_stdout(io.StringIO()):
+            self.assertEqual(bk.main(["now"]), 1)
+            self.assertEqual(bk.main(["now", "--allow-older-schema"]), 0)
+
+
+class FetchTest(Base):
+    """`fetch`: a scrubbed, inert local copy of an R2 snapshot, written outside the live data folder."""
+
+    SECRET_PASSWORD = "device-pass-9f3a71c2"
+    SECRET_KEY_HASH = "api-key-hash-5b8e44d0"
+
+    def _snapshots(self) -> str:
+        db_id = self.init_db()
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO devices (id, site, model, ip, port, protocol, comm_password, door_params_request, "
+            "door_params_requested_at, door_params_result) VALUES ('c3', 'Gachibowli', 'C3-400', "
+            "'10.0.0.2', 4370, 'c3-pullsdk', ?, '{\"DoorN\": 1}', '2026-10-14 09:00:00', 'queued')",
+            (self.SECRET_PASSWORD,))
+        conn.execute(
+            "INSERT INTO api_keys (prefix, key_hash, label, created_at) VALUES ('ab12', ?, 'hrms', "
+            "'2026-10-14 09:00:00')", (self.SECRET_KEY_HASH,))
+        conn.commit()
+        conn.close()
+        _insert_punch(self.db_path, 1)
+        _seed_secrets(self.db_path)
+        self.cycle()
+        _insert_punch(self.db_path, 2)
+        self.cycle(NOW + timedelta(minutes=15))
+        for suffix in ("", "-wal", "-shm"):
+            if os.path.exists(self.db_path + suffix):
+                os.unlink(self.db_path + suffix)
+        return db_id
+
+    def _fetch(self, out: Path | None = None, **kw) -> Path:
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            return bk.cmd_fetch(str(out or self.dir / "out"), self.r2, **kw)
+
+    def test_fetch_writes_a_scrubbed_inert_copy_with_a_new_id_and_the_marker(self) -> None:
+        production_id = self._snapshots()
+        copy = self._fetch()
+        self.assertEqual(copy.name, "essl-fetched-20261014T101500.db")
+        self.assertEqual(copy.stat().st_mode & 0o777, 0o600)
+        conn = sqlite3.connect(copy)
+        self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM punches").fetchone()[0], 2)
+        self.assertEqual(conn.execute("SELECT comm_password, door_params_request, door_params_requested_at, "
+                                      "door_params_result FROM devices").fetchone(), (None, None, None, None))
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM api_keys").fetchone()[0], 0)
+        for table in bk.SCRUBBED_TABLES:
+            self.assertEqual(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0, table)
+        conn.close()
+        self.assertNotEqual(_setting(str(copy), "database_id"), production_id)
+        self.assertIn("recent/20261014T101500.db.gz", _setting(str(copy), bk.FETCHED_COPY_KEY))
+
+    def test_no_planted_secret_survives_in_the_file_bytes(self) -> None:
+        self._snapshots()
+        data = self._fetch().read_bytes()
+        self.assertNotIn(self.SECRET_PASSWORD.encode(), data)
+        self.assertNotIn(self.SECRET_KEY_HASH.encode(), data)
+
+    def test_only_the_final_file_is_left_and_the_live_data_folder_is_untouched(self) -> None:
+        self._snapshots()
+        before = sorted(p.name for p in self.dir.iterdir())
+        out = self.dir / "out"
+        self._fetch(out)
+        self.assertEqual([p.name for p in out.iterdir()], ["essl-fetched-20261014T101500.db"])
+        self.assertEqual(out.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir() if p.name != "out"), before)
+        self.assertFalse(os.path.exists(self.db_path))  # fetch never recreates the live database
+
+    def test_a_chosen_key_an_existing_file_and_missing_credentials(self) -> None:
+        self._snapshots()
+        older = self._fetch(key="recent/20261014T100000.db.gz")
+        conn = sqlite3.connect(older)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM punches").fetchone()[0], 1)
+        conn.close()
+        with self.assertRaisesRegex(bk.CommandError, "already exists"):
+            self._fetch(key="recent/20261014T100000.db.gz")
+        with self.assertRaisesRegex(bk.CommandError, "R2 credentials"):
+            bk.cmd_fetch(str(self.dir / "o2"), None)
+        self.assertEqual([p.name for p in (self.dir / "out").iterdir()], [older.name])
+
+    def test_a_corrupt_download_or_newer_schema_leaves_nothing_behind(self) -> None:
+        out = self.dir / "out"
+        self.r2.objects["recent/20261014T100000.db.gz"] = b"not gzip"
+        with self.assertRaises(bk.CommandError):
+            self._fetch(out)
+        raw = self.dir / "new.db"
+        conn = sqlite3.connect(raw)
+        conn.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute(f"PRAGMA user_version={SCHEMA_VERSION + 1}")
+        conn.commit()
+        conn.close()
+        self.r2.objects["recent/20261014T100000.db.gz"] = gzip.compress(raw.read_bytes())
+        with self.assertRaisesRegex(bk.CommandError, "newer"):
+            self._fetch(out)
+        self.assertEqual(list(out.iterdir()), [])
+
+    def test_a_fetched_copy_can_neither_back_up_nor_be_adopted(self) -> None:
+        self._snapshots()
+        copy = self._fetch()
+        status = str(self.dir / "copy-status.json")
+        self.r2.puts.clear()
+        latest_before = self.r2.latest()
+        self.assertEqual(bk.run_cycle(str(copy), self.r2, status_path=status, now=NOW), "blocked")
+        self.assertIn("fetched copy", bk.load_status(status)["last_error"])
+        self.assertEqual(self.r2.puts, [])
+        with self.assertRaisesRegex(bk.CommandError, "fetched copy"):
+            bk.cmd_adopt(str(copy), self.r2, confirm=lambda: True)
+        self.assertEqual(self.r2.latest(), latest_before)  # the bucket still belongs to production
+
+
+    def test_a_stale_unscrubbed_temp_folder_from_an_interrupted_fetch_is_swept(self) -> None:
+        self._snapshots()
+        out = self.dir / "out"
+        stale = out / ".fetch-interrupted"
+        stale.mkdir(parents=True)
+        (stale / "restore-old.db").write_bytes(self.SECRET_PASSWORD.encode())
+        self._fetch(out)
+        self.assertFalse(stale.exists())
+
+    def test_fetch_scrubs_an_older_schema_snapshot_that_lacks_tables_and_columns(self) -> None:
+        self.init_db()
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO devices (id, site, model, ip, port, protocol, comm_password) VALUES "
+            "('c3', 'G', 'C3', '10.0.0.2', 4370, 'c3-pullsdk', ?)", (self.SECRET_PASSWORD,))
+        conn.execute("DROP TABLE api_keys")
+        conn.execute("ALTER TABLE devices DROP COLUMN door_params_request")
+        conn.execute("PRAGMA user_version=7")
+        conn.execute("DELETE FROM settings WHERE key='schema_version'")
+        conn.commit()
+        conn.close()
+        self.assertEqual(self.cycle(allow_older=True), "ok")
+        for suffix in ("", "-wal", "-shm"):
+            if os.path.exists(self.db_path + suffix):
+                os.unlink(self.db_path + suffix)
+        copy = self._fetch()
+        self.assertNotIn(self.SECRET_PASSWORD.encode(), copy.read_bytes())
+        check = sqlite3.connect(copy)
+        self.assertIsNone(check.execute("SELECT comm_password FROM devices").fetchone()[0])
+        check.close()
+
+
 class PruneTest(Base):
     def test_retention_windows(self) -> None:
         def key(prefix: str, at: datetime) -> str:
@@ -212,7 +561,7 @@ class PruneTest(Base):
         self.init_db()
         counter = iter(range(10_000))
 
-        def fake_snapshot(source_path, work_dir):
+        def fake_snapshot(source_path, work_dir, **kwargs):
             packed = Path(work_dir) / "export.db.gz"
             packed.write_bytes(f"snap-{next(counter)}".encode())
             return bk.Snapshot(packed, _setting(self.db_path, "database_id"), 0)
@@ -315,6 +664,41 @@ class CycleTest(Base):
         conn.close()
         self.assertEqual(self.cycle(), "failed")
         self.assertIn("schema version", self.status()["last_error"])
+
+    def _v9_database(self) -> None:
+        """A database one schema step behind the code (the state during an update)."""
+        with mock.patch.object(db_module, "SCHEMA_VERSION", 9), \
+                mock.patch.object(bk, "SCHEMA_VERSION", 9), \
+                mock.patch.dict(db_module.MIGRATIONS, {}, clear=False):
+            for later in (10, 11):
+                db_module.MIGRATIONS.pop(later)
+            self.init_db()
+
+    def test_pre_update_snapshot_of_an_older_schema_needs_the_flag(self) -> None:
+        self._v9_database()
+        self.assertEqual(self.cycle(), "failed")  # the scheduled loop stays strict
+        self.assertEqual(self.r2.puts, [])
+        self.assertEqual(self.cycle(allow_older=True), "ok")
+        [key] = [k for k in self.r2.objects if k.startswith("recent/")]
+        raw = self.dir / "older.db"
+        raw.write_bytes(gzip.decompress(self.r2.objects[key]))
+        self.assertEqual(bk._schema_version(sqlite3.connect(raw)), 9)
+
+    def test_older_schema_snapshot_scrubs_only_the_tables_it_has(self) -> None:
+        self.init_db()
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("DROP TABLE mail_outbox")  # an older file has no such table
+        conn.execute("PRAGMA user_version=7")
+        conn.execute("DELETE FROM settings WHERE key='schema_version'")
+        conn.commit()
+        conn.close()
+        self.assertEqual(self.cycle(allow_older=True), "ok")
+        [key] = [k for k in self.r2.objects if k.startswith("recent/")]
+        snapshot = self.dir / "older-snap.db"
+        snapshot.write_bytes(gzip.decompress(self.r2.objects[key]))
+        check = sqlite3.connect(snapshot)
+        self.assertNotIn("mail_outbox", {r[0] for r in check.execute("SELECT name FROM sqlite_master")})
+        check.close()
 
     def test_nightly_once_per_day_after_hour_and_across_restart(self) -> None:
         self.init_db()
@@ -478,6 +862,27 @@ class RestoreTest(Base):
         conn.close()
         self.assertEqual(_setting(self.db_path, "database_id"), db_id)
         self.assertEqual(self.leftovers(), [])
+
+    def test_restored_v9_snapshot_opens_and_migrates_to_the_current_schema(self) -> None:
+        with mock.patch.object(db_module, "SCHEMA_VERSION", 9), \
+                mock.patch.object(bk, "SCHEMA_VERSION", 9), \
+                mock.patch.dict(db_module.MIGRATIONS, {}, clear=False):
+            for later in (10, 11):
+                db_module.MIGRATIONS.pop(later)
+            self.init_db()
+            self.cycle()
+        for suffix in ("", "-wal", "-shm"):
+            if os.path.exists(self.db_path + suffix):
+                os.unlink(self.db_path + suffix)
+        self._restore()
+        database = Database(self.db_path, must_exist=True)
+        self.addCleanup(database.close)
+        self.assertEqual(database.schema_version(), 9)
+        database.migrate_schema()
+        self.assertEqual(database.schema_version(), SCHEMA_VERSION)
+        with database.connect() as connection:
+            columns = {r["name"] for r in connection.execute("PRAGMA table_info(punch_corrections)").fetchall()}
+        self.assertIn("created_by_name", columns)
 
     def test_restore_key(self) -> None:
         _, older = self._snapshots()

@@ -110,6 +110,7 @@ class CheckinsApiTest(unittest.TestCase):
             self.database.upsert_employee(device_user_id=uid, name=name, email=f"{name.lower()}@x.com")
         asha = self.database.employee_by_device_user_id("101")["id"]
         hari = self.database.employee_by_device_user_id("900")["id"]
+        self.database.set_employee_role(hari, "hr")
         request_id = self.database.file_fix_lines(asha, date(2026, 3, 2), [
             {"kind": "ignore", "target_fingerprint": "a"},
             {"kind": "flip", "target_fingerprint": "b", "direction": "entry"},

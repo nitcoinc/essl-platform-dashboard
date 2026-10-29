@@ -326,6 +326,7 @@ class ExportTest(unittest.TestCase):
         ], source="session")["request_id"]
         self.database.upsert_employee(device_user_id="900", name="HR", email="hr@x.com")
         hr = self.database.employee_by_device_user_id("900")
+        self.database.set_employee_role(hr["id"], "hr")
         self.database.decide_fix_lines(request_id, [
             {"line_id": l["id"], "status": "approved"}
             for l in self.database.fix_request(request_id)["lines"]], actor_id=hr["id"])

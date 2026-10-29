@@ -301,6 +301,10 @@ class FakeDatabase:
                 "raw_state": p.get("raw_state", ""),
                 "site": p.get("site"),
                 "device_id": p.get("device_id"),
+                "door": p.get("door"),
+                "reader": p.get("reader"),
+                "source": p.get("source"),
+                "in_out_raw": p.get("in_out_raw"),
             }
             for p in self.punches
             if p.get("device_user_id") in wanted and start <= p["event_timestamp"] < end
@@ -667,9 +671,6 @@ class FakeDatabase:
     def active_hr_users(self) -> list[dict]:
         return self._with_role("hr")
 
-    def has_active_hr_other_than(self, employee_id) -> bool:
-        return any(p["id"] != employee_id for p in self._with_role("hr"))
-
     def active_admins(self) -> list[dict]:
         return self._with_role("admin")
 
@@ -926,9 +927,12 @@ class FakeDatabase:
                         raise ValueError(f"line {line['id']} needs a direction to flip to")
                     correction = {"kind": "set_direction", "fingerprint": line["target_fingerprint"],
                                   "event_timestamp": None, "direction": direction}
+                actor = self.employees_by_id[actor_id]
                 corrections.append({
                     **correction, "employee_id": request["employee_id"],
                     "work_day": request["work_day"], "request_line_id": line["id"], "created_at": now,
+                    "created_by": actor_id, "created_by_name": actor["name"],
+                    "created_by_role": actor["role"], "path": "request", "reason": note,
                 })
             updates[line["id"]] = {"status": decision["status"], "hr_event_time": hr_time,
                                    "hr_direction": hr_direction, "decided_by": actor_id,
@@ -957,6 +961,38 @@ class FakeDatabase:
             self._fix_event(request_id, None, actor_id, "decided", {"status": "pending"},
                             {"status": final, "note": note})
         return {"status": request["status"], "decided": decided, "skipped": skipped}
+
+    def record_direct_corrections(self, employee_id, work_day, edits, *, actor_id, reason):
+        from essl_hub import db as db_module
+
+        self._check_online()
+        reason = (reason or "").strip()
+        if not reason:
+            raise ValueError("A reason is required.")
+        if len(reason) > db_module.FIX_NOTE_MAX_CHARS:
+            raise ValueError(f"reason is longer than {db_module.FIX_NOTE_MAX_CHARS} characters")
+        edits = list(edits)
+        if not edits:
+            raise ValueError("There is nothing to change.")
+        actor = self.employees_by_id.get(actor_id)
+        if actor is None or actor.get("archived_at") or actor["role"] != "admin":
+            raise db_module.RuleViolation("Only an admin can fix punches directly.")
+        if actor_id == employee_id:
+            raise db_module.RuleViolation("Nobody fixes their own punches directly; file a fix request instead.")
+        target = self.employees_by_id.get(employee_id)
+        if target is None or target.get("archived_at"):
+            raise db_module.RuleViolation("No such active employee.")
+        now = _ist_now()
+        for edit in edits:
+            self.corrections.append({
+                "id": len(self.corrections) + 1, "employee_id": employee_id, "work_day": work_day,
+                "kind": edit["kind"], "fingerprint": edit.get("fingerprint"),
+                "event_timestamp": edit.get("event_timestamp"), "direction": edit.get("direction"),
+                "request_line_id": None, "created_at": now, "created_by": actor_id,
+                "created_by_name": actor["name"], "created_by_role": actor["role"],
+                "path": "direct", "reason": reason,
+            })
+        return len(edits)
 
     def corrections_for(self, employee_ids, start: datetime, end: datetime) -> list[dict]:
         wanted = set(employee_ids)
@@ -2124,7 +2160,7 @@ class CorrectionOverlayWebTest(_QuickViewBase):
         screens = self._screens()
         self.assertIn("3h 55m", screens["team"])
         self.assertEqual(screens["csv"], "3:55")
-        self.assertNotIn("added by HR", screens["day"])
+        self.assertNotIn(">added<", screens["day"])
 
     def test_approved_fixes_show_the_same_corrected_hours_everywhere(self) -> None:
         self._decide("approved")
@@ -2138,8 +2174,8 @@ class CorrectionOverlayWebTest(_QuickViewBase):
             self.assertIn('<h3 class="raw-punches-title">All punches (7)</h3>', page)
             self.assertIn('<span class="chip chip-neutral">ignored</span>', page)
             self.assertIn('<span class="chip chip-info">direction fixed</span>', page)
-            self.assertEqual(page.count('<span class="chip chip-info">added by HR</span>'), 2)
-            self.assertIn("2 punches added by HR, 1 punch ignored", page)
+            self.assertEqual(page.count('<span class="chip chip-info">added</span>'), 2)
+            self.assertIn("2 punches added, 1 punch ignored", page)
             self.assertNotIn("Fix pending", page)
         self.assertIn('status-chip status-met">Met</span>', screens["people"])
         # The device rows are untouched.
@@ -2519,6 +2555,49 @@ class AdminDeviceEditTest(unittest.TestCase):
         page = self.client.get("/devices?saved=uppal-x990")
         self.assertIn("192.168.5.5", page.text)
         self.assertIn("Saved", page.text)
+
+    def _collector_status(self, payload: dict | None) -> None:
+        import json
+        import tempfile
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "collector.json")
+        if payload is not None:
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+        patcher = patch.dict(os.environ, {"ESSL_COLLECTOR_STATUS_PATH": path})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_failing_c3_history_download_is_shown_on_its_card_only(self) -> None:
+        self._collector_status({"last_poll": "2026-10-29 19:30:10", "c3_history": {
+            "gachibowli-c3-400": {
+                "last_ok_at": "2026-10-21 19:05:00", "failing_since": "2026-10-29 18:00:00",
+                "last_error": "ConnectionResetError: [Errno 104] Connection reset by peer",
+                "next_try_at": "2026-10-29 19:59:00", "seconds": 57.5}}})
+        page = self.client.get("/devices").text
+        self.assertEqual(page.count("History download failing since"), 1)
+        self.assertIn("29 Oct, 18:00", page)
+        self.assertIn("Connection reset by peer", page)
+        self.assertIn("Live-log directions stay unconfirmed until it works.", page)
+        self.assertIn("Next try", page)
+        self.assertEqual(page.count("History last read"), 1)
+        self.assertIn("21 Oct, 19:05", page)
+
+    def test_a_working_history_shows_only_when_it_was_last_read(self) -> None:
+        self._collector_status({"c3_history": {"gachibowli-c3-400": {
+            "last_ok_at": "2026-10-29 19:00:00", "failing_since": None, "last_error": None,
+            "next_try_at": None}}})
+        page = self.client.get("/devices").text
+        self.assertNotIn("History download failing", page)
+        self.assertIn("History last read", page)
+
+    def test_no_status_file_adds_no_history_line(self) -> None:
+        self._collector_status(None)
+        page = self.client.get("/devices").text
+        self.assertNotIn("History last read", page)
+        self.assertNotIn("History download", page)
 
     def test_pending_until_a_newer_attempt_then_applied(self) -> None:
         self._post("uppal-x990", ip="192.168.1.201", port="4370", comm_password="")
@@ -4035,6 +4114,28 @@ class DatabaseSetupTest(unittest.TestCase):
         response = app.test_client().get("/api/health")
         self.assertEqual(response.status_code, 503)
         self.assertIn("Busy, try again", response.text)
+
+
+class FetchedCopyMailTest(unittest.TestCase):
+    """A database made by `backup fetch` holds real staff emails: the web app never mails them."""
+
+    def test_a_fetched_copy_forces_console_mail_even_when_a_provider_is_configured(self) -> None:
+        from essl_hub import config
+
+        database = FakeDatabase()
+        database.is_fetched_copy = lambda: True
+        with patch.dict(os.environ, {"ESSL_MAIL_PROVIDER": "resend", "RESEND_API_KEY": "re_x"}):
+            create_app(database=database)
+            self.assertEqual(config.mail_provider(), "console")
+
+    def test_a_normal_database_keeps_its_configured_provider(self) -> None:
+        from essl_hub import config
+
+        database = FakeDatabase()
+        database.is_fetched_copy = lambda: False
+        with patch.dict(os.environ, {"ESSL_MAIL_PROVIDER": "resend", "RESEND_API_KEY": "re_x"}):
+            create_app(database=database)
+            self.assertEqual(config.mail_provider(), "resend")
 
 
 if __name__ == "__main__":
@@ -5790,6 +5891,21 @@ class FixReportTest(unittest.TestCase):
         self.assertEqual(lines[1]["note"], "I went back in.")
         self.assertEqual(len(self.database.outbox), 2)
 
+    def test_flipping_a_live_swipe_with_no_direction_turns_its_scored_direction(self) -> None:
+        # v11: a C3 live-log byte 15 has no stored direction; after 13:00 Out
+        # the day scores it In, so "other direction" files an Out.
+        self.database.insert_punches([{
+            **_punch_row("a-live", datetime(2026, 10, 26, 17, 51), None, uid="118"),
+            "raw_direction_byte": 15, "door": "1", "source": "realtime_fallback"}])
+        page = self.client.get(f"/fix/{self.token}").text
+        self.assertIn('17:51:00</span>\n          <span class="punch-dir">In</span>', page)
+        response = self._post_link(flip="a-live")
+        self.assertEqual(response.status_code, 302)
+        [request] = self._requests()
+        [line] = self.database.fix_request(request["id"])["lines"]
+        self.assertEqual((line["kind"], line["target_fingerprint"], line["direction"]),
+                         ("flip", "a-live", "exit"))
+
     def test_flip_and_ignore_targets_and_after_midnight_times(self) -> None:
         self._post_link(ignore="a-in", **{"add-0-time": "01:30", "add-0-dir": "out"},
                         token=self._link(self.asha, self.DAY - timedelta(days=1)))
@@ -6212,7 +6328,27 @@ class FixReviewTest(unittest.TestCase):
         self.assertIn("https://hub.example.com/day?date=2026-10-26", mail["text_body"])
         day = self.client.get(f"/day?employee={self.asha['id']}&date=2026-10-26").text
         self.assertIn("7h 20m", day)
-        self.assertIn("added by HR", day)
+        self.assertIn('<span class="chip chip-info">added</span>', day)
+
+    def test_a_flip_of_a_live_swipe_with_no_direction_defaults_and_applies_the_opposite(self) -> None:
+        # v11: a C3 live-log byte 15 after the 17:00 Out scores In; an older
+        # flip line that carries no direction defaults to Out and approves.
+        self.database.insert_punches([{
+            **_punch_row("a-live", datetime(2026, 10, 26, 17, 51), None, uid="118"),
+            "raw_direction_byte": 15, "door": "1", "source": "realtime_fallback"}])
+        request_id = self._file({"kind": "flip", "target_fingerprint": "a-live",
+                                 "event_time": datetime(2026, 10, 26, 17, 51), "direction": None})
+        self._sign_in(self.hari)
+        detail = self.client.get(f"/fixes/review/{request_id}").text
+        [line] = self._lines(request_id)
+        self.assertIn(f'name="line-{line["id"]}-dir" value="out" checked', detail)
+        form = {f"line-{line['id']}-decision": "approved", f"line-{line['id']}-dir": "out"}
+        self._post(request_id, form)
+        response = self._post(request_id, form, "/confirm")
+        self.assertEqual(response.status_code, 302)
+        [correction] = self.database.corrections
+        self.assertEqual((correction["kind"], correction["fingerprint"], correction["direction"]),
+                         ("set_direction", "a-live", "exit"))
 
     def test_hr_edit_of_the_time_is_applied_and_audited_with_both_values(self) -> None:
         request_id = self._file()
@@ -6328,15 +6464,18 @@ class FixReviewTest(unittest.TestCase):
         self.assertEqual(self._post(request_id, form, "/confirm").status_code, 302)
         self.assertEqual(self.database.fix_request(request_id)["status"], "approved")
 
-    def test_admin_cannot_approve_while_another_hr_user_exists(self) -> None:
+    def test_admin_approves_while_an_hr_user_exists_and_is_recorded_as_the_decider(self) -> None:
         request_id = self._file()
         self._sign_in(self.admin)
         page = self.client.get(f"/fixes/review/{request_id}")
         self.assertEqual(page.status_code, 200)
-        self.assertIn("Admins approve only when no HR user", page.text)
-        self.assertNotIn('name="line-', page.text)
-        self.assertEqual(self._post(request_id, self._approve_all(request_id), "/confirm").status_code, 403)
-        self.assertEqual(self.database.fix_request(request_id)["status"], "pending")
+        self.assertNotIn("View only", page.text)
+        self.assertIn('name="line-', page.text)
+        form = self._approve_all(request_id)
+        self.assertEqual(self._post(request_id, form, "/confirm").status_code, 302)
+        filed = self.database.fix_request(request_id)
+        self.assertEqual(filed["status"], "approved")
+        self.assertEqual(filed["decided_by"], self.admin["id"])
 
     def test_admin_never_approves_their_own_request(self) -> None:
         self.database.set_employee_role(self.hari["id"], "employee")
@@ -6489,6 +6628,262 @@ class FixReviewTest(unittest.TestCase):
         self.assertTrue(response.headers["Location"].endswith("/fixes/review"))
         self.assertEqual(self.database.fix_request(request_id)["status"], "approved")
         self.assertIn("Saved. 1 line approved, 0 rejected.", self._flash())
+
+    # --- Why each punch counted the way it did (v10) ----------------------------------------
+
+    NO_DIRECTION = "The live log gave no direction; counted as "
+
+    def _reported_day(self) -> None:
+        """The shape the user reported on 2026-10-28 after v11: two live-log
+        swipes with no direction (byte 15), then three entries."""
+        live = {"door": "1", "reader": "", "source": "realtime_fallback", "device_id": DEVICES[1].id}
+        day = datetime(2026, 10, 25)
+        self.database.insert_punches([
+            {**_punch_row("r-1", day.replace(hour=17, minute=51), None, uid="118"), **live,
+             "raw_direction_byte": 15},
+            {**_punch_row("r-2", day.replace(hour=19, minute=53), None, uid="118"), **live,
+             "raw_direction_byte": 15},
+            {**_punch_row("r-3", day.replace(hour=19, minute=55), "entry", uid="118"), **live,
+             "raw_direction_byte": 0},
+            {**_punch_row("r-4", day.replace(hour=20, minute=7), "entry", uid="118"), **live,
+             "raw_direction_byte": 0},
+            {**_punch_row("r-5", day.replace(hour=20, minute=22), "entry", uid="118"), **live,
+             "raw_direction_byte": 0},
+        ])
+
+    def test_the_reported_day_says_why_each_punch_is_in_or_out_and_admins_see_the_raw_facts(self) -> None:
+        self._reported_day()
+        self._sign_in(self.admin)
+        page = self.client.get(f"/day?employee={self.asha['id']}&date=2026-10-25").text
+        # The arrival scores In and the leaving Out, as the user tapped them.
+        self.assertEqual(page.count(f"{self.NO_DIRECTION}In from the swipes around it"), 1)
+        self.assertEqual(page.count(f"{self.NO_DIRECTION}Out from the swipes around it"), 1)
+        self.assertNotIn("Guessed Out", page)
+        self.assertEqual(page.count("Device said In"), 3)
+        self.assertIn("gachibowli-c3-400 · door 1 · in/out byte 15 · live log", page)
+        self.assertIn("gachibowli-c3-400 · door 1 · in/out byte 0 · live log", page)
+
+    def test_the_employee_sees_the_reason_but_not_device_door_reader_or_byte(self) -> None:
+        self._reported_day()
+        self._sign_in(self.asha)
+        page = self.client.get("/day?date=2026-10-25").text
+        self.assertEqual(page.count(self.NO_DIRECTION), 2)
+        for hidden in ("gachibowli-c3-400 ·", "door 1", "in/out byte", "live log</span>"):
+            self.assertNotIn(hidden, page)
+
+    def test_hr_sees_the_raw_facts_and_a_manager_does_not(self) -> None:
+        self._reported_day()
+        self._sign_in(self.hari)
+        self.assertIn("in/out byte 15", self.client.get(f"/day?employee={self.asha['id']}&date=2026-10-25").text)
+        self._sign_in(self.boss)
+        self.assertNotIn("in/out byte", self.client.get(f"/day?employee={self.asha['id']}&date=2026-10-25").text)
+
+    # --- Admin direct fixes (v10): the form, confirm-then-apply, who may use them -----
+
+    def _url(self, person=None, step: str = "", day=None) -> str:
+        return f"/fixes/direct/{(person or self.asha)['id']}/{(day or self.DAY).isoformat()}{step}"
+
+    def _form(self, **extra) -> dict:
+        return {"reason": "Badge log shows he arrived at 13:40", **extra}
+
+    def _fp(self, uid: str, name: str) -> str:
+        return next(p["fingerprint"] for p in self.database.punches if p["fingerprint"] == name)
+
+    def _fix(self, step: str, form: dict, client=None, person=None):
+        client = client or self.client
+        return client.post(self._url(person, step), data={"csrf": self._csrf(client), **form})
+
+    def test_admin_sees_a_form_listing_the_punches_and_a_button_on_their_day(self) -> None:
+        self._sign_in(self.admin)
+        page = self.client.get(self._url())
+        self.assertEqual(page.status_code, 200)
+        for name in ("act-a-in", "act-a-out", "act-a-last"):
+            self.assertIn(f'name="{name}"', page.text)
+        self.assertIn('name="reason"', page.text)
+        self.assertIn('name="add-0-time"', page.text)
+        day = self.client.get(f"/day?employee={self.asha['id']}&date=2026-10-26")
+        self.assertIn("Fix punches", day.text)
+        self.assertIn(self._url(), day.text)
+
+    def test_only_an_admin_may_open_it_and_never_for_their_own_day(self) -> None:
+        # Three sign-ins at most per test: the code limiter blocks a fourth.
+        for person in (self.hari, self.boss):
+            with self.subTest(person=person["name"]):
+                self._sign_in(person)
+                self.assertEqual(self.client.get(self._url()).status_code, 403)
+                self.assertEqual(self._fix("", self._form()).status_code, 403)
+                self.assertNotIn("Fix punches", self.client.get(f"/day?employee={self.asha['id']}&date=2026-10-26").text)
+        self._sign_in(self.admin)
+        self.assertEqual(self.client.get(self._url(self.admin)).status_code, 403)
+        self.assertEqual(self._fix("/confirm", self._form(), person=self.admin).status_code, 403)
+        self.assertNotIn("Fix punches", self.client.get("/day?date=2026-10-26").text)
+        self.assertEqual(self.database.corrections, [])
+
+    def test_unknown_future_and_archived_targets_are_not_found(self) -> None:
+        self._sign_in(self.admin)
+        self.assertEqual(self.client.get("/fixes/direct/9999/2026-10-26").status_code, 404)
+        self.assertEqual(self.client.get(self._url(day=self.DAY + timedelta(days=3))).status_code, 404)
+        self.assertEqual(self.client.get("/fixes/direct/%d/not-a-day" % self.asha["id"]).status_code, 404)
+        self.database.employees_by_id[self.asha["id"]]["archived_at"] = datetime(2026, 10, 26, 12, 0)
+        self.assertEqual(self.client.get(self._url()).status_code, 404)
+
+    def test_preview_shows_hours_before_and_after_and_writes_nothing(self) -> None:
+        self._sign_in(self.admin)
+        # 09:00 In, 13:00 Out, 17:00 Out (orphan): 4h 00m. Counting 17:00 as In adds nothing, but a
+        # missed In at 13:40 makes 13:40-17:00 a stretch: 7h 20m.
+        preview = self._fix("", self._form(**{"add-0-time": "13:40", "add-0-dir": "in"}))
+        self.assertEqual(preview.status_code, 200)
+        self.assertIn("Confirm fix", preview.text)
+        self.assertIn("4h 00m", preview.text)
+        self.assertIn("7h 20m", preview.text)
+        self.assertIn("Add a missed punch: In at 13:40", preview.text)
+        self.assertIn("Badge log shows he arrived at 13:40", preview.text)
+        self.assertEqual(self.database.corrections, [])
+
+    def test_confirm_records_the_admin_the_reason_and_the_path(self) -> None:
+        self._sign_in(self.admin)
+        form = self._form(**{"act-a-last": "ignore", "add-0-time": "13:40", "add-0-dir": "in"})
+        preview = self._fix("", form)
+        hidden = {"punch_set_hash": self._hash_of(preview.text)}
+        response = self._fix("/confirm", {**form, **hidden})
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(f"/day?employee={self.asha['id']}&date=2026-10-26", response.headers["Location"])
+        kinds = sorted((c["kind"], c["fingerprint"], c["direction"]) for c in self.database.corrections)
+        self.assertEqual(kinds, [("add", None, "entry"), ("ignore", "a-last", None)])
+        for correction in self.database.corrections:
+            self.assertEqual(
+                (correction["created_by"], correction["created_by_name"], correction["created_by_role"],
+                 correction["path"], correction["request_line_id"], correction["reason"]),
+                (self.admin["id"], "Ada Admin", "admin", "direct", None,
+                 "Badge log shows he arrived at 13:40"))
+        day = self.client.get(f"/day?employee={self.asha['id']}&date=2026-10-26").text
+        # 09:00-13:00 (4h) plus the added In at 13:40, open until 18:00 now: 8h 20m.
+        self.assertIn("8h 20m", day)
+
+    def test_a_flip_sets_an_absolute_direction_even_on_a_direction_less_punch(self) -> None:
+        self.database.insert_punches([{**_punch_row("x-1", datetime(2026, 10, 26, 18, 0), None, uid="118")}])
+        self._sign_in(self.admin)
+        form = self._form(**{"act-x-1": "out"})
+        response = self._fix("/confirm", {**form, "punch_set_hash": self._hash_of(self._fix("", form).text)})
+        self.assertEqual(response.status_code, 302)
+        [correction] = self.database.corrections
+        self.assertEqual((correction["kind"], correction["fingerprint"], correction["direction"]),
+                         ("set_direction", "x-1", "exit"))
+
+    def test_the_fix_form_says_why_each_punch_counts_and_warns_on_an_unconfirmed_guess(self) -> None:
+        self.database.insert_punches([{
+            **_punch_row("g-1", datetime(2026, 10, 26, 18, 0), None, uid="118"),
+            "raw_direction_byte": 15, "door": "1", "source": "realtime_fallback"}])
+        self._sign_in(self.admin)
+        page = self.client.get(self._url()).text
+        self.assertIn("Device said In", page)
+        self.assertEqual(page.count("Not confirmed yet"), 1)
+        self.assertIn("The live log gave no direction; counted as In", page)
+
+    def test_validation_refuses_without_writing(self) -> None:
+        self._sign_in(self.admin)
+        cases = {
+            "no reason": ({"reason": "", "act-a-last": "ignore"}, "Say why you are changing"),
+            "no change": (self._form(), "Choose at least one change"),
+            "add without a direction": (self._form(**{"add-0-time": "13:40"}), "Choose In or Out"),
+            "add without a time": (self._form(**{"add-0-dir": "in"}), "Enter the time"),
+            "add in the future": (self._form(**{"add-0-time": "23:00", "add-0-dir": "in"}), "happened yet"),
+            "a punch that is not on the day": (self._form(**{"act-nope": "ignore"}), "no longer on the day"),
+            "a bad action": (self._form(**{"act-a-in": "explode"}), "Choose In, Out or Ignore"),
+        }
+        for label, (form, message) in cases.items():
+            with self.subTest(label):
+                for step in ("", "/confirm"):
+                    response = self._fix(step, form)
+                    self.assertEqual(response.status_code, 400)
+                    self.assertIn(message, response.text)
+        self.assertEqual(self.database.corrections, [])
+
+    def test_a_day_that_changed_since_the_preview_is_refused(self) -> None:
+        self._sign_in(self.admin)
+        form = self._form(**{"act-a-last": "ignore"})
+        stale = self._hash_of(self._fix("", form).text)
+        self.database.insert_punches([_punch_row("late", datetime(2026, 10, 26, 17, 30), "entry", uid="118")])
+        response = self._fix("/confirm", {**form, "punch_set_hash": stale})
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("changed after you opened this page", response.text)
+        self.assertEqual(self.database.corrections, [])
+
+    def test_forged_actor_fields_in_the_form_are_ignored(self) -> None:
+        self._sign_in(self.admin)
+        form = self._form(**{"act-a-last": "ignore", "created_by": str(self.hari["id"]),
+                             "created_by_role": "hr", "path": "request", "created_by_name": "Hari HR"})
+        self._fix("/confirm", {**form, "punch_set_hash": self._hash_of(self._fix("", form).text)})
+        [correction] = self.database.corrections
+        self.assertEqual((correction["created_by"], correction["created_by_role"], correction["path"]),
+                         (self.admin["id"], "admin", "direct"))
+
+    def test_bad_csrf_is_refused(self) -> None:
+        self._sign_in(self.admin)
+        response = self.client.post(self._url(), data={"csrf": "wrong", **self._form(**{"act-a-last": "ignore"})})
+        self.assertIn(response.status_code, (400, 403))
+        self.assertEqual(self.database.corrections, [])
+
+    @staticmethod
+    def _hidden_inputs(html: str) -> dict:
+        import re
+        from html import unescape
+
+        return {name: unescape(value) for name, value in
+                re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)"', html)}
+
+    def test_posting_exactly_what_the_preview_returned_writes_the_same_corrections(self) -> None:
+        self._sign_in(self.admin)
+        form = self._form(**{"act-a-last": "ignore", "add-0-time": "13:40", "add-0-dir": "in"})
+        preview = self._fix("", form)
+        hidden = self._hidden_inputs(preview.text)
+        self.assertIn("punch_set_hash", hidden)
+        response = self.client.post(self._url(step="/confirm"), data=hidden)
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(sorted((c["kind"], c["fingerprint"]) for c in self.database.corrections),
+                         [("add", None), ("ignore", "a-last")])
+
+    def test_replaying_a_confirmation_never_adds_the_missed_punch_twice(self) -> None:
+        self._sign_in(self.admin)
+        form = self._form(**{"add-0-time": "13:40", "add-0-dir": "in"})
+        hidden = self._hidden_inputs(self._fix("", form).text)
+        self.assertEqual(self.client.post(self._url(step="/confirm"), data=hidden).status_code, 302)
+        again = self.client.post(self._url(step="/confirm"), data=hidden)
+        self.assertEqual(again.status_code, 409)
+        self.assertEqual([c["kind"] for c in self.database.corrections], ["add"])
+
+    def test_choosing_the_direction_a_punch_already_has_still_pins_it(self) -> None:
+        self._sign_in(self.admin)
+        form = self._form(**{"act-a-in": "in"})  # a-in is already an In from the device
+        self._fix("/confirm", {**form, "punch_set_hash": self._hash_of(self._fix("", form).text)})
+        [correction] = self.database.corrections
+        self.assertEqual((correction["kind"], correction["fingerprint"], correction["direction"]),
+                         ("set_direction", "a-in", "entry"))
+
+    def test_a_database_refusal_becomes_403_and_a_bad_edit_becomes_400(self) -> None:
+        from essl_hub.db import RuleViolation
+
+        self._sign_in(self.admin)
+        form = self._form(**{"act-a-last": "ignore"})
+        confirm = {**form, "punch_set_hash": self._hash_of(self._fix("", form).text)}
+        with patch.object(self.database, "record_direct_corrections", side_effect=RuleViolation("no")):
+            self.assertEqual(self._fix("/confirm", confirm).status_code, 403)
+        with patch.object(self.database, "record_direct_corrections", side_effect=ValueError("bad edit")):
+            response = self._fix("/confirm", confirm)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Bad edit", response.text)
+        self.assertEqual(self.database.corrections, [])
+
+    def test_the_form_tells_the_admin_who_can_read_the_reason(self) -> None:
+        self._sign_in(self.admin)
+        self.assertIn("Asha Rao and their managers can read it", self.client.get(self._url()).text)
+
+    @staticmethod
+    def _hash_of(html: str) -> str:
+        marker = 'name="punch_set_hash" value="'
+        start = html.index(marker) + len(marker)
+        return html[start: html.index('"', start)]
+
 
 
 class CopyAndPhoneLayoutTest(unittest.TestCase):

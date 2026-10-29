@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% import "_ui.html" as ui %}
+{% block title %}Confirm fix: {{ person.name }}, {{ day_label }} - eSSL Attendance Hub{% endblock %}
+{% set status_labels = {'met': 'Met', 'short': 'Short', 'incomplete': 'Incomplete', 'open': 'In progress', 'empty': 'No swipes'} %}
+{% macro hours_cell(minutes) -%}{{ ui.hours(minutes) }}{%- endmacro %}
+{% block content %}
+<div class="review-page">
+<header class="topbar">
+  <div>
+    <h1>Confirm fix</h1>
+    <p>{{ person.name }} · {{ day_label }}. Nothing is saved until you confirm.</p>
+  </div>
+</header>
+
+<section class="review-card review-confirm" aria-labelledby="summary-heading">
+  <h2 id="summary-heading">{{ summary|length }} {{ 'change' if summary|length == 1 else 'changes' }}</h2>
+  <ul class="review-lines">
+    {% for text in summary %}<li class="review-line"><div class="review-line-head"><span class="review-line-text">{{ text }}</span></div></li>{% endfor %}
+  </ul>
+  <div class="report-note"><p class="report-note-label">Your reason (kept with the change)</p><p class="report-note-text">{{ reason }}</p></div>
+</section>
+
+<section class="review-card" aria-labelledby="preview-heading">
+  <h2 id="preview-heading">Hours for {{ day_label }}</h2>
+  <div class="table-scroll">
+    <table class="table review-preview">
+      <caption class="visually-hidden">Hours before and after this fix</caption>
+      <thead><tr><th scope="col"><span class="visually-hidden">Measure</span></th><th scope="col" class="num">Before</th><th scope="col" class="num">After</th></tr></thead>
+      <tbody>
+        <tr><th scope="row">Worked</th><td class="num">{{ hours_cell(before.effective_minutes) }}</td><td class="num">{{ hours_cell(after.effective_minutes) }}</td></tr>
+        <tr><th scope="row">First in to last out</th><td class="num">{{ hours_cell(before.gross_minutes) }}</td><td class="num">{{ hours_cell(after.gross_minutes) }}</td></tr>
+        <tr><th scope="row">Breaks</th><td class="num">{{ hours_cell(before.break_minutes) }}</td><td class="num">{{ hours_cell(after.break_minutes) }}</td></tr>
+        <tr><th scope="row">Status</th><td class="num">{{ status_labels.get(before.status, before.status) }}</td><td class="num">{{ status_labels.get(after.status, after.status) }}</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="field-hint">Fixes are added on top of the device records, which never change. Frappe HR still receives the device's own direction.</p>
+</section>
+
+<form method="post" action="{{ url_for('fixes.direct_confirm', employee_id=person.id, day=day.isoformat()) }}" class="review-actions">
+  <input type="hidden" name="csrf" value="{{ csrf_token }}">
+  <input type="hidden" name="punch_set_hash" value="{{ form_hash }}">
+  {% for name, value in fields %}<input type="hidden" name="{{ name }}" value="{{ value }}">{% endfor %}
+  {{ ui.button('Confirm and save', 'primary', type='submit') }}
+  {{ ui.button('Change the fix', 'secondary', href=url_for('fixes.direct_form', employee_id=person.id, day=day.isoformat())) }}
+  {{ ui.button('Cancel', 'tertiary', href=url_for('me.day_view', employee=person.id, date=day.isoformat())) }}
+</form>
+</div>
+{% endblock %}

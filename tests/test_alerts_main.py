@@ -708,5 +708,35 @@ class AlertsServiceTest(unittest.TestCase):
         self.assertTrue(self.messages(needle="not set up"))
 
 
+class FetchedCopyTest(unittest.TestCase):
+    def test_alerts_main_refuses_a_fetched_copy_but_not_a_normal_database(self) -> None:
+        import os
+        import tempfile
+        from unittest.mock import patch
+
+        from essl_hub import alerts_main
+        from essl_hub.db import FETCHED_COPY_KEY, Database
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "essl.db")
+            database = Database(path)
+            database.initialize(())
+            database.set_setting(FETCHED_COPY_KEY, "2026-10-28 from recent/x")
+            database.close()
+            with patch.dict(os.environ, {"ESSL_DB_PATH": path}), \
+                    patch.object(alerts_main, "run_loop") as loop:
+                with self.assertRaisesRegex(SystemExit, "fetched copy"):
+                    alerts_main.main()
+                loop.assert_not_called()
+            normal = os.path.join(tmp, "normal.db")
+            fresh = Database(normal)
+            fresh.initialize(())
+            fresh.close()
+            with patch.dict(os.environ, {"ESSL_DB_PATH": normal}), \
+                    patch.object(alerts_main, "run_loop") as loop:
+                alerts_main.main()
+                loop.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

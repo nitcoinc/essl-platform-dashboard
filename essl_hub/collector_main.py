@@ -14,6 +14,7 @@ from .collectors import (
     CollectionResult,
     DoorStep,
     c3_door_step,
+    c3_history_status,
     collect,
 )
 from .config import (
@@ -388,6 +389,9 @@ def collector_status(database: Database, spool: Spool, state: PollState) -> dict
         "spool_oldest_at": spool.oldest_at(),
         "dead_count": spool.dead_count(),
         "offline": not state.ready,
+        # R4: per C3 device, when its history download last worked or since
+        # when it has been failing (the Devices page shows it).
+        "c3_history": c3_history_status(),
     }
 
 
@@ -476,6 +480,9 @@ def main() -> None:
     # retries the boot work each cycle until the file exists.
     spool = Spool(spool_path())
     database = Database(must_exist=True)
+    if database.is_fetched_copy():
+        raise SystemExit("this database is a fetched copy of a production snapshot; "
+                         "the collector will not poll devices or push to Frappe from it")
     frappe = None
     frappe_config = frappe_sync.config_from_env()
     if frappe_config is not None:

@@ -1289,6 +1289,59 @@ class DatabaseTest(unittest.TestCase):
         self.assertIsNone(classify(ValueError("no such table: nope")))
 
 
+    def _rerun_from(self, version: int) -> None:
+        with self.database.transaction() as connection:
+            connection.execute("UPDATE settings SET value=? WHERE key='schema_version'", (str(version),))
+            connection.execute(f"PRAGMA user_version={version}")
+        self.database.migrate_schema()
+
+    def test_v11_drops_stored_live_15_guesses_only(self) -> None:
+        live = {"pin": "118", "event_type": 0, "source": "realtime_fallback"}
+        self.database.insert_punches([
+            self._punch(fingerprint="live-15", raw_direction_byte=15, trusted_direction="exit", raw=live),
+            self._punch(fingerprint="live-15-ev20", raw_direction_byte=15, trusted_direction="exit",
+                        raw={**live, "event_type": 20}),
+            self._punch(fingerprint="live-filled", raw_direction_byte=1, trusted_direction="exit", raw=live),
+            self._punch(fingerprint="live-0", raw_direction_byte=0, trusted_direction="entry", raw=live),
+            # Filled by history before 2026-10-26, when a fill kept byte 15.
+            self._punch(fingerprint="old-fill-entry", raw_direction_byte=15, trusted_direction="entry", raw=live),
+            self._punch(fingerprint="old-fill-exit", raw_direction_byte=15, trusted_direction="exit", raw=live),
+            self._punch(fingerprint="denied", raw_direction_byte=15, trusted_direction="exit",
+                        raw={**live, "event_type": 24}),
+            self._punch(fingerprint="history-1", raw_direction_byte=1, trusted_direction="exit"),
+            self._punch(fingerprint="x990", device_id="uppal-x990", site="Uppal",
+                        raw_direction_byte=15, trusted_direction="exit", raw=live),
+        ])
+        with self.database.transaction() as connection:  # collected before the guess rule existed
+            connection.execute("UPDATE punches SET collected_at='2026-10-10 09:00:00' WHERE fingerprint='old-fill-exit'")
+        self._rerun_from(10)
+        cutover = self.database.setting("c3_live15_cutover_at")
+        self._rerun_from(10)  # a re-run changes nothing and keeps the first cutover
+        with self.database.connect() as connection:
+            rows = {r["fingerprint"]: r["trusted_direction"] for r in connection.execute(
+                "SELECT fingerprint, trusted_direction FROM punches").fetchall()}
+        self.assertEqual(rows, {"live-15": None, "live-15-ev20": None, "live-filled": "exit", "live-0": "entry",
+                                "old-fill-entry": "entry", "old-fill-exit": "exit", "denied": "exit",
+                                "history-1": "exit", "x990": "exit"})
+        self.assertIsNotNone(cutover)
+        self.assertEqual(self.database.setting("c3_live15_cutover_at"), cutover)
+        datetime.strptime(cutover, "%Y-%m-%d %H:%M:%S")
+
+    def test_v11_on_an_empty_file_stores_no_cutover(self) -> None:
+        self._rerun_from(10)
+        self.assertIsNone(self.database.setting("c3_live15_cutover_at"))
+
+    def test_history_fills_a_live_row_v11_cleared(self) -> None:
+        live = {"pin": "118", "event_type": 0, "source": "realtime_fallback"}
+        self.database.insert_punches([
+            self._punch(raw_direction_byte=15, trusted_direction="exit", raw=live)])
+        self._rerun_from(10)
+        history = self._punch(trusted_direction="entry", raw_direction_byte=0)
+        self.assertEqual(self.database.fill_punch_directions([history]), 1)
+        with self.database.connect() as connection:
+            row = connection.execute("SELECT trusted_direction, raw_direction_byte FROM punches").fetchone()
+        self.assertEqual((row["trusted_direction"], row["raw_direction_byte"]), ("entry", 0))
+
     def test_fill_punch_directions_updates_null_c3_rows_without_inserting(self) -> None:
         self.database.insert_punches([self._punch(trusted_direction=None, raw_direction_byte=15)])
         history = self._punch(trusted_direction="exit", raw_direction_byte=1)
@@ -1419,7 +1472,8 @@ class MissedPunchSchemaTest(unittest.TestCase):
         )
         with mock.patch.object(db_module, "SCHEMA_VERSION", 7), \
                 mock.patch.dict(db_module.MIGRATIONS, {}, clear=False):
-            db_module.MIGRATIONS.pop(8)
+            for later in (8, 9, 10, 11):  # a v7 file has none of the later steps
+                db_module.MIGRATIONS.pop(later)
             old.initialize((device,))
             old.insert_punches([{
                 "fingerprint": "fp-v7", "device_id": "uppal-x990", "site": "Uppal",
@@ -1447,6 +1501,276 @@ class MissedPunchSchemaTest(unittest.TestCase):
         self.assertEqual(fingerprints, ["fp-v7"])
         self.assertEqual(old.setting("daily_target_minutes"), "450")
         self.assertEqual(old.device_windows(), {"uppal-x990": 60})
+
+    def _v9_database(self, name: str = "v9.db") -> db_module.Database:
+        """A database at schema v9 with Asha's request decided by Hari, written
+        the way v9 code did (no audit columns)."""
+        path = os.path.join(self._tmp.name, name)
+        old = db_module.Database(path)
+        self.addCleanup(old.close)
+        with mock.patch.object(db_module, "SCHEMA_VERSION", 9), \
+                mock.patch.dict(db_module.MIGRATIONS, {}, clear=False):
+            for later in (10, 11):
+                db_module.MIGRATIONS.pop(later)
+            old.initialize(())
+        for uid, person, role in (("101", "Asha", "employee"), ("102", "Hari", "hr")):
+            old.upsert_employee(device_user_id=uid, name=person, email=f"{person.lower()}@x.com")
+            old.set_employee_role(old.employee_by_device_user_id(uid)["id"], role)
+        return old
+
+    def _v9_correction(self, old: db_module.Database, *, decider: int | None, note: str | None,
+                       day=DAY) -> int:
+        asha = old.employee_by_device_user_id("101")["id"]
+        request = old.file_fix_lines(
+            asha, day, [self._add_in()], source="link", punch_set_hash="h1")["request_id"]
+        line = old.fix_request(request)["lines"][0]["id"]
+        with old.transaction() as connection:
+            connection.execute(
+                "UPDATE fix_request_lines SET status='approved', decided_by=?, decided_at=? WHERE id=?",
+                (decider, datetime(2026, 10, 27, 9, 0), line))
+            connection.execute("UPDATE fix_requests SET decision_note=? WHERE id=?", (note, request))
+            connection.execute(
+                "INSERT INTO punch_corrections (employee_id, work_day, kind, event_timestamp, direction, "
+                "request_line_id, created_at) VALUES (?, ?, 'add', ?, 'entry', ?, ?)",
+                (asha, day, datetime(2026, 10, 26, 13, 40), line, datetime(2026, 10, 27, 9, 0)))
+        return asha
+
+    def _corrections(self, database: db_module.Database) -> list[dict]:
+        with database.connect() as connection:
+            return connection.execute("SELECT * FROM punch_corrections ORDER BY id").fetchall()
+
+    def test_v9_to_v10_keeps_corrections_and_names_the_old_decider(self) -> None:
+        old = self._v9_database()
+        hari = old.employee_by_device_user_id("102")["id"]
+        asha = self._v9_correction(old, decider=hari, note="Badge log agrees")
+        before = [(c["id"], c["employee_id"], c["kind"], c["event_timestamp"], c["direction"],
+                   c["request_line_id"]) for c in self._corrections(old)]
+        old.migrate_schema()
+        old.migrate_schema()  # a re-run is a no-op
+        [row] = self._corrections(old)
+        self.assertEqual(
+            [(row["id"], row["employee_id"], row["kind"], row["event_timestamp"], row["direction"],
+              row["request_line_id"])], before)
+        self.assertEqual(
+            (row["created_by"], row["created_by_name"], row["created_by_role"], row["path"], row["reason"]),
+            (hari, "Hari", None, "request", "Badge log agrees"))
+        self.assertEqual(row["employee_id"], asha)
+        # The overlay still reads it.
+        [read] = old.corrections_for([asha], datetime(2026, 10, 26, 6), datetime(2026, 10, 27, 6))
+        self.assertEqual(read["id"], row["id"])
+        with old.connect() as connection:
+            seq = connection.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name='punch_corrections'").fetchone()
+        self.assertGreaterEqual(seq["seq"], row["id"])
+
+    def test_correction_whose_decider_is_gone_migrates_as_before_the_audit_trail(self) -> None:
+        old = self._v9_database()
+        self._v9_correction(old, decider=None, note=None)
+        old.migrate_schema()
+        [row] = self._corrections(old)
+        self.assertEqual((row["created_by"], row["created_by_name"], row["created_by_role"], row["reason"]),
+                         (None, "before audit trail", None, None))
+
+    def test_v9_code_can_still_insert_a_correction_into_a_v10_file(self) -> None:
+        old = self._v9_database("rollback.db")
+        old.migrate_schema()
+        request = old.file_fix_lines(
+            old.employee_by_device_user_id("101")["id"], DAY, [self._add_in()],
+            source="link", punch_set_hash="h1")["request_id"]
+        line = old.fix_request(request)["lines"][0]["id"]
+        with old.transaction() as connection:  # the exact v9 statement
+            connection.execute(
+                "INSERT INTO punch_corrections (employee_id, work_day, kind, fingerprint, "
+                "event_timestamp, direction, request_line_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (old.employee_by_device_user_id("101")["id"], DAY, "add", None,
+                 datetime(2026, 10, 26, 13, 40), "entry", line, datetime(2026, 10, 27, 9, 0)))
+        [row] = self._corrections(old)
+        self.assertEqual((row["created_by_name"], row["path"]), ("before audit trail", "request"))
+
+    def test_audit_columns_cannot_be_updated_or_deleted_but_an_employee_delete_still_cascades(self) -> None:
+        request_id = self._file(self._add_in())["request_id"]
+        line = self.database.fix_request(request_id)["lines"][0]["id"]
+        self.database.decide_fix_lines(request_id, [{"line_id": line, "status": "approved"}],
+                                       actor_id=self.hari, note="ok")
+        for statement in (
+            "UPDATE punch_corrections SET created_by_name = 'Someone else'",
+            "UPDATE punch_corrections SET created_by_role = 'admin'",
+            "UPDATE punch_corrections SET reason = 'changed'",
+            "UPDATE punch_corrections SET direction = 'exit'",
+            "DELETE FROM punch_corrections",
+        ):
+            with self.subTest(statement=statement), self.assertRaises(Exception) as caught:
+                with self.database.transaction() as connection:
+                    connection.execute(statement)
+            self.assertIn("append-only", str(caught.exception))
+        self.assertEqual(self._count("punch_corrections"), 1)
+        with self.database.transaction() as connection:  # employee removal still cascades
+            connection.execute("DELETE FROM employees WHERE id = ?", (self.asha,))
+        self.assertEqual(self._count("punch_corrections"), 0)
+
+    def test_the_autoincrement_counter_survives_the_rebuild(self) -> None:
+        old = self._v9_database("seq.db")
+        hari = old.employee_by_device_user_id("102")["id"]
+        self._v9_correction(old, decider=hari, note=None)
+        self._v9_correction(old, decider=hari, note=None, day=DAY + timedelta(days=1))
+        with old.transaction() as connection:  # the newest correction is gone before the upgrade
+            connection.execute("DELETE FROM punch_corrections WHERE id = 2")
+        old.migrate_schema()
+        with old.connect() as connection:
+            seq = connection.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name='punch_corrections'").fetchone()["seq"]
+        self.assertEqual(seq, 2)  # an id once handed out is never reused
+
+    def test_a_corrections_id_and_actor_cannot_be_repointed_but_the_actor_can_be_nulled_by_a_delete(self) -> None:
+        request_id = self._file(self._add_in())["request_id"]
+        line = self.database.fix_request(request_id)["lines"][0]["id"]
+        self.database.decide_fix_lines(request_id, [{"line_id": line, "status": "approved"}],
+                                       actor_id=self.hari, note="ok")
+        for statement in (
+            "UPDATE punch_corrections SET id = 99",
+            f"UPDATE punch_corrections SET created_by = {self.adam}",
+            "UPDATE punch_corrections SET created_by = NULL",
+        ):
+            with self.subTest(statement=statement), self.assertRaises(Exception) as caught:
+                with self.database.transaction() as connection:
+                    connection.execute(statement)
+            self.assertIn("append-only", str(caught.exception))
+        # The foreign key's own SET NULL (the actor's row is gone) still goes through.
+        with self.database.transaction() as connection:
+            connection.execute("UPDATE fix_request_lines SET decided_by = NULL WHERE decided_by = ?", (self.hari,))
+            connection.execute("UPDATE fix_requests SET decided_by = NULL WHERE decided_by = ?", (self.hari,))
+            connection.execute("DELETE FROM employees WHERE id = ?", (self.hari,))
+        [row] = self._corrections(self.database)
+        self.assertEqual((row["created_by"], row["created_by_name"]), (None, "Hari"))
+
+    def test_an_unknown_or_unauthorised_approver_cannot_decide_a_request(self) -> None:
+        request_id = self._file(self._add_in())["request_id"]
+        line = self.database.fix_request(request_id)["lines"][0]["id"]
+        for actor in (9999, self._person("106", "Eve", "employee")):
+            with self.subTest(actor=actor), self.assertRaises(db_module.RuleViolation):
+                self.database.decide_fix_lines(request_id, [{"line_id": line, "status": "approved"}],
+                                               actor_id=actor)
+        self.assertEqual(self._count("punch_corrections"), 0)
+        self.assertEqual(self.database.fix_request(request_id)["status"], "pending")
+
+    def test_deleting_the_decider_keeps_the_name_that_was_recorded(self) -> None:
+        request_id = self._file(self._add_in())["request_id"]
+        line = self.database.fix_request(request_id)["lines"][0]["id"]
+        self.database.decide_fix_lines(request_id, [{"line_id": line, "status": "approved"}],
+                                       actor_id=self.hema)
+        with self.database.transaction() as connection:
+            connection.execute("UPDATE fix_request_lines SET decided_by = NULL WHERE decided_by = ?", (self.hema,))
+            connection.execute("UPDATE fix_requests SET decided_by = NULL WHERE decided_by = ?", (self.hema,))
+            connection.execute("DELETE FROM employees WHERE id = ?", (self.hema,))
+        [row] = self._corrections(self.database)
+        self.assertEqual((row["created_by"], row["created_by_name"], row["created_by_role"]),
+                         (None, "Hema", "hr"))
+
+    def test_a_request_decision_stamps_who_when_role_path_and_reason(self) -> None:
+        request_id = self._file(self._add_in())["request_id"]
+        line = self.database.fix_request(request_id)["lines"][0]["id"]
+        self.database.decide_fix_lines(request_id, [{"line_id": line, "status": "approved"}],
+                                       actor_id=self.adam, note="Door log confirms")
+        [row] = self._corrections(self.database)
+        self.assertEqual(
+            (row["created_by"], row["created_by_name"], row["created_by_role"], row["path"], row["reason"]),
+            (self.adam, "Adam", "admin", "request", "Door log confirms"))
+        [read] = self.database.corrections_for(
+            [self.asha], datetime(2026, 10, 26, 6), datetime(2026, 10, 27, 6))
+        self.assertEqual((read["created_by_name"], read["created_by_role"]), ("Adam", "admin"))
+
+    def test_day_punches_carry_door_reader_and_the_collector_source(self) -> None:
+        with self.database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO devices (id, site, model, ip, port, protocol) "
+                "VALUES ('c3', 'Gachibowli', 'C3-400', '10.0.0.2', 4370, 'c3-pullsdk')")
+        self.database.insert_punches([
+            {"fingerprint": "fp-live", "device_id": "c3", "site": "Gachibowli", "device_user_id": "101",
+             "event_timestamp": datetime(2026, 10, 26, 17, 51), "trusted_direction": "exit",
+             "raw_direction_byte": 15, "door": "1", "reader": "", "raw": {"source": "realtime_fallback"}},
+            {"fingerprint": "fp-hist", "device_id": "c3", "site": "Gachibowli", "device_user_id": "101",
+             "event_timestamp": datetime(2026, 10, 26, 18, 30), "trusted_direction": "entry",
+             "raw_direction_byte": 0, "door": "1", "reader": "2", "raw": {"pin": "101"}},
+        ])
+        live, hist = self.database.punches_for_employee_range(
+            "101", datetime(2026, 10, 26, 6), datetime(2026, 10, 27, 6))
+        self.assertEqual((live["door"], live["source"], live["raw_direction_byte"]), ("1", "realtime_fallback", 15))
+        self.assertEqual((hist["door"], hist["reader"], hist["source"]), ("1", "2", None))
+
+    # --- direct admin corrections (v10) -------------------------------------------
+
+    def _direct(self, edits=None, *, actor=None, employee=None, reason="Door log shows an exit"):
+        edits = edits if edits is not None else [
+            {"kind": "set_direction", "fingerprint": "fp-out", "direction": "entry"}]
+        return self.database.record_direct_corrections(
+            employee or self.asha, DAY, edits, actor_id=actor or self.adam, reason=reason)
+
+    def test_direct_corrections_record_actor_role_path_reason_and_no_request(self) -> None:
+        count = self._direct([
+            {"kind": "add", "event_timestamp": datetime(2026, 10, 26, 13, 35), "direction": "entry"},
+            {"kind": "ignore", "fingerprint": "fp-dup"},
+            {"kind": "set_direction", "fingerprint": "fp-out", "direction": "entry"},
+        ])
+        self.assertEqual(count, 3)
+        rows = self._corrections(self.database)
+        self.assertEqual([r["kind"] for r in rows], ["add", "ignore", "set_direction"])
+        for row in rows:
+            self.assertEqual(
+                (row["created_by"], row["created_by_name"], row["created_by_role"], row["path"],
+                 row["reason"], row["request_line_id"], row["employee_id"], row["work_day"]),
+                (self.adam, "Adam", "admin", "direct", "Door log shows an exit", None, self.asha, DAY))
+        read = self.database.corrections_for(
+            [self.asha], datetime(2026, 10, 26, 6), datetime(2026, 10, 27, 6))
+        self.assertEqual(len(read), 3)
+
+    def test_direct_corrections_name_the_role_at_the_time(self) -> None:
+        self._person("105", "Bea", "admin")  # the last admin cannot be demoted
+        self._direct()
+        self.database.set_employee_role(self.adam, "employee")
+        [row] = self._corrections(self.database)
+        self.assertEqual(row["created_by_role"], "admin")
+
+    def test_direct_corrections_need_an_active_admin_who_is_not_the_employee(self) -> None:
+        for label, kwargs in (
+            ("hr", {"actor": self.hari}),
+            ("employee", {"actor": self.asha, "employee": self.hari}),
+            ("self", {"actor": self.adam, "employee": self.adam}),
+            ("unknown actor", {"actor": 9999}),
+            ("unknown employee", {"employee": 9999}),
+        ):
+            with self.subTest(label), self.assertRaises(db_module.RuleViolation):
+                self._direct(**kwargs)
+        self._person("105", "Bea", "admin")  # the last admin cannot be archived
+        self.database.archive_employee(self.adam)
+        with self.assertRaises(db_module.RuleViolation):
+            self._direct()
+        self.assertEqual(self._count("punch_corrections"), 0)
+
+    def test_direct_corrections_refuse_an_archived_employee(self) -> None:
+        self.database.archive_employee(self.asha)
+        with self.assertRaises(db_module.RuleViolation):
+            self._direct()
+        self.assertEqual(self._count("punch_corrections"), 0)
+
+    def test_direct_corrections_need_a_reason_and_valid_edits_and_write_all_or_nothing(self) -> None:
+        for reason in (None, "", "   ", "x" * (db_module.FIX_NOTE_MAX_CHARS + 1)):
+            with self.subTest(reason=reason), self.assertRaises(ValueError):
+                self._direct(reason=reason)
+        for edits in (
+            [],
+            [{"kind": "flip", "fingerprint": "fp"}],
+            [{"kind": "set_direction", "fingerprint": "fp", "direction": "sideways"}],
+            [{"kind": "set_direction", "direction": "entry"}],
+            [{"kind": "ignore"}],
+            [{"kind": "add", "direction": "entry"}],
+            [{"kind": "add", "event_timestamp": datetime(2026, 10, 26, 13, 35)}],
+        ):
+            with self.subTest(edits=edits), self.assertRaises(ValueError):
+                self._direct(edits)
+        # A bad edit after a good one writes nothing.
+        with self.assertRaises(ValueError):
+            self._direct([{"kind": "ignore", "fingerprint": "fp-dup"}, {"kind": "ignore"}])
+        self.assertEqual(self._count("punch_corrections"), 0)
 
     def test_work_day_round_trips_as_a_date_and_datetimes_still_bind_as_timestamps(self) -> None:
         self.assertTrue(self.database.record_alert(
@@ -1862,12 +2186,6 @@ class MissedPunchSchemaTest(unittest.TestCase):
         self.assertEqual([p["name"] for p in self.database.active_admins()], ["Adam"])
         self.assertEqual(self.database.active_admins()[0]["device_ids"], ["104"])
 
-    def test_has_active_hr_other_than_skips_the_person_and_archived_hr(self) -> None:
-        self.assertTrue(self.database.has_active_hr_other_than(self.hari))
-        self.database.archive_employee(self.hema)
-        self.assertFalse(self.database.has_active_hr_other_than(self.hari))
-        self.assertTrue(self.database.has_active_hr_other_than(self.asha))
-
     # --- correction overlay (U2) ------------------------------------------------
 
     def _overlay_day(self) -> None:
@@ -2024,7 +2342,8 @@ class PunchArchiveTest(unittest.TestCase):
         self.addCleanup(old.close)
         with mock.patch.object(db_module, "SCHEMA_VERSION", 8), \
                 mock.patch.dict(db_module.MIGRATIONS, {}, clear=False):
-            db_module.MIGRATIONS.pop(9)
+            for later in (9, 10, 11):  # a v8 file has none of the later steps
+                db_module.MIGRATIONS.pop(later)
             old.initialize((self.device,))
             old.insert_punches([self._punch("fp-v8", "7", datetime(2026, 10, 20, 9, 0))])
         with old.connect() as connection:
@@ -2037,7 +2356,7 @@ class PunchArchiveTest(unittest.TestCase):
             connection.execute("PRAGMA user_version=8")
         old.migrate_schema()
         old.migrate_schema()
-        self.assertEqual(old.schema_version(), 9)
+        self.assertEqual(old.schema_version(), db_module.SCHEMA_VERSION)
         self.assertEqual(old.punch_archives(), [])
         self.assertEqual([p["fingerprint"] for p in old.punches_for_employee_range(
             "7", datetime(2026, 10, 20), datetime(2026, 10, 21))], ["fp-v8"])

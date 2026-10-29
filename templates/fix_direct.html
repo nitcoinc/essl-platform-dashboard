@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% import "_ui.html" as ui %}
+{% block title %}Fix punches: {{ person.name }}, {{ day_label }} - eSSL Attendance Hub{% endblock %}
+{% block content %}
+<div class="review-page">
+<header class="topbar">
+  <div>
+    <a class="back-link" href="{{ url_for('me.day_view', employee=person.id, date=day.isoformat()) }}">{{ ui.icon('arrow-left') }}<span>Back to their day</span></a>
+    <h1>Fix punches · {{ person.name }}</h1>
+    <p>{{ day_label }} · work day from {{ day_start }}. The device records never change; each fix is added on top, with your name and reason.</p>
+  </div>
+</header>
+
+{% if notice %}<div class="notice notice-warn" role="status">{{ ui.icon('triangle-alert') }}<p>{{ notice }}</p></div>{% endif %}
+{% if errors.form %}<div class="notice notice-bad" role="alert">{{ ui.icon('circle-alert') }}<p>{{ errors.form }}</p></div>{% endif %}
+
+<form method="post" action="{{ url_for('fixes.direct_preview', employee_id=person.id, day=day.isoformat()) }}" class="review-card review-form" novalidate aria-labelledby="fix-heading">
+  <h2 id="fix-heading">Punches on this day</h2>
+  <input type="hidden" name="csrf" value="{{ csrf_token }}">
+  {% if swipes %}
+  <p class="field-hint">Choose how each punch should count, or leave it as it is. A punch you set to In or Out always counts and is never treated as a quick re-swipe.</p>
+  {% for s in swipes %}
+  {% set key = 'act-' ~ s.fingerprint %}
+  <fieldset class="review-line">
+    <legend class="visually-hidden">Punch at {{ s.time.strftime('%H:%M:%S') }}</legend>
+    <div class="review-line-head">
+      <span class="punch-time num">{{ s.time.strftime('%H:%M:%S') }}{% if s.next_day %}<sup title="Next calendar day">+1</sup>{% endif %}</span>
+      <span class="punch-dir">{{ s.direction }}</span>
+      {% for label, tone in s.chips %}{{ ui.chip(label, tone) }}{% endfor %}
+    </div>
+    {% if s.basis %}<p class="review-line-note muted">{{ s.basis }}</p>{% endif %}
+    {% if s.unconfirmed %}<p class="review-flag">{{ ui.icon('triangle-alert') }}<span>Not confirmed yet: the device history may still change this direction. Check it before fixing.</span></p>{% endif %}
+    {% if s.actionable %}
+    {% set chosen = values.act.get(s.fingerprint, '') %}
+    <div class="report-dir-options">
+      <label class="report-check"><input type="radio" name="{{ key }}" value=""{{ ' checked' if not chosen }}><span>Leave as it is</span></label>
+      <label class="report-check"><input type="radio" name="{{ key }}" value="in"{{ ' checked' if chosen == 'in' }}><span>In</span></label>
+      <label class="report-check"><input type="radio" name="{{ key }}" value="out"{{ ' checked' if chosen == 'out' }}><span>Out</span></label>
+      <label class="report-check"><input type="radio" name="{{ key }}" value="ignore"{{ ' checked' if chosen == 'ignore' }}><span>Ignore</span></label>
+    </div>
+    {% else %}
+    <p class="review-line-note muted">This one is already corrected and can't be changed here.</p>
+    {% endif %}
+  </fieldset>
+  {% endfor %}
+  {% else %}
+  <p class="muted">No punches were recorded on this day. You can still add a missed one below.</p>
+  {% endif %}
+
+  <h3>Add a missed punch</h3>
+  {% for n in range(add_rows) %}
+  {% set raw = values.add[n] if values.add|length > n else {'time': '', 'dir': ''} %}
+  {% set problems = errors.add.get(n, {}) if errors.add else {} %}
+  <div class="review-line-edits">
+    {{ ui.field('add-' ~ n ~ '-time', 'Time', raw.time, type='time', error=problems.time) }}
+    <fieldset class="report-dir">
+      <legend>Direction</legend>
+      <div class="report-dir-options">
+        {% for value, label in (('in', 'In'), ('out', 'Out')) %}
+        <label class="report-check"><input type="radio" name="add-{{ n }}-dir" value="{{ value }}"{{ ' checked' if raw.dir == value }}{% if problems.dir %} aria-invalid="true"{% endif %}><span>{{ label }}</span></label>
+        {% endfor %}
+      </div>
+      {% if problems.dir %}{{ ui.inline_error(problems.dir, 'f-add-' ~ n ~ '-dir-error') }}{% endif %}
+    </fieldset>
+  </div>
+  {% endfor %}
+
+  <div class="field">
+    <label for="f-reason">Why are you changing these punches?</label>
+    <textarea id="f-reason" name="reason" rows="3" maxlength="{{ reason_max }}" aria-describedby="f-reason-hint{% if errors.reason %} f-reason-error{% endif %}"{% if errors.reason %} aria-invalid="true"{% endif %}>{{ reason }}</textarea>
+    <p class="field-hint" id="f-reason-hint">Required. Kept with the change, with your name and the time. {{ person.name }} and their managers can read it. Up to {{ reason_max }} characters.</p>
+    {% if errors.reason %}{{ ui.inline_error(errors.reason, 'f-reason-error') }}{% endif %}
+  </div>
+  <div class="review-actions">
+    {{ ui.button('Review changes', 'primary', type='submit') }}
+    {{ ui.button('Cancel', 'tertiary', href=url_for('me.day_view', employee=person.id, date=day.isoformat())) }}
+  </div>
+</form>
+</div>
+{% endblock %}

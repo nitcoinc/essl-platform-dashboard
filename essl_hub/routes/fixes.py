@@ -46,6 +46,7 @@ from .fix_views import (
     _day_rows,
     _line_view,
     _swipes,
+    current_direction,
     punch_set_hash,
 )
 
@@ -145,7 +146,7 @@ def _validate(form: dict, action: str, rows: list[dict], day: date, day_start_ho
         for fp in sorted(picked, key=lambda f: by_fingerprint[f]["event_timestamp"]):
             row = by_fingerprint[fp]
             if fp in form["flips"]:
-                direction = OPPOSITE_DIRECTION.get(row.get("trusted_direction"))
+                direction = OPPOSITE_DIRECTION.get(current_direction(row))
                 lines.append({"kind": "flip", "target_fingerprint": fp,
                               "event_time": row["event_timestamp"], "direction": direction})
             else:

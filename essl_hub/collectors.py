@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import socket
@@ -10,8 +11,9 @@ import zlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
-from .config import C3_PROTOCOL, X990_PROTOCOL, DeviceConfig, numeric_comm_password, password_for
+from .config import C3_PROTOCOL, TIMEZONE_NAME, X990_PROTOCOL, DeviceConfig, numeric_comm_password, password_for
 from .door_params import (
     DOOR_REQUEST_TTL,
     READ_BATCH,
@@ -22,6 +24,8 @@ from .door_params import (
     validate_request,
 )
 from .hashing import sha256_hex
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -92,19 +96,72 @@ C3_ATTENDANCE_EVENT_TYPES = C3_GRANTED_EVENT_TYPES | {C3_INTERVAL_TOO_SHORT_EVEN
 # swipe history, not on the person. Captured, flagged, only from the device's
 # door_denied_since on ("Wait for door close" unchecked).
 C3_DOOR_DENIED_NOTES = {"24": "door denied: anti-passback", "25": "door denied: interlock"}
-# KTD4: events whose realtime in/out 15 is a real exit (byte 1). Event 20 was
-# gated by the 2026-10-26 pre-implementation check; drop it here to undo.
-C3_REALTIME_15_EXIT_EVENT_TYPES = frozenset(C3_GRANTED_EVENT_TYPES | {C3_INTERVAL_TOO_SHORT_EVENT})
 
 _C3_HISTORY_AT: dict[str, float] = {}
+# R4: after a failed download the next try waits ESSL_C3_HISTORY_RETRY_MINUTES
+# instead of tying the panel up for most of every poll. Monotonic for the
+# schedule; _C3_HISTORY_STATUS holds wall-clock IST text for the status file.
+_C3_HISTORY_RETRY_AT: dict[str, float] = {}
+_C3_HISTORY_STATUS: dict[str, dict[str, Any]] = {}
 
 
 def _c3_history_due(device_id: str) -> bool:
     """Auto mode pulls the full history at start and then every
-    ESSL_C3_HISTORY_HOURS (default 6); the realtime log covers the gaps."""
+    ESSL_C3_HISTORY_HOURS (default 6); the realtime log covers the gaps.
+    After a failure it retries once the backoff has passed."""
+    retry = _C3_HISTORY_RETRY_AT.get(device_id)
+    if retry is not None:
+        return time.monotonic() >= retry
     hours = float(os.getenv("ESSL_C3_HISTORY_HOURS", "6"))
     last = _C3_HISTORY_AT.get(device_id)
     return last is None or time.monotonic() - last >= hours * 3600
+
+
+def _ist_text(offset_seconds: float = 0) -> str:
+    now = datetime.now(ZoneInfo(TIMEZONE_NAME)).replace(tzinfo=None) + timedelta(seconds=offset_seconds)
+    return now.isoformat(sep=" ", timespec="seconds")
+
+
+def _c3_history_ok(device_id: str, seconds: float) -> None:
+    _C3_HISTORY_AT[device_id] = time.monotonic()
+    _C3_HISTORY_RETRY_AT.pop(device_id, None)
+    _C3_HISTORY_STATUS[device_id] = {"last_ok_at": _ist_text(), "seconds": round(seconds, 1),
+                                     "failing_since": None, "last_error": None, "next_try_at": None}
+
+
+def _retry_minutes() -> float:
+    try:
+        return max(1.0, float(os.getenv("ESSL_C3_HISTORY_RETRY_MINUTES", "30")))
+    except ValueError:
+        return 30.0  # a bad value must not stop the live-log fallback
+
+
+def _c3_history_failed(device_id: str, seconds: float, exc: BaseException, *, backoff: bool = True) -> None:
+    """R4: a failed download is logged and recorded, never silent. Auto mode
+    backs off; history-only mode raises and retries on the next poll."""
+    minutes = _retry_minutes()
+    error = f"{type(exc).__name__}: {_friendly_error(exc)}"
+    _logger.warning(
+        "C3 history download for %s failed after %.1fs: %s%s",
+        device_id, seconds, error,
+        f"; reading the live log, next try in {minutes:.0f} min" if backoff else "",
+    )
+    if backoff:
+        _C3_HISTORY_RETRY_AT[device_id] = time.monotonic() + minutes * 60
+    previous = _C3_HISTORY_STATUS.get(device_id) or {}
+    _C3_HISTORY_STATUS[device_id] = {
+        "last_ok_at": previous.get("last_ok_at"),
+        "seconds": round(seconds, 1),
+        "failing_since": previous.get("failing_since") or _ist_text(),
+        "last_error": error,
+        "next_try_at": _ist_text(minutes * 60) if backoff else None,
+    }
+
+
+def c3_history_status() -> dict[str, dict[str, Any]]:
+    """Per C3 device: when its history download last worked, and since when
+    it has been failing, for collector-status.json and the Devices page."""
+    return {device_id: dict(status) for device_id, status in _C3_HISTORY_STATUS.items()}
 
 
 def _c3_is_punch(event_type: str) -> bool:
@@ -180,33 +237,112 @@ def parse_c3_table(buffer: bytes, fields: dict[int, tuple[str, str]]) -> list[di
     return records
 
 
-def read_c3_table(panel: Any, table_name: str) -> list[dict[str, Any]]:
+# A reply frame's length field is 16 bits, and a 0xC8 buffer reply spends 4
+# bytes on its offset, so one 0x0E read returns at most this many bytes.
+C3_MAX_READ_BYTES = 0xFFFF - 4
+
+
+@dataclass
+class C3TableStart:
+    """The panel's answer to GETDATA: the whole table in one reply
+    (``payload``), or a prepared buffer of ``total`` bytes to read in
+    ``chunk``-sized 0x0E requests and check against ``crc``."""
+
+    fields: dict[int, tuple[str, str]]
+    payload: bytes | None = None
+    total: int = 0
+    crc: int = 0
+    chunk: int = 0
+
+
+def start_c3_table(panel: Any, table_name: str) -> C3TableStart:
+    """Send GETDATA for every field of ``table_name`` (read-only)."""
     cfg = next((c for c in panel._get_device_data_cfg() if c.name == table_name), None)
     if cfg is None:
         raise ValueError(f"C3 has no {table_name} table")
     fields = {f.index: (f.name, f.type) for f in cfg.fields}
     indexes = sorted(fields)
-    sock = panel._sock
-    sock.settimeout(C3_TABLE_TIMEOUT_SECONDS)
+    panel._sock.settimeout(C3_TABLE_TIMEOUT_SECONDS)
     panel._send(C3_CMD_GETDATA, [cfg.index, len(indexes), *indexes, 0, 0])
-    command, payload = _read_c3_frame(sock)
+    command, payload = _read_c3_frame(panel._sock)
     if command == C3_REPLY_OK:
-        return parse_c3_table(payload, fields) if payload else []
+        return C3TableStart(fields, payload=payload)
     if command != C3_CMD_LARGE_DATA or len(payload) < 17:
         raise ConnectionError(f"unexpected reply 0x{command:02x} to GETDATA {table_name}")
     total, _, crc, chunk = struct.unpack_from("<IIII", payload, 1)
-    buffer = bytearray()
-    while len(buffer) < total:
-        panel._send(C3_CMD_READ_BUFFER, list(struct.pack("<II", len(buffer), min(chunk, total - len(buffer)))))
-        command, part = _read_c3_frame(sock)
-        if command != C3_REPLY_OK or struct.unpack_from("<I", part, 0)[0] != len(buffer):
-            raise ConnectionError(f"C3 buffer read failed at offset {len(buffer)}")
-        if len(part) <= 4:
-            raise ConnectionError(f"C3 returned an empty chunk at offset {len(buffer)}")
-        buffer += part[4:]
-    if zlib.crc32(bytes(buffer)) != crc:
+    return C3TableStart(fields, total=total, crc=crc, chunk=chunk)
+
+
+def request_c3_buffer(panel: Any, offset: int, length: int) -> None:
+    """Ask for ``length`` bytes of the prepared buffer from ``offset`` (0x0E)."""
+    panel._send(C3_CMD_READ_BUFFER, list(struct.pack("<II", offset, length)))
+
+
+def receive_c3_buffer(panel: Any, offset: int) -> bytes:
+    """One 0x0E reply, checked to answer ``offset`` and to carry data."""
+    command, part = _read_c3_frame(panel._sock)
+    if command != C3_REPLY_OK or struct.unpack_from("<I", part, 0)[0] != offset:
+        raise ConnectionError(f"C3 buffer read failed at offset {offset}")
+    if len(part) <= 4:
+        raise ConnectionError(f"C3 returned an empty chunk at offset {offset}")
+    return part[4:]
+
+
+def finish_c3_table(start: C3TableStart, buffer: bytes, table_name: str) -> list[dict[str, Any]]:
+    if zlib.crc32(bytes(buffer)) != start.crc:
         raise ConnectionError(f"C3 {table_name} download failed its checksum")
-    return parse_c3_table(bytes(buffer), fields)
+    return parse_c3_table(bytes(buffer), start.fields)
+
+
+def read_c3_table(panel: Any, table_name: str) -> list[dict[str, Any]]:
+    start = start_c3_table(panel, table_name)
+    if start.payload is not None:
+        return parse_c3_table(start.payload, start.fields) if start.payload else []
+    buffer = bytearray()
+    while len(buffer) < start.total:
+        request_c3_buffer(panel, len(buffer), min(start.chunk, start.total - len(buffer)))
+        buffer += receive_c3_buffer(panel, len(buffer))
+    return finish_c3_table(start, bytes(buffer), table_name)
+
+
+_RT_RAW_WARNED = False
+
+
+def read_c3_rt_log(panel: Any) -> list[tuple[Any, int | None]]:
+    """``C3.get_rt_log`` that also keeps each record's in/out value as the
+    panel sent it (byte 11 of a binary record, ``inoutstatus`` of a key/value
+    one): the library decodes only 0, 2 and 3 and turns anything else into
+    15. Same command, mode switch and door-status update as the library; a
+    panel object without those internals falls back to ``get_rt_log``."""
+    from c3 import consts, rtlog
+
+    if not all(hasattr(panel, name) for name in ("_send_receive", "_rtlog_command", "_update_inout_status")):
+        global _RT_RAW_WARNED
+        if not _RT_RAW_WARNED:
+            _RT_RAW_WARNED = True
+            _logger.warning("C3 library internals changed; live-log rows are stored without the panel's raw in/out value")
+        return [(record, None) for record in panel.get_rt_log()]
+    if not panel.is_connected():
+        raise ConnectionError("No connection to C3 panel.")
+    pairs: list[tuple[Any, int | None]] = []
+    message, length = panel._send_receive(panel._rtlog_command)
+    if length:
+        if panel._rtlog_command == consts.Command.RTLOG_BINARY:
+            if length % 16 == 0:
+                for start in range(0, length, 16):
+                    frame = bytes(message[start : start + 16])
+                    pairs.append((rtlog.factory(frame), frame[11]))
+            else:  # the firmware has no binary mode; the library switches too
+                panel._rtlog_command = consts.Command.RTLOG_KEYVALUE
+        elif panel._rtlog_command == consts.Command.RTLOG_KEYVALUE:
+            pairs_kv = panel._parse_kv_from_message(message)
+            if pairs_kv:
+                value = str(pairs_kv.get("inoutstatus", "")).strip()
+                pairs.append((rtlog.factory(pairs_kv), int(value) if value.isdigit() else None))
+        else:
+            raise NotImplementedError(f"The requested RT log command {panel._rtlog_command} is not supported")
+    panel._update_inout_status([record for record, _ in pairs])
+    return pairs
 
 
 def collect(device: DeviceConfig) -> CollectionResult:
@@ -309,11 +445,13 @@ def collect_c3(device: DeviceConfig) -> CollectionResult:
             transactions = []
             history_error = ConnectionError("history not due; reading the realtime log")
         else:
+            started = time.monotonic()
             try:
                 transactions = read_c3_table(panel, "transaction")
                 history_error = None
-                _C3_HISTORY_AT[device.id] = time.monotonic()
+                _c3_history_ok(device.id, time.monotonic() - started)
             except Exception as exc:
+                _c3_history_failed(device.id, time.monotonic() - started, exc, backoff=mode != "history")
                 if mode == "history":
                     raise
                 transactions = []
@@ -378,9 +516,8 @@ def collect_c3(device: DeviceConfig) -> CollectionResult:
             )
         batch_size = max(1, min(int(os.getenv("ESSL_C3_RTLOG_BATCH", "250")), 2000))
         for _ in range(batch_size):
-            records = panel.get_rt_log()
             realtime_events = [
-                record for record in records
+                (record, raw_in_out) for record, raw_in_out in read_c3_rt_log(panel)
                 if record.is_event()
                 and _c3_keep(
                     str(int(record.event_type)),
@@ -392,7 +529,7 @@ def collect_c3(device: DeviceConfig) -> CollectionResult:
             ]
             if not realtime_events:
                 break
-            for record in realtime_events:
+            for record, raw_in_out in realtime_events:
                 pin = str(record.pin or "")
                 card = str(record.card_no or "")
                 raw = {
@@ -405,6 +542,10 @@ def collect_c3(device: DeviceConfig) -> CollectionResult:
                     "timestamp": _format_datetime(record.time_second),
                     "source": "realtime_fallback",
                 }
+                if raw_in_out is not None:
+                    # R3: what the panel sent, before the library's decode
+                    # turns anything but 0/2/3 into 15. Evidence only.
+                    raw["in_out_raw"] = raw_in_out
                 events.append(
                     _normalized_event(
                         device,
@@ -426,9 +567,7 @@ def collect_c3(device: DeviceConfig) -> CollectionResult:
                         ),
                         door=str(record.port_nr),
                         raw_direction_byte=int(record.in_out_state),
-                        trusted_direction=_c3_trusted_direction(
-                            int(record.in_out_state), int(record.event_type)
-                        ),
+                        trusted_direction=_c3_trusted_direction(int(record.in_out_state)),
                         identity=c3_identity(
                             pin, card, raw["timestamp"], str(record.port_nr), str(int(record.event_type))
                         ),
@@ -684,23 +823,16 @@ def _normalized_event(
     }
 
 
-def _c3_trusted_direction(in_out_state: int, event_type: int | None = None) -> str | None:
-    """KTD4: this library's InOutDirection enum only decodes bytes 0 and 3 to
-    ENTRY/EXIT. A real exit (protocol byte 1) fails its decode and the record
-    keeps only the fallback UNKNOWN_UNSUPPORTED (15); the raw byte is not
-    exposed. The Gachibowli history table carries only bytes 0 and 1 (14,195
-    and 13,958 rows, 2026-10-12 replica), so 15 is an exit for the swipe
-    events in C3_REALTIME_15_EXIT_EVENT_TYPES. Door-denied rows (24/25) with
-    15 stay unknown until a history read fills them."""
+def _c3_trusted_direction(in_out_state: int) -> str | None:
+    """KTD4 (revised 2026-10-29): only bytes the library decodes as a direction
+    count, 0 entry and 3 exit. Anything else arrives as its fallback 15, which
+    the live log returns for arrivals and leavings alike at Gachibowli (one
+    reader outside, one inside), so 15 is unknown: hours.py infers it from the
+    swipes around it until a history read fills the real byte
+    (db.fill_punch_directions)."""
     if in_out_state == 0:
         return "entry"
     if in_out_state == 3:
-        return "exit"
-    if (
-        in_out_state == 15
-        and event_type is not None
-        and str(event_type).strip() in C3_REALTIME_15_EXIT_EVENT_TYPES
-    ):
         return "exit"
     return None
 

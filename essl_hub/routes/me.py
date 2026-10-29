@@ -94,6 +94,7 @@ def _day_context(subject: dict, day, today, request_now, target_minutes: int, da
         breaks=day_story.break_view(
             result, now, rows,
             database.fix_request_days([subject["id"]], day, day).get((subject["id"], day), ()),
+            show_facts=access.can_see_punch_facts(g.employee),
         ),
         ring_percent=day_story.ring_percent(result, target_minutes),
         finish_at=reached if result.status == "open" else None,
@@ -104,6 +105,7 @@ def _day_context(subject: dict, day, today, request_now, target_minutes: int, da
         # the needs-review notice (U6) points here, so /day, its poll and the
         # drawer all agree.
         can_report=subject["id"] == g.employee["id"] and reportable(day, today),
+        can_fix_direct=access.can_fix_punches_directly(g.employee, subject["id"]) and day <= today,
         request_now=request_now,
         server_epoch_ms=int(request_now.replace(tzinfo=_TZ).timestamp() * 1000),
         target_minutes=target_minutes,

@@ -221,6 +221,208 @@ class _FakeC3:
         return self._batches.pop(0) if self._batches else []
 
 
+def _rt_frame(event: int, pin: int, in_out: int, second: int, door: int = 1) -> bytes:
+    """One 16-byte binary live-log record, laid out as c3.rtlog reads it."""
+    return (b"\x00\x00\x00\x00" + pin.to_bytes(4, "little") + bytes([1, door, event, in_out])
+            + second.to_bytes(4, "little"))
+
+
+class _FakeRawC3(_FakeC3):
+    """A panel answering the live-log command with raw frames, as the real
+    library's ``_send_receive`` does: binary, or key/value firmware."""
+
+    messages: list = []
+    key_value = False
+
+    def __init__(self, *a, **k):
+        from c3 import consts
+
+        super().__init__()
+        self._messages = list(type(self).messages)
+        self._rtlog_command = consts.Command.RTLOG_KEYVALUE if self.key_value else consts.Command.RTLOG_BINARY
+        self.statuses: list = []
+
+    def is_connected(self):
+        return True
+
+    def _send_receive(self, command):
+        message = self._messages.pop(0) if self._messages else b""
+        return message, len(message)
+
+    def _parse_kv_from_message(self, message):
+        return dict(pair.split("=", 1) for pair in message.decode().split("\t") if "=" in pair)
+
+    def _update_inout_status(self, records):
+        self.statuses.append(len(records))
+
+
+class C3RawInOutTest(unittest.TestCase):
+    """R3: the panel's own live-log in/out value is kept beside the decode."""
+
+    SECOND = 800000000
+
+    def setUp(self) -> None:
+        self.device = next(d for d in DEVICES if d.protocol == "c3-pullsdk")
+
+    def _realtime(self, *messages, key_value=False):
+        from essl_hub import collectors
+
+        _FakeRawC3.messages = list(messages)
+        with patch("c3.C3", _FakeRawC3), patch.object(_FakeRawC3, "key_value", key_value), patch.dict(os.environ, {"ESSL_C3_MODE": "realtime", "ESSL_C3_RTLOG_BATCH": "3"}):
+            return collectors.collect_c3(self.device).events
+
+    def test_a_byte_the_library_cannot_decode_is_kept_raw_with_no_direction(self) -> None:
+        [event] = self._realtime(_rt_frame(0, 173, 1, self.SECOND))
+        self.assertEqual(event["raw"]["in_out_raw"], 1)
+        self.assertEqual(event["raw_direction_byte"], 15)
+        self.assertIsNone(event["trusted_direction"])
+
+    def test_a_decoded_entry_keeps_its_raw_zero_and_direction(self) -> None:
+        [event] = self._realtime(_rt_frame(0, 173, 0, self.SECOND))
+        self.assertEqual((event["raw"]["in_out_raw"], event["raw_direction_byte"], event["trusted_direction"]),
+                         (0, 0, "entry"))
+
+    def test_several_records_in_one_reply_keep_their_own_values(self) -> None:
+        events = self._realtime(_rt_frame(0, 173, 0, self.SECOND) + _rt_frame(0, 174, 4, self.SECOND + 1))
+        self.assertEqual([e["raw"]["in_out_raw"] for e in events], [0, 4])
+
+    def test_key_value_mode_keeps_inoutstatus(self) -> None:
+        kv = "\t".join(["time=2025-05-09 10:13:20", "pin=173", "cardno=0", "eventaddr=1", "event=0",
+                        "inoutstatus=2", "verifytype=1", "index=1"]).encode()
+        [event] = self._realtime(kv, key_value=True)
+        self.assertEqual(event["raw"]["in_out_raw"], 2)
+        self.assertIsNone(event["trusted_direction"])
+
+    def test_the_fingerprint_still_matches_the_history_twin(self) -> None:
+        from essl_hub import collectors
+
+        [live] = self._realtime(_rt_frame(0, 173, 1, self.SECOND))
+        row = {"Pin": "173", "Cardno": "0", "Time_second": str(self.SECOND), "EventType": "0",
+               "InOutState": "1", "DoorID": "1", "ReaderID": "1"}
+        with patch("c3.C3", _FakeC3), patch.object(collectors, "read_c3_table", return_value=[row]), \
+                patch.dict(os.environ, {"ESSL_C3_MODE": "history"}):
+            [history] = collectors.collect_c3(self.device).events
+        self.assertEqual(live["fingerprint"], history["fingerprint"])
+
+    def test_a_reply_that_is_not_whole_records_switches_to_key_value(self) -> None:
+        from c3 import consts
+        from essl_hub.collectors import read_c3_rt_log
+
+        _FakeRawC3.messages = [b"\x01" * 7]
+        panel = _FakeRawC3()
+        self.assertEqual(read_c3_rt_log(panel), [])
+        self.assertEqual(panel._rtlog_command, consts.Command.RTLOG_KEYVALUE)
+        self.assertEqual(panel.statuses, [0])
+
+    def test_a_lost_connection_and_an_unknown_command_raise(self) -> None:
+        from essl_hub.collectors import read_c3_rt_log
+
+        _FakeRawC3.messages = []
+        panel = _FakeRawC3()
+        panel.is_connected = lambda: False
+        with self.assertRaises(ConnectionError):
+            read_c3_rt_log(panel)
+        _FakeRawC3.messages = [b"\x01" * 16]
+        panel = _FakeRawC3()
+        panel._rtlog_command = 0x55
+        with self.assertRaises(NotImplementedError):
+            read_c3_rt_log(panel)
+
+    def test_a_panel_without_the_internals_falls_back_to_get_rt_log(self) -> None:
+        from c3.utils import C3DateTime
+        from essl_hub import collectors
+
+        _FakeC3.rt_batches = [[_RtRecord(0, "173", 15, C3DateTime.from_value(self.SECOND))]]
+        with patch("c3.C3", _FakeC3), patch.dict(os.environ, {"ESSL_C3_MODE": "realtime"}), \
+                patch.object(collectors, "_RT_RAW_WARNED", False), \
+                self.assertLogs("essl_hub.collectors", level="WARNING") as logs:
+            [event] = collectors.collect_c3(self.device).events
+        self.assertNotIn("in_out_raw", event["raw"])
+        self.assertIn("library internals changed", logs.output[0])
+
+
+class C3HistoryStatusTest(unittest.TestCase):
+    """R4: a failed history download is logged, recorded and backed off."""
+
+    def setUp(self) -> None:
+        from essl_hub import collectors
+
+        self.collectors = collectors
+        self.device = next(d for d in DEVICES if d.protocol == "c3-pullsdk")
+        for table in (collectors._C3_HISTORY_AT, collectors._C3_HISTORY_RETRY_AT, collectors._C3_HISTORY_STATUS):
+            table.pop(self.device.id, None)
+            self.addCleanup(table.pop, self.device.id, None)
+
+    def _poll(self, table, mode="auto"):
+        from c3.utils import C3DateTime
+
+        _FakeC3.rt_batches = [[_RtRecord(0, "173", 0, C3DateTime.from_value(800000000))]]
+        reader = patch.object(self.collectors, "read_c3_table",
+                              **({"side_effect": table} if isinstance(table, BaseException) else {"return_value": table}))
+        with patch("c3.C3", _FakeC3), reader, patch.dict(os.environ, {"ESSL_C3_MODE": mode}):
+            return self.collectors.collect_c3(self.device)
+
+    def _status(self):
+        return self.collectors.c3_history_status()[self.device.id]
+
+    def test_a_good_read_records_when_and_waits_for_the_schedule(self) -> None:
+        result = self._poll([])
+        self.assertEqual(result.transport, "TCP history")
+        status = self._status()
+        self.assertIsNotNone(status["last_ok_at"])
+        self.assertIsNone(status["failing_since"])
+        self.assertFalse(self.collectors._c3_history_due(self.device.id))
+
+    def test_a_failed_read_is_logged_falls_back_and_backs_off(self) -> None:
+        with self.assertLogs("essl_hub.collectors", level="WARNING") as logs:
+            result = self._poll(ConnectionResetError(104, "Connection reset by peer"))
+        self.assertEqual(result.transport, "TCP realtime")
+        self.assertEqual(len(result.events), 1)
+        self.assertIn("C3 history download for gachibowli-c3-400 failed after", logs.output[0])
+        self.assertIn("ConnectionResetError", logs.output[0])
+        status = self._status()
+        self.assertIsNotNone(status["failing_since"])
+        self.assertIn("Connection reset by peer", status["last_error"])
+        self.assertIsNotNone(status["next_try_at"])
+        # Within the backoff the next poll reads only the live log.
+        self.assertFalse(self.collectors._c3_history_due(self.device.id))
+        with patch.object(self.collectors, "read_c3_table") as reader, patch("c3.C3", _FakeC3), \
+                patch.dict(os.environ, {"ESSL_C3_MODE": "auto"}):
+            self.collectors.collect_c3(self.device)
+        reader.assert_not_called()
+
+    def test_a_second_failure_keeps_failing_since_and_a_success_clears_it(self) -> None:
+        with self.assertLogs("essl_hub.collectors", level="WARNING"):
+            self._poll(ConnectionResetError("reset"))
+        first = self._status()["failing_since"]
+        self.collectors._C3_HISTORY_RETRY_AT[self.device.id] = self.collectors.time.monotonic() - 1
+        self.assertTrue(self.collectors._c3_history_due(self.device.id))
+        with self.assertLogs("essl_hub.collectors", level="WARNING"):
+            self._poll(TimeoutError("timed out"))
+        self.assertEqual(self._status()["failing_since"], first)
+        self.collectors._C3_HISTORY_RETRY_AT[self.device.id] = self.collectors.time.monotonic() - 1
+        self._poll([])
+        status = self._status()
+        self.assertIsNone(status["failing_since"])
+        self.assertIsNone(status["last_error"])
+        self.assertNotIn(self.device.id, self.collectors._C3_HISTORY_RETRY_AT)
+
+    def test_history_mode_still_raises_records_and_does_not_back_off(self) -> None:
+        with self.assertLogs("essl_hub.collectors", level="WARNING"), self.assertRaises(ConnectionError):
+            self._poll(ConnectionResetError("reset"), mode="history")
+        status = self._status()
+        self.assertIsNotNone(status["failing_since"])
+        self.assertIsNone(status["next_try_at"])
+        self.assertTrue(self.collectors._c3_history_due(self.device.id))
+
+    def test_a_bad_retry_setting_still_reads_the_live_log(self) -> None:
+        with patch.dict(os.environ, {"ESSL_C3_HISTORY_RETRY_MINUTES": "half an hour"}), \
+                self.assertLogs("essl_hub.collectors", level="WARNING"):
+            result = self._poll(ConnectionResetError("reset"))
+        self.assertEqual(result.transport, "TCP realtime")
+        self.assertIsNotNone(self._status()["next_try_at"])
+
+
 class C3IntervalTooShortTest(unittest.TestCase):
     """U12/KTD11: event 20 is stored as a flagged swipe."""
 
@@ -260,19 +462,20 @@ class C3IntervalTooShortTest(unittest.TestCase):
         [hist] = self._history([self._row("20")])
         self.assertEqual(rt["fingerprint"], hist["fingerprint"])
         self.assertIn("interval too short", rt["raw_state"])
-        # KTD4: the panel only emits bytes 0/1, so realtime 15 on event 20 is an exit.
-        self.assertEqual(rt["trusted_direction"], "exit")
+        # KTD4 (revised): realtime 15 carries no direction; history fills it.
+        self.assertIsNone(rt["trusted_direction"])
 
     def test_realtime_directions_for_granted_and_interval_too_short(self) -> None:
         from c3.utils import C3DateTime
 
-        entry, short_exit = self._realtime([
+        entry, short_unknown = self._realtime([
             _RtRecord(0, "173", 0, C3DateTime.from_value(800000000)),
             _RtRecord(20, "173", 15, C3DateTime.from_value(800000005)),
         ])
         self.assertEqual(entry["trusted_direction"], "entry")
         self.assertEqual(entry["raw_state"], "0 · 0")
-        self.assertEqual(short_exit["trusted_direction"], "exit")
+        self.assertIsNone(short_unknown["trusted_direction"])
+        self.assertEqual(short_unknown["raw_direction_byte"], 15)
 
     def test_event_20_without_pin_or_card_is_dropped(self) -> None:
         self.assertEqual(self._history([self._row("20", pin="", card="0")]), [])
@@ -363,34 +566,11 @@ class C3TrustedDirectionTest(unittest.TestCase):
     def test_byte_three_is_trusted_as_exit(self) -> None:
         self.assertEqual(_c3_trusted_direction(3), "exit")
 
-    def test_byte_fifteen_on_a_card_event_is_an_exit(self) -> None:
-        # The library cannot decode the real exit byte (1) and keeps only its
-        # fallback 15; the raw byte is not exposed on the record.
-        for event_type in (0, 1, 2, 3):
-            self.assertEqual(_c3_trusted_direction(15, event_type), "exit")
-
-    def test_byte_fifteen_on_interval_too_short_is_an_exit(self) -> None:
-        # KTD4: history carries only bytes 0/1, so 15 is byte 1 for event 20 too.
-        self.assertEqual(_c3_trusted_direction(15, 20), "exit")
-
-    def test_byte_fifteen_on_event_20_is_unknown_when_the_rule_is_off(self) -> None:
-        from essl_hub import collectors
-
-        # Gate-miss branch: the pre-implementation check could have failed.
-        with patch.object(collectors, "C3_REALTIME_15_EXIT_EVENT_TYPES", frozenset(collectors.C3_GRANTED_EVENT_TYPES)):
-            self.assertIsNone(_c3_trusted_direction(15, 20))
-            self.assertEqual(_c3_trusted_direction(15, 0), "exit")
-
-    def test_byte_fifteen_without_a_card_event_is_not_trusted(self) -> None:
+    def test_byte_fifteen_is_unknown_on_every_event(self) -> None:
+        # 2026-10-29: the live log returns 15 for arrivals (outside reader)
+        # and leavings (inside reader) alike, so it carries no direction;
+        # a history read fills the real byte later.
         self.assertIsNone(_c3_trusted_direction(15))
-        self.assertIsNone(_c3_trusted_direction(15, 8))
-        # Door-denied rows wait for a history read (KTD4).
-        self.assertIsNone(_c3_trusted_direction(15, 24))
-        self.assertIsNone(_c3_trusted_direction(15, 25))
-
-    def test_entry_and_exit_bytes_ignore_the_event_type(self) -> None:
-        self.assertEqual(_c3_trusted_direction(0, 0), "entry")
-        self.assertEqual(_c3_trusted_direction(3, 0), "exit")
 
     def test_byte_two_none_is_not_trusted(self) -> None:
         self.assertIsNone(_c3_trusted_direction(2))

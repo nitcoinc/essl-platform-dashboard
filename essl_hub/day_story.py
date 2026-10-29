@@ -9,7 +9,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from .hours import CORRECTION_ADDED, CORRECTION_DIRECTION, CORRECTION_IGNORED, Collapsed, DayResult
+from .db import C3_UNDECODED_BYTE
+from .hours import (
+    CORRECTION_ADDED, CORRECTION_DIRECTION, CORRECTION_IGNORED, NO_AUDIT_NAME, Collapsed, DayResult,
+)
+from .punch_alerts import C3_REALTIME_SOURCE
 
 
 @dataclass(frozen=True)
@@ -119,12 +123,79 @@ def punch_flags(raw_state: str | None) -> tuple[str, ...]:
 # KTD4: chips for a swipe an approved fix touched, keyed by the row's
 # ``correction`` (hours.apply_corrections).
 CORRECTION_FLAGS = {
-    CORRECTION_ADDED: "added by HR",
+    CORRECTION_ADDED: "added",
     CORRECTION_DIRECTION: "direction fixed",
     CORRECTION_IGNORED: "ignored",
 }
 # Day-level chips from the day's latest fix request status.
 _FIX_FLAGS = {"pending": "Fix pending", "rejected": "Fix rejected"}
+
+
+_DIRECTION_WORDS = {"entry": "In", "exit": "Out"}
+_CORRECTION_VERBS = {
+    CORRECTION_ADDED: "Added",
+    CORRECTION_DIRECTION: "Direction fixed",
+    CORRECTION_IGNORED: "Ignored",
+}
+
+
+def is_unconfirmed_guess(row: dict) -> bool:
+    """A C3 live-log row read as the undecoded byte 15 with no direction yet
+    (v11), until the device history confirms it (db.fill_punch_directions).
+    One that kept 15 with a direction was filled by history before fills
+    rewrote the byte, so it is confirmed."""
+    return (row.get("raw_direction_byte") == C3_UNDECODED_BYTE and row.get("source") == C3_REALTIME_SOURCE
+            and not row.get("trusted_direction"))
+
+
+def punch_basis(row: dict, direction: str, *, collapsed: bool = False, inferred: bool = False) -> str:
+    """Who or what decided this swipe's direction, in words, from the row as
+    the day was scored: a fix (naming who made it), a quick re-swipe, a swipe
+    filled in between its neighbours, a live-log swipe with no direction yet,
+    the direction the device stored, or the hub's alternation from the first
+    swipe."""
+    correction = row.get("correction")
+    if correction in _CORRECTION_VERBS:
+        verb = _CORRECTION_VERBS[correction]
+        info = row.get("correction_info") or {}
+        by = info.get("by")
+        if not by or by == NO_AUDIT_NAME:
+            return f"{verb} before the audit trail"
+        text = f"{verb} by {by}" + (f" ({info['role']})" if info.get("role") else "")
+        text += f": {info['reason']}" if info.get("reason") else ""
+        device = _DIRECTION_WORDS.get(row.get("device_direction"))
+        if correction == CORRECTION_DIRECTION and device and row.get("device_direction") != row.get("trusted_direction"):
+            text += f" (the device said {device})"
+        return text
+    if collapsed:
+        return "Quick re-swipe: not counted"
+    word = _DIRECTION_WORDS.get(direction)
+    stored = _DIRECTION_WORDS.get(row.get("trusted_direction"))
+    if word and is_unconfirmed_guess(row):
+        return f"The live log gave no direction; counted as {word} from the swipes around it until the device history confirms it"
+    if inferred and word:
+        return f"Filled in as {word} between the swipes around it"
+    if stored:
+        return f"Device said {stored}"
+    return f"Counted as {word} by alternating from the first swipe" if word else ""
+
+
+def punch_facts(row: dict) -> str:
+    """The raw device facts behind a swipe, for HR and admins."""
+    parts = [row.get("device_id") or ""]
+    if row.get("door"):
+        parts.append(f"door {row['door']}")
+    if row.get("reader"):
+        parts.append(f"reader {row['reader']}")
+    if row.get("raw_direction_byte") is not None:
+        byte = f"in/out byte {row['raw_direction_byte']}"
+        sent = row.get("in_out_raw")
+        if sent is not None and sent != row["raw_direction_byte"]:
+            byte += f" (panel sent {sent})"  # R3: the live-log value before decoding
+        parts.append(byte)
+    if row.get("source") == C3_REALTIME_SOURCE:
+        parts.append("live log")
+    return " · ".join(part for part in parts if part)
 
 
 def fix_flags(statuses) -> tuple[str, ...]:
@@ -164,6 +235,8 @@ class RawPunch:
     direction: str  # "entry" | "exit" | ""
     flags: tuple[str, ...]  # "not counted", "unpaired", "inferred", "interval too short", "ignored", ...
     note: str = ""  # R6: why a "not counted" swipe was dropped
+    basis: str = ""  # who or what decided this swipe's direction (punch_basis)
+    facts: str = ""  # the raw device facts, only for roles that may see them
 
 
 @dataclass(frozen=True)
@@ -262,11 +335,13 @@ def _bar_marks(bar: list[BarSegment], live: bool) -> tuple[BarMark, ...]:
     return tuple(marks)
 
 
-def break_view(result: DayResult, now: datetime | None, raw_rows=(), fix_statuses=()) -> BreakView:
+def break_view(result: DayResult, now: datetime | None, raw_rows=(), fix_statuses=(), *,
+               show_facts: bool = False) -> BreakView:
     """The break view for one day. ``raw_rows`` are the stored swipes
     (``event_timestamp``, ``raw_state``) so the raw list shows every one,
     with approved fixes merged (KTD4): ignored swipes stay listed, marked.
-    ``fix_statuses`` are the day's fix request statuses, oldest first."""
+    ``fix_statuses`` are the day's fix request statuses, oldest first.
+    ``show_facts`` adds each swipe's raw device facts (HR and admins only)."""
     open_day = result.status == "open" and now is not None
     pieces: list[tuple[str, int | None, datetime, datetime, bool]] = []
     for seg in result.segments:
@@ -322,7 +397,9 @@ def break_view(result: DayResult, now: datetime | None, raw_rows=(), fix_statuse
             # Never scored, so it pairs with nothing and repeats nothing.
             flags.append(CORRECTION_FLAGS[correction])
             flags.extend(punch_flags(row.get("raw_state")))
-            punches.append(RawPunch(t, row.get("trusted_direction") or "", tuple(flags)))
+            punches.append(RawPunch(
+                t, row.get("trusted_direction") or "", tuple(flags),
+                basis=punch_basis(row, ""), facts=punch_facts(row) if show_facts else ""))
             continue
         reason = next((c for c in collapsed if c.punch.timestamp == t), None)
         if reason is not None:
@@ -344,7 +421,10 @@ def break_view(result: DayResult, now: datetime | None, raw_rows=(), fix_statuse
         if correction in CORRECTION_FLAGS:
             flags.append(CORRECTION_FLAGS[correction])
         flags.extend(punch_flags(row.get("raw_state")))
-        punches.append(RawPunch(t, direction, tuple(flags), note))
+        punches.append(RawPunch(
+            t, direction, tuple(flags), note,
+            basis=punch_basis(row, direction, collapsed="not counted" in flags, inferred="inferred" in flags),
+            facts=punch_facts(row) if show_facts else ""))
     return BreakView(
         inside_seconds=result.effective_seconds,
         break_seconds=result.break_seconds,
