@@ -227,33 +227,72 @@ def parse_c3_table(buffer: bytes, fields: dict[int, tuple[str, str]]) -> list[di
     return records
 
 
-def read_c3_table(panel: Any, table_name: str) -> list[dict[str, Any]]:
+# A reply frame's length field is 16 bits, and a 0xC8 buffer reply spends 4
+# bytes on its offset, so one 0x0E read returns at most this many bytes.
+C3_MAX_READ_BYTES = 0xFFFF - 4
+
+
+@dataclass
+class C3TableStart:
+    """The panel's answer to GETDATA: the whole table in one reply
+    (``payload``), or a prepared buffer of ``total`` bytes to read in
+    ``chunk``-sized 0x0E requests and check against ``crc``."""
+
+    fields: dict[int, tuple[str, str]]
+    payload: bytes | None = None
+    total: int = 0
+    crc: int = 0
+    chunk: int = 0
+
+
+def start_c3_table(panel: Any, table_name: str) -> C3TableStart:
+    """Send GETDATA for every field of ``table_name`` (read-only)."""
     cfg = next((c for c in panel._get_device_data_cfg() if c.name == table_name), None)
     if cfg is None:
         raise ValueError(f"C3 has no {table_name} table")
     fields = {f.index: (f.name, f.type) for f in cfg.fields}
     indexes = sorted(fields)
-    sock = panel._sock
-    sock.settimeout(C3_TABLE_TIMEOUT_SECONDS)
+    panel._sock.settimeout(C3_TABLE_TIMEOUT_SECONDS)
     panel._send(C3_CMD_GETDATA, [cfg.index, len(indexes), *indexes, 0, 0])
-    command, payload = _read_c3_frame(sock)
+    command, payload = _read_c3_frame(panel._sock)
     if command == C3_REPLY_OK:
-        return parse_c3_table(payload, fields) if payload else []
+        return C3TableStart(fields, payload=payload)
     if command != C3_CMD_LARGE_DATA or len(payload) < 17:
         raise ConnectionError(f"unexpected reply 0x{command:02x} to GETDATA {table_name}")
     total, _, crc, chunk = struct.unpack_from("<IIII", payload, 1)
-    buffer = bytearray()
-    while len(buffer) < total:
-        panel._send(C3_CMD_READ_BUFFER, list(struct.pack("<II", len(buffer), min(chunk, total - len(buffer)))))
-        command, part = _read_c3_frame(sock)
-        if command != C3_REPLY_OK or struct.unpack_from("<I", part, 0)[0] != len(buffer):
-            raise ConnectionError(f"C3 buffer read failed at offset {len(buffer)}")
-        if len(part) <= 4:
-            raise ConnectionError(f"C3 returned an empty chunk at offset {len(buffer)}")
-        buffer += part[4:]
-    if zlib.crc32(bytes(buffer)) != crc:
+    return C3TableStart(fields, total=total, crc=crc, chunk=chunk)
+
+
+def request_c3_buffer(panel: Any, offset: int, length: int) -> None:
+    """Ask for ``length`` bytes of the prepared buffer from ``offset`` (0x0E)."""
+    panel._send(C3_CMD_READ_BUFFER, list(struct.pack("<II", offset, length)))
+
+
+def receive_c3_buffer(panel: Any, offset: int) -> bytes:
+    """One 0x0E reply, checked to answer ``offset`` and to carry data."""
+    command, part = _read_c3_frame(panel._sock)
+    if command != C3_REPLY_OK or struct.unpack_from("<I", part, 0)[0] != offset:
+        raise ConnectionError(f"C3 buffer read failed at offset {offset}")
+    if len(part) <= 4:
+        raise ConnectionError(f"C3 returned an empty chunk at offset {offset}")
+    return part[4:]
+
+
+def finish_c3_table(start: C3TableStart, buffer: bytes, table_name: str) -> list[dict[str, Any]]:
+    if zlib.crc32(bytes(buffer)) != start.crc:
         raise ConnectionError(f"C3 {table_name} download failed its checksum")
-    return parse_c3_table(bytes(buffer), fields)
+    return parse_c3_table(bytes(buffer), start.fields)
+
+
+def read_c3_table(panel: Any, table_name: str) -> list[dict[str, Any]]:
+    start = start_c3_table(panel, table_name)
+    if start.payload is not None:
+        return parse_c3_table(start.payload, start.fields) if start.payload else []
+    buffer = bytearray()
+    while len(buffer) < start.total:
+        request_c3_buffer(panel, len(buffer), min(start.chunk, start.total - len(buffer)))
+        buffer += receive_c3_buffer(panel, len(buffer))
+    return finish_c3_table(start, bytes(buffer), table_name)
 
 
 def read_c3_rt_log(panel: Any) -> list[tuple[Any, int | None]]:

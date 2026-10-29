@@ -687,6 +687,16 @@ The C3 sends big tables in chunks, which the bundled library cannot read, so the
 
 **Door settings (Devices page).** Each C3 card shows the panel's door parameters and when they were read. **Read from device** asks the collector to read them on its next poll. An admin can change a closed whitelist: per door *Punch interval* (`DoorNIntertime`, 0–10 s), *Unlock time* (`DoorNDrivertime`), *Door-open alarm after* (`DoorNDetectortime`), *Lock when door closes* (`DoorNCloseAndLock`), *Door sensor* (`DoorNSensorType`), plus panel-wide *Anti-passback* (0–6) and *Interlock* (0–5). Changes go through a confirm page (old → new), are applied by the collector one key at a time and count as applied only when read back. A request the collector has not reached within 15 minutes expires unsent. The values from before the last write are kept and **Restore previous values** puts them back through the same confirm page. Every change is recorded with who made it. The dashboard never writes `ComPwd`, `IPAddress`, `NetMask`, `GATEIPAddress`, `RS232BaudRate`, `DeviceID` or `DoorNVerifyType`.
 
+**When the history download fails.** The card says "History download failing since …" and the collector log names the error. To find out why, run the read-only probe off-hours with someone on site. It replays the collector's download, then tests a fresh session, one long buffer read and pipelined reads, each on its own connection. It writes no setting and clears no log:
+
+```
+docker compose stop collector
+docker compose run --rm --no-deps -T collector python scripts/c3_history_probe.py
+docker compose start collector
+```
+
+It prints the table size, the panel's chunk, round-trip times, bytes per second, and where and after how long the panel cut the download. Until history works, live-log swipes stay unconfirmed and an admin can fix them with **Fix punches**. Exporting and then clearing old transactions on the panel with ZKAccess also shortens the download. The hub never does that itself.
+
 **Wait for door close.** Interlock (event 25) and anti-passback (event 24) are the only panel settings that deny a swipe based on door state or swipe history. With **Wait for door close** checked (default) those denials are not attendance. Unchecked, denials that carry a PIN or card are stored from that moment on, flagged *door denied*, and not sent to Frappe; past denials are not added. Setting InterLock and AntiPassback to 0 stops the denials at the source. As read on 2026-10-26 the Gachibowli panel has no door sensor configured and both set to 0, so the panel never waits for the door.
 
 **Bench check (pending).** Before relying on door writes, on the panel: write `Door1Intertime` 0 and read it back; swipe one card twice within 1 s and confirm both are granted; reboot and read again; write and read back one `AntiPassback` value. Record the results here, including whether a written value needs a restart.
