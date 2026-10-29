@@ -22,6 +22,7 @@ from .fix_views import (
     _day_rows,
     _line_view,
     _swipes,
+    current_direction,
     punch_set_hash,
 )
 from .fixes import _logger, bp
@@ -57,7 +58,7 @@ def _default_direction(line: dict, rows_by_fp: dict) -> str | None:
         return _FROM_DIRECTION.get(line["direction"])
     if line["kind"] == "flip":
         row = rows_by_fp.get(line.get("target_fingerprint"))
-        current = row.get("trusted_direction") if row else None
+        current = current_direction(row) if row else None
         return _FROM_DIRECTION.get(OPPOSITE_DIRECTION.get(current))
     return None
 

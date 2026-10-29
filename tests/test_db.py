@@ -1289,6 +1289,49 @@ class DatabaseTest(unittest.TestCase):
         self.assertIsNone(classify(ValueError("no such table: nope")))
 
 
+    def _rerun_from(self, version: int) -> None:
+        with self.database.transaction() as connection:
+            connection.execute("UPDATE settings SET value=? WHERE key='schema_version'", (str(version),))
+            connection.execute(f"PRAGMA user_version={version}")
+        self.database.migrate_schema()
+
+    def test_v11_drops_stored_live_15_guesses_only(self) -> None:
+        live = {"pin": "118", "source": "realtime_fallback"}
+        self.database.insert_punches([
+            self._punch(fingerprint="live-15", raw_direction_byte=15, trusted_direction="exit", raw=live),
+            self._punch(fingerprint="live-filled", raw_direction_byte=1, trusted_direction="exit", raw=live),
+            self._punch(fingerprint="live-0", raw_direction_byte=0, trusted_direction="entry", raw=live),
+            self._punch(fingerprint="history-1", raw_direction_byte=1, trusted_direction="exit"),
+            self._punch(fingerprint="x990", device_id="uppal-x990", site="Uppal",
+                        raw_direction_byte=15, trusted_direction="exit", raw=live),
+        ])
+        self._rerun_from(10)
+        cutover = self.database.setting("c3_live15_cutover_at")
+        self._rerun_from(10)  # a re-run changes nothing and keeps the first cutover
+        with self.database.connect() as connection:
+            rows = {r["fingerprint"]: r["trusted_direction"] for r in connection.execute(
+                "SELECT fingerprint, trusted_direction FROM punches").fetchall()}
+        self.assertEqual(rows, {"live-15": None, "live-filled": "exit", "live-0": "entry",
+                                "history-1": "exit", "x990": "exit"})
+        self.assertIsNotNone(cutover)
+        self.assertEqual(self.database.setting("c3_live15_cutover_at"), cutover)
+        datetime.strptime(cutover, "%Y-%m-%d %H:%M:%S")
+
+    def test_v11_on_an_empty_file_stores_no_cutover(self) -> None:
+        self._rerun_from(10)
+        self.assertIsNone(self.database.setting("c3_live15_cutover_at"))
+
+    def test_history_fills_a_live_row_v11_cleared(self) -> None:
+        live = {"pin": "118", "source": "realtime_fallback"}
+        self.database.insert_punches([
+            self._punch(raw_direction_byte=15, trusted_direction="exit", raw=live)])
+        self._rerun_from(10)
+        history = self._punch(trusted_direction="entry", raw_direction_byte=0)
+        self.assertEqual(self.database.fill_punch_directions([history]), 1)
+        with self.database.connect() as connection:
+            row = connection.execute("SELECT trusted_direction, raw_direction_byte FROM punches").fetchone()
+        self.assertEqual((row["trusted_direction"], row["raw_direction_byte"]), ("entry", 0))
+
     def test_fill_punch_directions_updates_null_c3_rows_without_inserting(self) -> None:
         self.database.insert_punches([self._punch(trusted_direction=None, raw_direction_byte=15)])
         history = self._punch(trusted_direction="exit", raw_direction_byte=1)
@@ -1419,7 +1462,7 @@ class MissedPunchSchemaTest(unittest.TestCase):
         )
         with mock.patch.object(db_module, "SCHEMA_VERSION", 7), \
                 mock.patch.dict(db_module.MIGRATIONS, {}, clear=False):
-            for later in (8, 9, 10):  # a v7 file has none of the later steps
+            for later in (8, 9, 10, 11):  # a v7 file has none of the later steps
                 db_module.MIGRATIONS.pop(later)
             old.initialize((device,))
             old.insert_punches([{
@@ -1457,7 +1500,8 @@ class MissedPunchSchemaTest(unittest.TestCase):
         self.addCleanup(old.close)
         with mock.patch.object(db_module, "SCHEMA_VERSION", 9), \
                 mock.patch.dict(db_module.MIGRATIONS, {}, clear=False):
-            db_module.MIGRATIONS.pop(10)
+            for later in (10, 11):
+                db_module.MIGRATIONS.pop(later)
             old.initialize(())
         for uid, person, role in (("101", "Asha", "employee"), ("102", "Hari", "hr")):
             old.upsert_employee(device_user_id=uid, name=person, email=f"{person.lower()}@x.com")
@@ -2288,7 +2332,7 @@ class PunchArchiveTest(unittest.TestCase):
         self.addCleanup(old.close)
         with mock.patch.object(db_module, "SCHEMA_VERSION", 8), \
                 mock.patch.dict(db_module.MIGRATIONS, {}, clear=False):
-            for later in (9, 10):  # a v8 file has neither later step
+            for later in (9, 10, 11):  # a v8 file has none of the later steps
                 db_module.MIGRATIONS.pop(later)
             old.initialize((self.device,))
             old.insert_punches([self._punch("fp-v8", "7", datetime(2026, 10, 20, 9, 0))])

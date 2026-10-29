@@ -92,9 +92,6 @@ C3_ATTENDANCE_EVENT_TYPES = C3_GRANTED_EVENT_TYPES | {C3_INTERVAL_TOO_SHORT_EVEN
 # swipe history, not on the person. Captured, flagged, only from the device's
 # door_denied_since on ("Wait for door close" unchecked).
 C3_DOOR_DENIED_NOTES = {"24": "door denied: anti-passback", "25": "door denied: interlock"}
-# KTD4: events whose realtime in/out 15 is a real exit (byte 1). Event 20 was
-# gated by the 2026-10-26 pre-implementation check; drop it here to undo.
-C3_REALTIME_15_EXIT_EVENT_TYPES = frozenset(C3_GRANTED_EVENT_TYPES | {C3_INTERVAL_TOO_SHORT_EVENT})
 
 _C3_HISTORY_AT: dict[str, float] = {}
 
@@ -685,22 +682,15 @@ def _normalized_event(
 
 
 def _c3_trusted_direction(in_out_state: int, event_type: int | None = None) -> str | None:
-    """KTD4: this library's InOutDirection enum only decodes bytes 0 and 3 to
-    ENTRY/EXIT. A real exit (protocol byte 1) fails its decode and the record
-    keeps only the fallback UNKNOWN_UNSUPPORTED (15); the raw byte is not
-    exposed. The Gachibowli history table carries only bytes 0 and 1 (14,195
-    and 13,958 rows, 2026-10-12 replica), so 15 is an exit for the swipe
-    events in C3_REALTIME_15_EXIT_EVENT_TYPES. Door-denied rows (24/25) with
-    15 stay unknown until a history read fills them."""
+    """KTD4 (revised 2026-10-29): only bytes the library decodes as a direction
+    count, 0 entry and 3 exit. Anything else arrives as its fallback 15, which
+    the live log returns for arrivals and leavings alike at Gachibowli (one
+    reader outside, one inside), so 15 is unknown: hours.py infers it from the
+    swipes around it until a history read fills the real byte
+    (db.fill_punch_directions). ``event_type`` is kept for the call sites."""
     if in_out_state == 0:
         return "entry"
     if in_out_state == 3:
-        return "exit"
-    if (
-        in_out_state == 15
-        and event_type is not None
-        and str(event_type).strip() in C3_REALTIME_15_EXIT_EVENT_TYPES
-    ):
         return "exit"
     return None
 

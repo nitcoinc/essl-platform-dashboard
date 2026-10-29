@@ -83,7 +83,7 @@ _TZ = ZoneInfo(TIMEZONE_NAME)
 _logger = logging.getLogger(__name__)
 
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 # libsql exposes no declared column types (U8), so read-side conversion is by
 # column name. Every TIMESTAMP column in the schema is listed here (a test
@@ -827,13 +827,36 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         BEGIN SELECT RAISE(ABORT, 'punch corrections are append-only'); END
         """,
     ),
+    # v11: the C3 live log returns in/out 15 for arrivals and leavings alike,
+    # so a live row read as 15 carries no direction (collectors KTD4, revised
+    # 2026-10-29). Drop the old "15 is an exit" guess on rows history has not
+    # filled yet (a filled row has byte 0/1); hours infer them from the swipes
+    # around them and fill_punch_directions confirms them later. Collector
+    # metadata, like that repair, not a punch edit. The cutover time (IST, only
+    # on a file that already holds punches) lets
+    # scripts/c3_guessed_frappe_report.py tell which rows Frappe got as OUT.
+    11: (
+        """
+        UPDATE punches SET trusted_direction = NULL
+        WHERE raw_direction_byte = 15
+          AND trusted_direction IS NOT NULL
+          AND json_extract(raw_json, '$.source') = 'realtime_fallback'
+          AND device_id IN (SELECT id FROM devices WHERE protocol = 'c3-pullsdk')
+        """,
+        """
+        INSERT OR IGNORE INTO settings (key, value)
+        SELECT 'c3_live15_cutover_at', datetime('now', '+5 hours', '+30 minutes')
+        WHERE EXISTS (SELECT 1 FROM punches)
+        """,
+    ),
 }
 
-# The C3 library's "unknown" in/out value: a realtime exit (byte 1) arrives as
-# 15 and its direction is a guess until a history read gives the real byte.
+# The C3 library's "unknown" in/out value: a live-log byte it cannot decode
+# arrives as 15 and carries no direction until a history read gives the real
+# byte (v11; before it, 15 was guessed as an exit).
 C3_UNDECODED_BYTE = 15
-# How long such a guess waits for that confirmation before Frappe gets it
-# anyway (history is re-read every ESSL_C3_HISTORY_HOURS, default 6).
+# How long such a row waits for that confirmation before Frappe gets it
+# anyway, without a log type (history is re-read every ESSL_C3_HISTORY_HOURS, default 6).
 FRAPPE_GUESS_HOLD = timedelta(hours=24)
 # Params: C3_UNDECODED_BYTE, now - FRAPPE_GUESS_HOLD. COALESCE keeps NOT (...)
 # true for rows with no byte or no source (SQL NULL would hide them).

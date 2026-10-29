@@ -384,7 +384,8 @@ class ReplaceRestoreTest(Base):
         with mock.patch.object(db_module, "SCHEMA_VERSION", 9), \
                 mock.patch.object(bk, "SCHEMA_VERSION", 9), \
                 mock.patch.dict(db_module.MIGRATIONS, {}, clear=False):
-            db_module.MIGRATIONS.pop(10)
+            for later in (10, 11):
+                db_module.MIGRATIONS.pop(later)
             self.init_db()
         env = {"ESSL_DB_PATH": self.db_path}
         with mock.patch.dict(os.environ, env), mock.patch.object(bk, "make_client", return_value=self.r2), \
@@ -669,7 +670,8 @@ class CycleTest(Base):
         with mock.patch.object(db_module, "SCHEMA_VERSION", 9), \
                 mock.patch.object(bk, "SCHEMA_VERSION", 9), \
                 mock.patch.dict(db_module.MIGRATIONS, {}, clear=False):
-            db_module.MIGRATIONS.pop(10)
+            for later in (10, 11):
+                db_module.MIGRATIONS.pop(later)
             self.init_db()
 
     def test_pre_update_snapshot_of_an_older_schema_needs_the_flag(self) -> None:
@@ -865,7 +867,8 @@ class RestoreTest(Base):
         with mock.patch.object(db_module, "SCHEMA_VERSION", 9), \
                 mock.patch.object(bk, "SCHEMA_VERSION", 9), \
                 mock.patch.dict(db_module.MIGRATIONS, {}, clear=False):
-            db_module.MIGRATIONS.pop(10)
+            for later in (10, 11):
+                db_module.MIGRATIONS.pop(later)
             self.init_db()
             self.cycle()
         for suffix in ("", "-wal", "-shm"):

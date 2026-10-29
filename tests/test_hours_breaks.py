@@ -412,3 +412,27 @@ class CorrectionOverlayTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LiveLogUnknownDirectionTest(unittest.TestCase):
+    """v11: the reported Gachibowli day of 2026-10-28. 17:51 and 19:53 were
+    live-log byte 15 (no direction); 19:55, 20:07 and 20:22 byte 0 (entry)."""
+
+    def _day(self):
+        return compute_day([
+            Punch(_t(17, 51), None, 10), Punch(_t(19, 53), None, 10), Punch(_t(19, 55), "entry", 10),
+            Punch(_t(20, 7), "entry", 10), Punch(_t(20, 22), "entry", 10),
+        ], target_minutes=480)
+
+    def test_arrival_counts_in_and_the_swipe_before_the_next_entry_counts_out(self) -> None:
+        r = self._day()
+        self.assertEqual(r.segments[0], Segment(_t(17, 51), _t(19, 53)))
+        self.assertEqual(r.inferred, (_t(19, 53),))
+        self.assertEqual(r.effective_seconds, 2 * 3600 + 2 * 60)
+
+    def test_back_to_back_live_entries_stay_unpaired_until_history_confirms_them(self) -> None:
+        # Known limit (plan, System-Wide Impact): only the history read can
+        # say which of 19:55, 20:07 and 20:22 was really a leaving.
+        r = self._day()
+        self.assertEqual(r.unpaired, ((_t(19, 55), "entry"), (_t(20, 7), "entry"), (_t(20, 22), "entry")))
+        self.assertTrue(r.anomalies)

@@ -5847,6 +5847,21 @@ class FixReportTest(unittest.TestCase):
         self.assertEqual(lines[1]["note"], "I went back in.")
         self.assertEqual(len(self.database.outbox), 2)
 
+    def test_flipping_a_live_swipe_with_no_direction_turns_its_scored_direction(self) -> None:
+        # v11: a C3 live-log byte 15 has no stored direction; after 13:00 Out
+        # the day scores it In, so "other direction" files an Out.
+        self.database.insert_punches([{
+            **_punch_row("a-live", datetime(2026, 10, 26, 17, 51), None, uid="118"),
+            "raw_direction_byte": 15, "door": "1", "source": "realtime_fallback"}])
+        page = self.client.get(f"/fix/{self.token}").text
+        self.assertIn('17:51:00</span>\n          <span class="punch-dir">In</span>', page)
+        response = self._post_link(flip="a-live")
+        self.assertEqual(response.status_code, 302)
+        [request] = self._requests()
+        [line] = self.database.fix_request(request["id"])["lines"]
+        self.assertEqual((line["kind"], line["target_fingerprint"], line["direction"]),
+                         ("flip", "a-live", "exit"))
+
     def test_flip_and_ignore_targets_and_after_midnight_times(self) -> None:
         self._post_link(ignore="a-in", **{"add-0-time": "01:30", "add-0-dir": "out"},
                         token=self._link(self.asha, self.DAY - timedelta(days=1)))
@@ -6271,6 +6286,26 @@ class FixReviewTest(unittest.TestCase):
         self.assertIn("7h 20m", day)
         self.assertIn('<span class="chip chip-info">added</span>', day)
 
+    def test_a_flip_of_a_live_swipe_with_no_direction_defaults_and_applies_the_opposite(self) -> None:
+        # v11: a C3 live-log byte 15 after the 17:00 Out scores In; an older
+        # flip line that carries no direction defaults to Out and approves.
+        self.database.insert_punches([{
+            **_punch_row("a-live", datetime(2026, 10, 26, 17, 51), None, uid="118"),
+            "raw_direction_byte": 15, "door": "1", "source": "realtime_fallback"}])
+        request_id = self._file({"kind": "flip", "target_fingerprint": "a-live",
+                                 "event_time": datetime(2026, 10, 26, 17, 51), "direction": None})
+        self._sign_in(self.hari)
+        detail = self.client.get(f"/fixes/review/{request_id}").text
+        [line] = self._lines(request_id)
+        self.assertIn(f'name="line-{line["id"]}-dir" value="out" checked', detail)
+        form = {f"line-{line['id']}-decision": "approved", f"line-{line['id']}-dir": "out"}
+        self._post(request_id, form)
+        response = self._post(request_id, form, "/confirm")
+        self.assertEqual(response.status_code, 302)
+        [correction] = self.database.corrections
+        self.assertEqual((correction["kind"], correction["fingerprint"], correction["direction"]),
+                         ("set_direction", "a-live", "exit"))
+
     def test_hr_edit_of_the_time_is_applied_and_audited_with_both_values(self) -> None:
         request_id = self._file()
         self._sign_in(self.hari)
@@ -6552,14 +6587,17 @@ class FixReviewTest(unittest.TestCase):
 
     # --- Why each punch counted the way it did (v10) ----------------------------------------
 
+    NO_DIRECTION = "The live log gave no direction; counted as "
+
     def _reported_day(self) -> None:
-        """The shape the user reported on 2026-10-28: two guessed exits, then three entries."""
+        """The shape the user reported on 2026-10-28 after v11: two live-log
+        swipes with no direction (byte 15), then three entries."""
         live = {"door": "1", "reader": "", "source": "realtime_fallback", "device_id": DEVICES[1].id}
         day = datetime(2026, 10, 25)
         self.database.insert_punches([
-            {**_punch_row("r-1", day.replace(hour=17, minute=51), "exit", uid="118"), **live,
+            {**_punch_row("r-1", day.replace(hour=17, minute=51), None, uid="118"), **live,
              "raw_direction_byte": 15},
-            {**_punch_row("r-2", day.replace(hour=19, minute=53), "exit", uid="118"), **live,
+            {**_punch_row("r-2", day.replace(hour=19, minute=53), None, uid="118"), **live,
              "raw_direction_byte": 15},
             {**_punch_row("r-3", day.replace(hour=19, minute=55), "entry", uid="118"), **live,
              "raw_direction_byte": 0},
@@ -6573,7 +6611,10 @@ class FixReviewTest(unittest.TestCase):
         self._reported_day()
         self._sign_in(self.admin)
         page = self.client.get(f"/day?employee={self.asha['id']}&date=2026-10-25").text
-        self.assertEqual(page.count("Guessed Out from the live log; the device history confirms it later"), 2)
+        # The arrival scores In and the leaving Out, as the user tapped them.
+        self.assertEqual(page.count(f"{self.NO_DIRECTION}In from the swipes around it"), 1)
+        self.assertEqual(page.count(f"{self.NO_DIRECTION}Out from the swipes around it"), 1)
+        self.assertNotIn("Guessed Out", page)
         self.assertEqual(page.count("Device said In"), 3)
         self.assertIn("gachibowli-c3-400 · door 1 · in/out byte 15 · live log", page)
         self.assertIn("gachibowli-c3-400 · door 1 · in/out byte 0 · live log", page)
@@ -6582,7 +6623,7 @@ class FixReviewTest(unittest.TestCase):
         self._reported_day()
         self._sign_in(self.asha)
         page = self.client.get("/day?date=2026-10-25").text
-        self.assertEqual(page.count("Guessed Out from the live log; the device history confirms it later"), 2)
+        self.assertEqual(page.count(self.NO_DIRECTION), 2)
         for hidden in ("gachibowli-c3-400 ·", "door 1", "in/out byte", "live log</span>"):
             self.assertNotIn(hidden, page)
 

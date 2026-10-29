@@ -260,19 +260,20 @@ class C3IntervalTooShortTest(unittest.TestCase):
         [hist] = self._history([self._row("20")])
         self.assertEqual(rt["fingerprint"], hist["fingerprint"])
         self.assertIn("interval too short", rt["raw_state"])
-        # KTD4: the panel only emits bytes 0/1, so realtime 15 on event 20 is an exit.
-        self.assertEqual(rt["trusted_direction"], "exit")
+        # KTD4 (revised): realtime 15 carries no direction; history fills it.
+        self.assertIsNone(rt["trusted_direction"])
 
     def test_realtime_directions_for_granted_and_interval_too_short(self) -> None:
         from c3.utils import C3DateTime
 
-        entry, short_exit = self._realtime([
+        entry, short_unknown = self._realtime([
             _RtRecord(0, "173", 0, C3DateTime.from_value(800000000)),
             _RtRecord(20, "173", 15, C3DateTime.from_value(800000005)),
         ])
         self.assertEqual(entry["trusted_direction"], "entry")
         self.assertEqual(entry["raw_state"], "0 · 0")
-        self.assertEqual(short_exit["trusted_direction"], "exit")
+        self.assertIsNone(short_unknown["trusted_direction"])
+        self.assertEqual(short_unknown["raw_direction_byte"], 15)
 
     def test_event_20_without_pin_or_card_is_dropped(self) -> None:
         self.assertEqual(self._history([self._row("20", pin="", card="0")]), [])
@@ -363,30 +364,12 @@ class C3TrustedDirectionTest(unittest.TestCase):
     def test_byte_three_is_trusted_as_exit(self) -> None:
         self.assertEqual(_c3_trusted_direction(3), "exit")
 
-    def test_byte_fifteen_on_a_card_event_is_an_exit(self) -> None:
-        # The library cannot decode the real exit byte (1) and keeps only its
-        # fallback 15; the raw byte is not exposed on the record.
-        for event_type in (0, 1, 2, 3):
-            self.assertEqual(_c3_trusted_direction(15, event_type), "exit")
-
-    def test_byte_fifteen_on_interval_too_short_is_an_exit(self) -> None:
-        # KTD4: history carries only bytes 0/1, so 15 is byte 1 for event 20 too.
-        self.assertEqual(_c3_trusted_direction(15, 20), "exit")
-
-    def test_byte_fifteen_on_event_20_is_unknown_when_the_rule_is_off(self) -> None:
-        from essl_hub import collectors
-
-        # Gate-miss branch: the pre-implementation check could have failed.
-        with patch.object(collectors, "C3_REALTIME_15_EXIT_EVENT_TYPES", frozenset(collectors.C3_GRANTED_EVENT_TYPES)):
-            self.assertIsNone(_c3_trusted_direction(15, 20))
-            self.assertEqual(_c3_trusted_direction(15, 0), "exit")
-
-    def test_byte_fifteen_without_a_card_event_is_not_trusted(self) -> None:
-        self.assertIsNone(_c3_trusted_direction(15))
-        self.assertIsNone(_c3_trusted_direction(15, 8))
-        # Door-denied rows wait for a history read (KTD4).
-        self.assertIsNone(_c3_trusted_direction(15, 24))
-        self.assertIsNone(_c3_trusted_direction(15, 25))
+    def test_byte_fifteen_is_unknown_on_every_event(self) -> None:
+        # 2026-10-29: the live log returns 15 for arrivals (outside reader)
+        # and leavings (inside reader) alike, so it carries no direction;
+        # a history read fills the real byte later.
+        for event_type in (None, 0, 1, 2, 3, 8, 20, 24, 25):
+            self.assertIsNone(_c3_trusted_direction(15, event_type), event_type)
 
     def test_entry_and_exit_bytes_ignore_the_event_type(self) -> None:
         self.assertEqual(_c3_trusted_direction(0, 0), "entry")

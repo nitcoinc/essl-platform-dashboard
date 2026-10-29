@@ -140,17 +140,18 @@ _CORRECTION_VERBS = {
 
 
 def is_unconfirmed_guess(row: dict) -> bool:
-    """A C3 live-log row still carrying the undecoded byte 15, whose direction
-    the device history has not confirmed yet (db.fill_punch_directions)."""
+    """A C3 live-log row still carrying the undecoded byte 15: no direction
+    (v11; older rows may still hold the old exit guess) until the device
+    history confirms it (db.fill_punch_directions)."""
     return row.get("raw_direction_byte") == C3_UNDECODED_BYTE and row.get("source") == C3_REALTIME_SOURCE
 
 
 def punch_basis(row: dict, direction: str, *, collapsed: bool = False, inferred: bool = False) -> str:
     """Who or what decided this swipe's direction, in words, from the row as
     the day was scored: a fix (naming who made it), a quick re-swipe, a swipe
-    filled in between its neighbours, the direction the device stored (or a
-    live-log guess of it, until the device history confirms it), or the hub's
-    alternation from the first swipe."""
+    filled in between its neighbours, a live-log swipe with no direction yet,
+    the direction the device stored, or the hub's alternation from the first
+    swipe."""
     correction = row.get("correction")
     if correction in _CORRECTION_VERBS:
         verb = _CORRECTION_VERBS[correction]
@@ -167,9 +168,11 @@ def punch_basis(row: dict, direction: str, *, collapsed: bool = False, inferred:
     if collapsed:
         return "Quick re-swipe: not counted"
     word = _DIRECTION_WORDS.get(direction)
+    stored = _DIRECTION_WORDS.get(row.get("trusted_direction"))
+    if not stored and word and is_unconfirmed_guess(row):
+        return f"The live log gave no direction; counted as {word} from the swipes around it until the device history confirms it"
     if inferred and word:
         return f"Filled in as {word} between the swipes around it"
-    stored = _DIRECTION_WORDS.get(row.get("trusted_direction"))
     if stored:
         if is_unconfirmed_guess(row):
             return f"Guessed {stored} from the live log; the device history confirms it later"

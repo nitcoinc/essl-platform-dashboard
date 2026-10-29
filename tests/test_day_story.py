@@ -268,13 +268,29 @@ class BreakViewTest(unittest.TestCase):
         rows[0].update(raw_direction_byte=0, source="realtime_fallback")
         rows[1].update(raw_direction_byte=1)  # a history row: the device's own byte
         rows[2].update(raw_direction_byte=0)
-        rows[3].update(raw_direction_byte=15, source="realtime_fallback")
+        rows[3].update(raw_direction_byte=15, source="realtime_fallback")  # a pre-v11 guess
         got = [b for b, _ in self._basis(swipes, rows)]
         self.assertEqual(got, [
             "Device said In",
             "Device said Out",
             "Device said In",
             "Guessed Out from the live log; the device history confirms it later"])
+
+    def test_a_live_15_swipe_without_direction_says_it_waits_for_history(self) -> None:
+        # v11: the reported 2026-10-28 day. 17:51 (arrival) and 19:53 (leaving)
+        # read byte 15 with no direction; 19:55 read byte 0 (entry).
+        swipes = [(_at(17, 51), None), (_at(19, 53), None), (_at(19, 55), "entry")]
+        rows = self._rows(*swipes)
+        for row in rows:
+            row.update(source="realtime_fallback", raw_direction_byte=15)
+        rows[2].update(raw_direction_byte=0)
+        view = day_story.break_view(self._day(*swipes), None, rows)
+        self.assertEqual([p.basis for p in view.punches], [
+            "The live log gave no direction; counted as In from the swipes around it "
+            "until the device history confirms it",
+            "The live log gave no direction; counted as Out from the swipes around it "
+            "until the device history confirms it",
+            "Device said In"])
 
     def test_x990_swipes_with_no_stored_direction_say_the_hub_alternated(self) -> None:
         swipes = [(_at(9), None), (_at(13), None), (_at(14), None), (_at(18), None)]

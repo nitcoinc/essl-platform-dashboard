@@ -108,11 +108,12 @@ class LiveDecisionTest(unittest.TestCase):
         day = _today(now, (9, 0, "entry"), (11, 0, "exit"), (12, 30, "exit"))
         self.assertEqual(_decide(day, now), LiveAlert(_t(12, 30), 150))
 
-    def test_c3_realtime_exit_counts_as_out(self) -> None:
+    def test_c3_realtime_15_after_an_entry_alternates_to_out(self) -> None:
         now = _t(14, 45)
         rows = [
             {"event_timestamp": _t(9), "trusted_direction": "entry", "device_id": "c3"},
-            # Realtime in/out 15 on a granted swipe (event 0): read as an exit.
+            # Realtime in/out 15 on a granted swipe (event 0) carries no
+            # direction (v11); after an In the day alternates it to Out.
             {"event_timestamp": _t(13), "trusted_direction": _c3_trusted_direction(15, 0),
              "raw_direction_byte": C3_UNDECODED_BYTE, "device_id": "c3"},
         ]
